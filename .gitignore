@@ -1,0 +1,33 @@
+# dependencies & build
+node_modules/
+web/node_modules/
+web/dist/
+.vite/
+*.log
+.DS_Store
+
+# secrets & local runtime (never commit)
+.env
+.env.*
+!.env.example
+data/
+.grok-desk-uploads/
+*.pem
+*.key
+secrets.json
+
+# local desktop build artifacts
+Grok Desk.app/
+*.app/
+dist-electron/
+
+# agent / editor junk
+.agent-write-test*
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.AppleDouble
+.LSOverride

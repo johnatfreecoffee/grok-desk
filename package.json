@@ -1,0 +1,44 @@
+{
+  "name": "grok-desk",
+  "productName": "Grok Desk",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Local visual desk for Grok Build — CLI agent text + optional xAI realtime voice",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johnatfreecoffee/grok-desk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/johnatfreecoffee/grok-desk/issues"
+  },
+  "homepage": "https://github.com/johnatfreecoffee/grok-desk#readme",
+  "type": "module",
+  "main": "desktop/main.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run build --prefix web",
+    "start": "node daemon/index.js",
+    "desk": "npm run build && node daemon/index.js",
+    "app": "npm run make-app && open -a 'Grok Desk'",
+    "app:dev": "electron .",
+    "make-app": "bash scripts/make-app.sh",
+    "phone": "bash scripts/phone-serve.sh",
+    "always-on": "bash scripts/install-launchd.sh",
+    "radar": "node daemon/radar/scanner.mjs",
+    "radar:digest": "node daemon/radar/digest.mjs",
+    "radar:digest:dry": "node daemon/radar/digest.mjs --dry",
+    "smoke": "node scripts/smoke-desk.mjs",
+    "smoke:turns": "node scripts/smoke-turn-resilience.mjs"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "electron": "^36.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

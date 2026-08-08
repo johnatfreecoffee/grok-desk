@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install root
+        run: npm ci
+
+      - name: Install web
+        run: npm ci --prefix web
+
+      - name: Build web UI
+        run: npm run build --prefix web
+
+      - name: Syntax-check daemon modules
+        run: |
+          node --check daemon/index.js
+          node --check daemon/acp-bridge.js
+          node --check daemon/acp-pool.js
+          node --check daemon/cli-ext.js
+          node --check daemon/routes/build.js
+          node --check daemon/session-store.js
+
+      - name: No secrets in tree
+        run: |
+          set -e
+          if git ls-files | grep -E '(^|/)\.env$|secrets\.json$|\.pem$'; then
+            echo "Refusing: secret-like paths tracked by git"
+            exit 1
+          fi
+          if git grep -nE 'sk-[a-zA-Z0-9]{20,}|xai-[a-zA-Z0-9]{20,}|re_[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}' -- \
+            ':!.github/workflows/ci.yml' ':!package-lock.json' ':!web/package-lock.json' 2>/dev/null; then
+            echo "Refusing: high-entropy secret pattern in tracked files"
+            exit 1
+          fi
+          echo "Secret path/pattern scan clean"

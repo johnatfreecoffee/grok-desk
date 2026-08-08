@@ -1,0 +1,20 @@
+{
+  "poll_interval": "1d",
+  "digest_day": "sunday",
+  "digest_to": "",
+  "digest_from": "",
+  "sources": [
+    { "id": "changelog", "url": "https://x.ai/build/changelog" },
+    { "id": "releaseNotes", "url": "https://docs.x.ai/developers/release-notes" },
+    { "id": "models", "url": "https://docs.x.ai/developers/models" },
+    { "id": "buildOverview", "url": "https://docs.x.ai/build/overview" },
+    { "id": "marketplace", "url": "https://github.com/xai-org/plugin-marketplace" },
+    { "id": "grokBuildRepo", "url": "https://github.com/xai-org/grok-build" }
+  ],
+  "local": [
+    "~/.grok/version.json",
+    "~/.grok/CHANGELOG.md",
+    "~/.grok/models_cache.json",
+    "~/.grok/bundled/manifest.json"
+  ]
+}
