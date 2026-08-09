@@ -58,7 +58,7 @@ Legend: ✅ native · 🟡 partial · ❌ missing · N/A not applicable
 | Phone PWA | ✅ | |
 | Module help Info | ✅ | |
 | Public OSS repo | ✅ | github.com/johnatfreecoffee/grok-desk |
-| X.com launch | ❌ | After OSS live |
+| X.com launch | 🟡 | Thread draft in docs/LAUNCH_X.md — post when ready |
 
 ## Gates
 - **Parity v1:** no ❌ left (only N/A)
