@@ -65,8 +65,11 @@ type Props = {
 
 export function LiveTurn({ draft, streaming, onToolClick }: Props) {
   const thinking = Boolean(draft.thought);
-  // Stay open while streaming; stay available after end so open/close doesn't lose the stream
-  const showThoughtOpen = streaming && (draft.phase === "thinking" || draft.phase === "tooling");
+  // Stay open while streaming (any phase) so phone shows sequence, not a blank green pulse
+  const showThoughtOpen =
+    streaming &&
+    Boolean(draft.thought) &&
+    (draft.phase === "thinking" || draft.phase === "tooling" || !draft.content);
 
   return (
     <div className={`live-turn ${streaming ? "streaming" : ""} phase-${draft.phase}`}>
@@ -112,12 +115,17 @@ export function LiveTurn({ draft, streaming, onToolClick }: Props) {
               content={draft.content}
               streaming={Boolean(streaming && draft.phase === "writing")}
             />
-          ) : streaming && draft.phase === "thinking" ? (
+          ) : streaming && (draft.phase === "thinking" || draft.phase === "tooling") ? (
             <span className="inline-thinking">
               <span className="think-dots">
                 <i />
                 <i />
                 <i />
+              </span>
+              <span className="inline-thinking-label">
+                {draft.phase === "tooling"
+                  ? draft.lastActivity || "Working…"
+                  : draft.lastActivity || "Thinking…"}
               </span>
             </span>
           ) : streaming ? (

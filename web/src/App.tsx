@@ -493,12 +493,18 @@ export default function App() {
         }
         return base;
       }
+      // Prefer the longer assistant body (cache often has live partial/final Desk wrote)
+      const baseLen = (base.content || "").length;
+      const extraLen = (extra.content || "").length;
+      const richer = extraLen > baseLen + 20 ? extra : base;
+      const poorer = richer === extra ? base : extra;
       return {
-        ...base,
-        thought: base.thought || extra.thought,
-        tools: base.tools?.length ? base.tools : extra.tools,
-        plan: base.plan?.length ? base.plan : extra.plan,
-        phase: base.phase || extra.phase,
+        ...richer,
+        id: richer.id || poorer.id,
+        thought: richer.thought || poorer.thought,
+        tools: richer.tools?.length ? richer.tools : poorer.tools,
+        plan: richer.plan?.length ? richer.plan : poorer.plan,
+        phase: richer.phase || poorer.phase,
         // Never re-infect finished rows with sticky streaming from cache
         streaming: Boolean(base.streaming && extra.streaming),
         attachments: base.attachments?.length ? base.attachments : extra.attachments,
@@ -506,8 +512,17 @@ export default function App() {
     };
     if (!disk.length && cached.length) return cached.map(cleanUser);
     if (!cached.length) return disk.map(cleanUser);
-    // Prefer cache when it has more turns OR richer user rows (attachments)
-    if (cached.length > disk.length) return cached.map(cleanUser);
+    // Prefer cache when it has more turns OR richer last assistant content
+    const cacheLast = [...cached].reverse().find((m) => m.role === "assistant");
+    const diskLast = [...disk].reverse().find((m) => m.role === "assistant");
+    if (
+      cached.length > disk.length ||
+      ((cacheLast?.content?.length || 0) > (diskLast?.content?.length || 0) + 40 &&
+        cached.length >= disk.length - 1)
+    ) {
+      // Still merge disk-only tails via fingerprint pass below when counts close
+      if (cached.length > disk.length) return cached.map(cleanUser);
+    }
     // Merge: keep disk order (cleaned), add cached lines disk missed.
     // Prefer cached user message when fingerprint matches (keeps image previews).
     const diskClean = disk.map(cleanUser);
@@ -902,6 +917,10 @@ export default function App() {
       },
       onReady: (info) => setAgent(info.agent),
       onSession: (info) => {
+        const prevSid = agentRef.current?.sessionId || null;
+        const midTurn = Boolean(
+          busyRef.current || draftRef.current || turnSessionRef.current,
+        );
         setAgent((a) =>
           a
             ? { ...a, sessionId: info.sessionId, cwd: info.cwd || a.cwd, ready: true }
@@ -919,8 +938,29 @@ export default function App() {
         setSessionTitles((prev) =>
           prev[info.sessionId] ? prev : { ...prev, [info.sessionId]: info.title || "New chat" },
         );
-        setSessionListStatus(info.sessionId, null);
         setSidebarTick((n) => n + 1);
+
+        // CRITICAL: agent often emits session/new after turn_start. Never wipe the
+        // live stream / messages mid-turn (mobile "green only" + lost reply).
+        if (midTurn) {
+          const oldOwner = turnSessionRef.current || prevSid;
+          if (oldOwner && oldOwner !== info.sessionId) {
+            const cached = sessionCacheRef.current.get(oldOwner);
+            if (cached?.length) sessionCacheRef.current.set(info.sessionId, cached);
+            const live = liveDraftBySessionRef.current.get(oldOwner);
+            if (live) liveDraftBySessionRef.current.set(info.sessionId, live);
+            turnSessionRef.current = info.sessionId;
+            setSessionListStatus(info.sessionId, "working");
+          }
+          suppressPaintRef.current = false;
+          setLoadingSession(false);
+          setSessionPhase("ready");
+          setHistoryOnly(false);
+          setSidebarTick((n) => n + 1);
+          return;
+        }
+
+        setSessionListStatus(info.sessionId, null);
         const pending = pendingPromptRef.current;
         if (pending) {
           const seed: ChatMessage[] = [
@@ -996,23 +1036,80 @@ export default function App() {
           thought: (m as ChatMessage).thought,
           tools: (m as ChatMessage).tools,
           plan: (m as ChatMessage).plan,
+          streaming: Boolean((m as ChatMessage).streaming),
         }));
-        const merged = pickMessages(info.sessionId, disk);
+        let merged = pickMessages(info.sessionId, disk);
+        // Restore live stream if this session still has an in-flight turn
+        const partial = (info as { partialDraft?: TurnDraft & { id?: string } }).partialDraft;
+        const live =
+          liveDraftBySessionRef.current.get(info.sessionId) ||
+          (partial
+            ? (() => {
+                const d = createTurnDraft(partial.id || uid());
+                d.content = partial.content || "";
+                d.thought = partial.thought || "";
+                d.tools = partial.tools || [];
+                d.plan = partial.plan || [];
+                d.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
+                return d;
+              })()
+            : null);
+        if (live) liveDraftBySessionRef.current.set(info.sessionId, live);
+        // Fold partial/live into transcript so switch-back never drops the last reply mid-stream
+        if (live && (live.content || live.thought || live.tools?.length)) {
+          const has = merged.some(
+            (m) => m.id === live.id || (m.streaming && m.role === "assistant"),
+          );
+          if (has) {
+            merged = merged.map((m) =>
+              m.id === live.id || (m.streaming && m.role === "assistant")
+                ? {
+                    ...m,
+                    id: live.id,
+                    content: live.content || m.content,
+                    thought: live.thought || m.thought,
+                    tools: live.tools?.length ? live.tools : m.tools,
+                    plan: live.plan?.length ? live.plan : m.plan,
+                    phase: live.phase,
+                    streaming: true,
+                  }
+                : m,
+            );
+          } else {
+            merged = [
+              ...merged,
+              {
+                id: live.id,
+                role: "assistant",
+                content: live.content,
+                thought: live.thought || undefined,
+                tools: live.tools,
+                plan: live.plan,
+                phase: live.phase,
+                streaming: true,
+              },
+            ];
+          }
+        }
+        // Drop sticky streaming flag on finished rows from desk shadow
+        if (!(info as { turnActive?: boolean }).turnActive && !live) {
+          merged = merged.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+        }
         setMessages(merged);
         sessionCacheRef.current.set(info.sessionId, merged);
-        // Restore live stream if this session still has an in-flight turn
-        const live = liveDraftBySessionRef.current.get(info.sessionId);
         const turnActive = Boolean(
           (info as { turnActive?: boolean }).turnActive ||
-            (live && turnSessionRef.current === info.sessionId),
+            (live && turnSessionRef.current === info.sessionId) ||
+            Boolean(partial),
         );
         const viewOnly = Boolean((info as { viewOnly?: boolean }).viewOnly);
-        if (turnActive && (live || turnSessionRef.current === info.sessionId)) {
+        if (turnActive && (live || turnSessionRef.current === info.sessionId || partial)) {
           viewOnlyRef.current = false;
           setViewOnlyBrowse(false);
           if (live) {
             draftRef.current = live;
             setLiveDraft(live);
+            turnSessionRef.current = info.sessionId;
           }
           setBusy(true);
           setHistoryOnly(false);
@@ -1102,19 +1199,35 @@ export default function App() {
         // New-chat mid-turn: never paint old stream into the blank new thread
         const viewing =
           !suppressPaintRef.current &&
-          (!sid || agentRef.current?.sessionId === sid);
+          (!sid ||
+            !agentRef.current?.sessionId ||
+            agentRef.current?.sessionId === sid);
         // Clear queued badges for the message that just started (view only)
         if (viewing) {
           setMessages((prev) =>
             prev.map((m) => (m.queued ? { ...m, queued: false } : m)),
           );
         }
+        // Prefer server draftId so reconnect / partial_draft / desk shadow share one id
+        const serverDraftId = info?.draftId ? String(info.draftId) : null;
         // Reconnect may re-emit turn_start — reuse existing streaming draft
         if (info?.resume && draftRef.current) {
+          if (serverDraftId && draftRef.current.id !== serverDraftId) {
+            draftRef.current = { ...draftRef.current, id: serverDraftId };
+          }
           if (viewing) setLiveDraft({ ...draftRef.current });
           return;
         }
         if (draftRef.current && draftRef.current.phase !== "idle") {
+          if (serverDraftId && draftRef.current.id !== serverDraftId) {
+            const oldId = draftRef.current.id;
+            draftRef.current = { ...draftRef.current, id: serverDraftId };
+            if (viewing) {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === oldId ? { ...m, id: serverDraftId } : m)),
+              );
+            }
+          }
           if (viewing) setLiveDraft({ ...draftRef.current });
           return;
         }
@@ -1122,23 +1235,37 @@ export default function App() {
           ? messagesRef.current.find((m) => m.streaming && m.role === "assistant")
           : undefined;
         if (existing) {
-          const draft = createTurnDraft(existing.id);
+          const id = serverDraftId || existing.id;
+          const draft = createTurnDraft(id);
           draft.content = existing.content || "";
           draft.thought = existing.thought || "";
           draft.tools = existing.tools || [];
           draft.plan = existing.plan || [];
           draftRef.current = draft;
           if (sid) liveDraftBySessionRef.current.set(sid, draft);
-          if (viewing) setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
+          if (viewing) {
+            setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
+            if (id !== existing.id) {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === existing.id ? { ...m, id } : m)),
+              );
+            }
+          }
           return;
         }
-        const id = uid();
+        const id = serverDraftId || uid();
         const draft = createTurnDraft(id);
         draftRef.current = draft;
         if (sid) liveDraftBySessionRef.current.set(sid, draft);
         if (viewing) {
           setLiveDraft({ ...draft, tools: [], plan: [] });
           setMessages((prev) => {
+            // Avoid double empty assistant rows on reconnect
+            if (prev.some((m) => m.streaming && m.role === "assistant")) {
+              return prev.map((m) =>
+                m.streaming && m.role === "assistant" ? { ...m, id, streaming: true } : m,
+              );
+            }
             const next: ChatMessage[] = [
               ...prev,
               { id, role: "assistant", content: "", streaming: true },
@@ -1213,28 +1340,159 @@ export default function App() {
         }
         if (viewing) setLiveDraft(snap);
         if (viewing) mergeArtifacts(artifactsFromDraft(snap));
-        const patch = (m: ChatMessage): ChatMessage =>
-          m.id === draft!.id
-            ? {
-                ...m,
-                content: snap.content,
-                thought: snap.thought || undefined,
-                tools: snap.tools,
-                plan: snap.plan,
-                phase: snap.phase,
-                streaming: true,
-              }
-            : m;
+        // Match by draft id OR any streaming assistant (id can lag after reconnect)
+        const patch = (m: ChatMessage): ChatMessage => {
+          const isTarget =
+            m.id === draft!.id ||
+            (m.role === "assistant" && m.streaming) ||
+            (m.role === "assistant" && !m.content && snap.content);
+          if (!isTarget) return m;
+          return {
+            ...m,
+            id: draft!.id || m.id,
+            content: snap.content,
+            thought: snap.thought || undefined,
+            tools: snap.tools,
+            plan: snap.plan,
+            phase: snap.phase,
+            streaming: true,
+          };
+        };
         if (viewing) {
           setMessages((prev) => {
-            const next = prev.map(patch);
+            let next = prev.map(patch);
+            if (!next.some((m) => m.id === draft!.id || (m.streaming && m.role === "assistant"))) {
+              next = [
+                ...next,
+                {
+                  id: draft!.id,
+                  role: "assistant",
+                  content: snap.content,
+                  thought: snap.thought || undefined,
+                  tools: snap.tools,
+                  plan: snap.plan,
+                  phase: snap.phase,
+                  streaming: true,
+                },
+              ];
+            }
             if (turnSid) sessionCacheRef.current.set(turnSid, next);
             return next;
           });
           scrollToBottom();
         } else if (turnSid) {
           const cached = sessionCacheRef.current.get(turnSid) || [];
-          sessionCacheRef.current.set(turnSid, cached.map(patch));
+          let next = cached.map(patch);
+          if (!next.some((m) => m.id === draft!.id || (m.streaming && m.role === "assistant"))) {
+            next = [
+              ...next,
+              {
+                id: draft!.id,
+                role: "assistant",
+                content: snap.content,
+                thought: snap.thought || undefined,
+                tools: snap.tools,
+                plan: snap.plan,
+                phase: snap.phase,
+                streaming: true,
+              },
+            ];
+          }
+          sessionCacheRef.current.set(turnSid, next);
+        }
+      },
+      onPartialDraft: (info) => {
+        const partial = info?.draft;
+        if (!partial) return;
+        const sid =
+          info.sessionId || turnSessionRef.current || agentRef.current?.sessionId || null;
+        if (!sid) return;
+        // Only apply to live owner / viewed session
+        if (turnSessionRef.current && turnSessionRef.current !== sid) {
+          // still cache for background session
+        }
+        const id = partial.id || draftRef.current?.id || uid();
+        const draft = createTurnDraft(id);
+        draft.content = partial.content || "";
+        draft.thought = partial.thought || "";
+        draft.tools = (partial.tools as TurnDraft["tools"]) || [];
+        draft.plan = (partial.plan as TurnDraft["plan"]) || [];
+        draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
+        liveDraftBySessionRef.current.set(sid, draft);
+        setBusy(true);
+        setSessionListStatus(sid, "working");
+        const viewing =
+          !suppressPaintRef.current &&
+          (!agentRef.current?.sessionId || agentRef.current.sessionId === sid);
+        if (viewing) {
+          draftRef.current = draft;
+          setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
+          setMessages((prev) => {
+            let hit = false;
+            const next = prev.map((m) => {
+              if (m.role === "assistant" && (m.streaming || m.id === id)) {
+                hit = true;
+                return {
+                  ...m,
+                  id,
+                  content: draft.content,
+                  thought: draft.thought || undefined,
+                  tools: draft.tools,
+                  plan: draft.plan,
+                  phase: draft.phase,
+                  streaming: true,
+                };
+              }
+              return m;
+            });
+            if (!hit) {
+              next.push({
+                id,
+                role: "assistant",
+                content: draft.content,
+                thought: draft.thought || undefined,
+                tools: draft.tools,
+                plan: draft.plan,
+                phase: draft.phase,
+                streaming: true,
+              });
+            }
+            sessionCacheRef.current.set(sid, next);
+            return next;
+          });
+          scrollToBottom();
+        } else {
+          const cached = sessionCacheRef.current.get(sid) || [];
+          let hit = false;
+          const next = cached.map((m) => {
+            if (m.role === "assistant" && (m.streaming || m.id === id)) {
+              hit = true;
+              return {
+                ...m,
+                id,
+                content: draft.content,
+                thought: draft.thought || undefined,
+                tools: draft.tools,
+                plan: draft.plan,
+                phase: draft.phase,
+                streaming: true,
+              };
+            }
+            return m;
+          });
+          if (!hit) {
+            next.push({
+              id,
+              role: "assistant",
+              content: draft.content,
+              thought: draft.thought || undefined,
+              tools: draft.tools,
+              plan: draft.plan,
+              phase: draft.phase,
+              streaming: true,
+            });
+          }
+          sessionCacheRef.current.set(sid, next);
         }
       },
       onTurnEnd: (info) => {
@@ -1568,7 +1826,7 @@ export default function App() {
     if (!sid || busy || loadingSession) return;
     let cancelled = false;
     const pull = async () => {
-      if (cancelled || busy || draftRef.current) return;
+      if (cancelled || busyRef.current || draftRef.current) return;
       const cur = agentRef.current?.sessionId;
       if (cur !== sid) return;
       try {
@@ -1579,34 +1837,50 @@ export default function App() {
         if (!resp.ok || cancelled) return;
         const data = await resp.json();
         const disk: ChatMessage[] = (data.messages || []).map(
-          (m: { id?: string; role: string; content: string }) => ({
+          (m: {
+            id?: string;
+            role: string;
+            content: string;
+            thought?: string;
+            tools?: ChatMessage["tools"];
+            plan?: ChatMessage["plan"];
+          }) => ({
             id: m.id || uid(),
             role: m.role as ChatMessage["role"],
             content: m.content || "",
+            thought: m.thought,
+            tools: m.tools,
+            plan: m.plan,
+            streaming: false,
           }),
         );
         if (!disk.length || cancelled) return;
         if (agentRef.current?.sessionId !== sid) return;
-        const merged = pickMessages(sid, disk);
-        sessionCacheRef.current.set(sid, merged);
+        const merged = pickMessages(sid, disk).map((m) =>
+          m.streaming ? { ...m, streaming: false } : m,
+        );
         setMessages((prev) => {
           // Never clobber a richer in-memory transcript with a sparser disk view
-          // (was causing phantom second user bubbles after attach turns).
-          if (prev.length === 0 && merged.length) return merged;
-          if (merged.length > prev.length) return merged;
-          // Content growth on last assistant (CLI finished a turn) — same count
-          const prevLast = prev[prev.length - 1];
-          const nextLast = merged[merged.length - 1];
-          if (
-            prev.length === merged.length &&
-            prevLast &&
-            nextLast &&
-            prevLast.role === "assistant" &&
-            nextLast.role === "assistant" &&
-            (nextLast.content?.length || 0) > (prevLast.content?.length || 0) + 40
-          ) {
+          const prevAssist = [...prev].reverse().find((m) => m.role === "assistant");
+          const nextAssist = [...merged].reverse().find((m) => m.role === "assistant");
+          const prevLen = prevAssist?.content?.length || 0;
+          const nextLen = nextAssist?.content?.length || 0;
+          if (prev.length === 0 && merged.length) {
+            sessionCacheRef.current.set(sid, merged);
             return merged;
           }
+          if (merged.length > prev.length && nextLen >= prevLen) {
+            sessionCacheRef.current.set(sid, merged);
+            return merged;
+          }
+          if (
+            prev.length === merged.length &&
+            nextLen > prevLen + 40
+          ) {
+            sessionCacheRef.current.set(sid, merged);
+            return merged;
+          }
+          // Prefer prev when it has more assistant body (just finalized in UI)
           return prev;
         });
         // Refresh title from summary if present
@@ -1627,6 +1901,131 @@ export default function App() {
       window.clearInterval(id);
     };
   }, [agent?.sessionId, busy, loadingSession, pickMessages]);
+
+  /**
+   * Mobile/WS flap safety: while busy, poll /api/turn for partialDraft so
+   * thoughts/tools/text keep painting even when WS updates are dropped.
+   */
+  useEffect(() => {
+    if (!busy) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled || !busyRef.current) return;
+      try {
+        const resp = await fetch("/api/turn");
+        if (!resp.ok || cancelled) return;
+        const snap = (await resp.json()) as {
+          turnActive?: boolean;
+          activeSessionId?: string | null;
+          partialDraft?: {
+            id?: string;
+            content?: string;
+            thought?: string;
+            tools?: TurnDraft["tools"];
+            plan?: TurnDraft["plan"];
+            phase?: string;
+            sessionId?: string;
+          } | null;
+        };
+        if (!snap.turnActive) return;
+        const partial = snap.partialDraft;
+        if (!partial) return;
+        const sid =
+          snap.activeSessionId ||
+          partial.sessionId ||
+          turnSessionRef.current ||
+          agentRef.current?.sessionId ||
+          null;
+        if (!sid) return;
+        // Reuse partial_draft path via synthetic handler body
+        const id = partial.id || draftRef.current?.id || uid();
+        const draft = createTurnDraft(id);
+        draft.content = partial.content || "";
+        draft.thought = partial.thought || "";
+        draft.tools = partial.tools || [];
+        draft.plan = partial.plan || [];
+        draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
+        // Skip if we already have equal/richer content from WS
+        const cur = draftRef.current;
+        if (
+          cur &&
+          (cur.content?.length || 0) >= (draft.content?.length || 0) &&
+          (cur.thought?.length || 0) >= (draft.thought?.length || 0) &&
+          (cur.tools?.length || 0) >= (draft.tools?.length || 0)
+        ) {
+          return;
+        }
+        liveDraftBySessionRef.current.set(sid, draft);
+        const viewing =
+          !suppressPaintRef.current &&
+          (!agentRef.current?.sessionId || agentRef.current.sessionId === sid);
+        if (!viewing) {
+          const cached = sessionCacheRef.current.get(sid) || [];
+          sessionCacheRef.current.set(
+            sid,
+            cached.map((m) =>
+              m.streaming && m.role === "assistant"
+                ? {
+                    ...m,
+                    id,
+                    content: draft.content,
+                    thought: draft.thought || undefined,
+                    tools: draft.tools,
+                    plan: draft.plan,
+                    phase: draft.phase,
+                    streaming: true,
+                  }
+                : m,
+            ),
+          );
+          return;
+        }
+        draftRef.current = draft;
+        setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
+        setMessages((prev) => {
+          let hit = false;
+          const next = prev.map((m) => {
+            if (m.role === "assistant" && (m.streaming || m.id === id)) {
+              hit = true;
+              return {
+                ...m,
+                id,
+                content: draft.content,
+                thought: draft.thought || undefined,
+                tools: draft.tools,
+                plan: draft.plan,
+                phase: draft.phase,
+                streaming: true,
+              };
+            }
+            return m;
+          });
+          if (!hit) {
+            next.push({
+              id,
+              role: "assistant",
+              content: draft.content,
+              thought: draft.thought || undefined,
+              tools: draft.tools,
+              plan: draft.plan,
+              phase: draft.phase,
+              streaming: true,
+            });
+          }
+          sessionCacheRef.current.set(sid, next);
+          return next;
+        });
+      } catch {
+        /* */
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [busy]);
 
   const fileToAttachment = useCallback(async (file: File): Promise<AttachmentPreview> => {
     const dataBase64 = await new Promise<string>((resolve, reject) => {
@@ -3084,7 +3483,11 @@ export default function App() {
                 <>
                   <LiveTurn
                     draft={
-                      m.streaming && liveDraft && liveDraft.id === m.id
+                      m.streaming &&
+                      liveDraft &&
+                      (liveDraft.id === m.id ||
+                        // After reconnect draft id can lag; still show live sequence
+                        (m.role === "assistant" && Boolean(m.streaming)))
                         ? liveDraft
                         : {
                             id: m.id,

@@ -1223,6 +1223,47 @@ export function appendDeskMessage(sessionId, message) {
   }
 }
 
+/**
+ * Upsert by message id — used for mid-turn partial assistant + final rewrite.
+ * Prefer this over append for streaming rows so reloads don't stack duplicates.
+ */
+export function upsertDeskMessage(sessionId, message) {
+  if (!sessionId || !message) return;
+  const store = loadDeskMessagesStore();
+  const list = Array.isArray(store[sessionId]) ? store[sessionId] : [];
+  const at = new Date().toISOString();
+  const id = message.id || `d_${Date.now()}`;
+  const row = {
+    id,
+    role: message.role,
+    content: String(message.content || "").slice(0, 20000),
+    thought: message.thought ? String(message.thought).slice(0, 40000) : undefined,
+    tools: Array.isArray(message.tools) ? message.tools.slice(0, 80) : undefined,
+    plan: Array.isArray(message.plan) ? message.plan.slice(0, 40) : undefined,
+    streaming: Boolean(message.streaming),
+    at,
+  };
+  const idx = list.findIndex((m) => m && m.id === id);
+  if (idx >= 0) list[idx] = { ...list[idx], ...row };
+  else list.push(row);
+  store[sessionId] = list.length > 300 ? list.slice(-300) : list;
+  const keys = Object.keys(store);
+  if (keys.length > 80) {
+    const ranked = keys
+      .map((k) => ({ k, at: store[k][store[k].length - 1]?.at || "" }))
+      .sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    for (const drop of ranked.slice(80)) delete store[drop.k];
+  }
+  saveDeskMessagesStore(store);
+  if (!message.streaming) {
+    try {
+      touchSessionInteraction(sessionId, undefined);
+    } catch {
+      /* */
+    }
+  }
+}
+
 export function loadDeskMessages(sessionId) {
   if (!sessionId) return [];
   const store = loadDeskMessagesStore();
@@ -1235,6 +1276,7 @@ export function loadDeskMessages(sessionId) {
     thought: m.thought,
     tools: m.tools,
     plan: m.plan,
+    streaming: Boolean(m.streaming),
   }));
 }
 

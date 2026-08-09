@@ -107,6 +107,19 @@ type Handlers = {
     sessionId?: string;
     resume?: boolean;
     turnEpoch?: number;
+    draftId?: string;
+  }) => void;
+  onPartialDraft?: (info: {
+    sessionId?: string;
+    turnEpoch?: number;
+    draft?: {
+      id?: string;
+      content?: string;
+      thought?: string;
+      tools?: import("./turnState").ToolCallView[];
+      plan?: import("./turnState").PlanEntry[];
+      phase?: string;
+    } | null;
   }) => void;
   onTurnEnd?: (info: {
     result?: unknown;
@@ -388,10 +401,14 @@ export class DeskClient {
             resume: Boolean(msg.resume),
             turnEpoch:
               typeof msg.turnEpoch === "number" ? msg.turnEpoch : undefined,
+            draftId: msg.draftId ? String(msg.draftId) : undefined,
           });
           break;
         case "turn_end":
           this.handlers.onTurnEnd?.(msg as never);
+          break;
+        case "partial_draft":
+          this.handlers.onPartialDraft?.(msg as never);
           break;
         case "update":
           this.handlers.onUpdate?.(msg.update as Record<string, unknown>, {

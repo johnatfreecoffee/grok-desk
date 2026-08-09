@@ -21,6 +21,7 @@ import {
   trackDeskSession,
   getDeskSourceDir,
   appendDeskMessage,
+  upsertDeskMessage,
   setDeskTitle,
   loadAgentMailTranscript,
   sessionsRoot,
@@ -1037,7 +1038,12 @@ async function runPromptJob(text, attachments, opts = {}) {
     gen,
     (text || "").slice(0, 40),
   );
-  emitTurn({ type: "turn_start", sessionId: jobSessionId, turnEpoch: gen });
+  emitTurn({
+    type: "turn_start",
+    sessionId: jobSessionId,
+    turnEpoch: gen,
+    draftId,
+  });
 
   let assistantBuf = "";
   let thoughtBuf = "";
@@ -1170,6 +1176,46 @@ async function runPromptJob(text, attachments, opts = {}) {
       });
     };
 
+    /** Shadow mid-turn so phone reload / WS flaps still see progress */
+    let lastShadowAt = 0;
+    let lastShadowLen = 0;
+    const shadowPartial = (force = false) => {
+      if (!jobSessionId) return;
+      const len = assistantBuf.length + thoughtBuf.length + toolsBuf.length * 20;
+      const now = Date.now();
+      if (!force && now - lastShadowAt < 1500 && len - lastShadowLen < 80) return;
+      lastShadowAt = now;
+      lastShadowLen = len;
+      if (!assistantBuf.trim() && !thoughtBuf.trim() && !toolsBuf.length) return;
+      try {
+        upsertDeskMessage(jobSessionId, {
+          id: draftId,
+          role: "assistant",
+          content: assistantBuf,
+          thought: thoughtBuf || undefined,
+          tools: toolsBuf.length ? toolsBuf.map((x) => ({ ...x })) : undefined,
+          plan: planBuf.length ? planBuf : undefined,
+          streaming: true,
+        });
+      } catch {
+        /* */
+      }
+    };
+
+    // Throttled partial_draft for mobile HTTP poll fallback (WS flaps)
+    let lastPartialBroadcast = 0;
+    const broadcastPartial = (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastPartialBroadcast < 350) return;
+      lastPartialBroadcast = now;
+      emitTurn({
+        type: "partial_draft",
+        sessionId: jobSessionId,
+        turnEpoch: gen,
+        draft: partialDraftFromActive(),
+      });
+    };
+
     const result = await bridge.prompt(fullText, {
       promptBlocks,
       onUpdate: (update) => {
@@ -1184,6 +1230,8 @@ async function runPromptJob(text, attachments, opts = {}) {
               activeTurn.phase = "writing";
             }
             touchTurnActivity();
+            shadowPartial();
+            broadcastPartial();
           }
         } else if (kind === "agent_thought_chunk") {
           const t = update.content?.text ?? update.text ?? "";
@@ -1191,6 +1239,8 @@ async function runPromptJob(text, attachments, opts = {}) {
             thoughtBuf += t;
             if (activeTurn) activeTurn.thought = thoughtBuf;
             touchTurnActivity();
+            shadowPartial();
+            broadcastPartial();
           }
         } else if (kind === "tool_call") {
           const id = String(
@@ -1204,6 +1254,8 @@ async function runPromptJob(text, attachments, opts = {}) {
           });
           if (activeTurn) activeTurn.tools = toolsBuf.map((x) => ({ ...x }));
           emitPhase();
+          shadowPartial(true);
+          broadcastPartial(true);
         } else if (kind === "tool_call_update") {
           const id = String(update.toolCallId || update.tool_call_id || update.id || "");
           const t = toolsBuf.find((x) => x.id === id);
@@ -1213,6 +1265,7 @@ async function runPromptJob(text, attachments, opts = {}) {
           }
           if (activeTurn) activeTurn.tools = toolsBuf.map((x) => ({ ...x }));
           emitPhase();
+          broadcastPartial();
         } else if (kind === "plan" && Array.isArray(update.entries)) {
           planBuf = update.entries.map((e) => ({
             content: String(e.content || ""),
@@ -1221,6 +1274,7 @@ async function runPromptJob(text, attachments, opts = {}) {
           }));
           if (activeTurn) activeTurn.plan = planBuf;
           emitPhase();
+          broadcastPartial(true);
         }
         emitTurn({ type: "update", update, sessionId: jobSessionId, turnEpoch: gen });
       },
@@ -1230,13 +1284,14 @@ async function runPromptJob(text, attachments, opts = {}) {
       // Always write to jobSessionId captured at start — never live bridge after switch
       if (!jobSessionId) return;
       if (!assistantBuf.trim() && !thoughtBuf.trim() && !toolsBuf.length) return;
-      appendDeskMessage(jobSessionId, {
+      upsertDeskMessage(jobSessionId, {
         role: "assistant",
         content: assistantBuf.trim(),
         thought: thoughtBuf.trim() || undefined,
         tools: toolsBuf.length ? toolsBuf : undefined,
         plan: planBuf.length ? planBuf : undefined,
-        id: clientMsgId ? `desk_a_${clientMsgId}` : `desk_a_${Date.now()}`,
+        id: draftId,
+        streaming: false,
       });
     };
 
@@ -1451,6 +1506,7 @@ async function runParallelPrompt(worker, text, attachments, opts = {}) {
     sessionId: jobSessionId,
     workerId: worker.id,
     parallel: true,
+    draftId,
   });
   broadcastAgents();
 
