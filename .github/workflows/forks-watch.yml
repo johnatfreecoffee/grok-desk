@@ -1,9 +1,8 @@
-# Autonomous fork watch — weekly summary issue so you notice new forks / activity.
+# Autonomous fork watch — weekly summary issue + email to John.
 name: Forks watch
 
 on:
   schedule:
-    # Mondays 15:00 UTC
     - cron: "0 15 * * 1"
   workflow_dispatch:
 
@@ -15,6 +14,8 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/github-script@v7
         with:
           script: |
@@ -53,15 +54,10 @@ jobs:
             }
             body += `\n### Remember\n`;
             body += `- Forks are **copies**. People can’t edit your \`main\` unless you merge a PR.\n`;
-            body += `- Never paste API keys into issues or PRs.\n`;
+            body += `- Reply to the notification email at e.grokdesk@freecoffee.dev to talk to Agent Mail about the repo.\n`;
             body += `\n<sub>Automated by forks-watch.yml · <!-- grok-desk-forks-watch --></sub>\n`;
 
             const title = `OSS pulse · ${new Date().toISOString().slice(0, 10)}`;
-            // Upsert: find open issue with marker
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: 'oss-pulse', per_page: 5,
-            });
-            // ensure label
             try {
               await github.rest.issues.getLabel({ owner, repo, name: 'oss-pulse' });
             } catch {
@@ -71,7 +67,25 @@ jobs:
               });
             }
 
-            // Always open a fresh weekly issue (history)
-            await github.rest.issues.create({
+            const issue = await github.rest.issues.create({
               owner, repo, title, body, labels: ['oss-pulse'],
             });
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/pulse-body.md', body + `\n\nIssue: ${issue.data.html_url}\n`);
+            fs.writeFileSync('/tmp/pulse-subject.txt', `[Grok Desk] ${title}`);
+
+      - name: Email John (weekly pulse)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          REPLY_TO: e.grokdesk@freecoffee.dev
+        run: |
+          if [ -z "$RESEND_API_KEY" ]; then
+            echo "RESEND_API_KEY secret not set — skip email"
+            exit 0
+          fi
+          export NOTIFY_FROM="${NOTIFY_FROM:-Grok Desk <e.grokdesk@freecoffee.dev>}"
+          export NOTIFY_TO="${NOTIFY_TO:-johnfrankromanojr@gmail.com}"
+          SUBJECT=$(cat /tmp/pulse-subject.txt)
+          SUBJECT="$SUBJECT" BODY_FILE=/tmp/pulse-body.md node scripts/mail-notify.mjs

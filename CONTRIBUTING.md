@@ -84,3 +84,14 @@ Never commit:
 ## Code of conduct (minimal)
 
 Be respectful. No spam PRs. Security issues: prefer private report — see [SECURITY.md](SECURITY.md).
+
+## Maintainer email alerts
+
+PR auto-reviews and weekly OSS pulses email:
+
+- **From:** `e.grokdesk@freecoffee.dev`
+- **To:** `johnfrankromanojr@gmail.com` (override with repo secret `NOTIFY_TO`)
+- **Reply:** back to `e.grokdesk@` → Agent Mail worker (trusted Gmail) can act in `~/Documents/grok-desk`
+
+GitHub secrets: `RESEND_API_KEY`, optional `NOTIFY_TO` / `NOTIFY_FROM`.
+Local test: `SUBJECT="test" BODY_FILE=note.md node scripts/mail-notify.mjs`

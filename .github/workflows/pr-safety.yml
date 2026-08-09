@@ -77,6 +77,46 @@ jobs:
               });
             }
 
+      - name: Email John (Agent Mail / Resend)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          REPLY_TO: e.grokdesk@freecoffee.dev
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HARD: ${{ steps.review.outputs.exit_code }}
+        run: |
+          if [ -z "$RESEND_API_KEY" ]; then
+            echo "RESEND_API_KEY secret not set — skip email"
+            exit 0
+          fi
+          export NOTIFY_FROM="${NOTIFY_FROM:-Grok Desk <e.grokdesk@freecoffee.dev>}"
+          export NOTIFY_TO="${NOTIFY_TO:-johnfrankromanojr@gmail.com}"
+          FLAG="OK"
+          if [ "${HARD}" = "2" ]; then FLAG="STOP"; fi
+          SUBJECT="[Grok Desk PR #${PR_NUM}] ${FLAG}: ${PR_TITLE}"
+          {
+            echo "Grok Desk auto-reviewed a pull request."
+            echo ""
+            echo "PR: #${PR_NUM} — ${PR_TITLE}"
+            echo "Author: @${PR_AUTHOR}"
+            echo "Link: ${PR_URL}"
+            echo "Verdict flag: ${FLAG}"
+            echo ""
+            echo "—— review (simple English) ——"
+            echo ""
+            cat /tmp/review.md
+            echo ""
+            echo "—— how to reply ——"
+            echo "Reply to this email (to e.grokdesk@freecoffee.dev)."
+            echo "Agent Mail will pick it up (trusted: your Gmail) and can work in the grok-desk repo."
+            echo "Or merge/comment on GitHub: ${PR_URL}"
+          } > /tmp/email-body.txt
+          SUBJECT="$SUBJECT" BODY_FILE=/tmp/email-body.txt node scripts/mail-notify.mjs
+
       - name: Fail job on hard flags
         if: steps.review.outputs.exit_code == '2'
         run: exit 1
