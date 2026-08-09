@@ -1052,11 +1052,14 @@ body.desk-app .shell.no-sidebar .topbar {
   top: 0;
   z-index: 30;
   min-width: 0;
+  flex-wrap: nowrap;
+  overflow: hidden;
   /* room for macOS traffic lights in Electron hiddenInset titlebar */
   -webkit-app-region: drag;
 }
 
 .topbar .top-actions,
+.topbar .chat-power-btns,
 .topbar .icon-btn,
 .topbar .pill {
   -webkit-app-region: no-drag;
@@ -1075,7 +1078,10 @@ body.desk-app .topbar {
   font-weight: 650;
   letter-spacing: -0.02em;
   min-width: 0;
+  flex: 1 1 auto;
   flex-shrink: 1;
+  flex-wrap: nowrap;
+  overflow: hidden;
 }
 
 .brand-mark {
@@ -1095,7 +1101,11 @@ body.desk-app .topbar {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  flex-shrink: 1;
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow: hidden;
   -webkit-app-region: no-drag;
 }
 
@@ -4062,11 +4072,27 @@ body.desk-app .topbar {
   gap: 6px;
   margin-top: 10px;
 }
+/* Session tools: always one horizontal strip — never wrap into a tall stack */
 .chat-power-btns {
   display: inline-flex;
-  gap: 4px;
+  gap: 2px;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+  max-width: none;
+}
+.chat-power-btns .icon-btn.sm {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 5px;
+  gap: 2px;
+}
+.chat-power-q {
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  min-width: 0.9em;
 }
 .fork-check {
   display: flex;

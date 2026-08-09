@@ -28,13 +28,20 @@ import { copyTextToClipboard } from "./lib/clipboard";
 import {
   ChevronDown,
   Copy,
+  Download,
   FolderOpen,
+  Gauge,
+  GitBranch,
+  History,
+  Info,
+  ListOrdered,
   PanelLeft,
   PanelRight,
   Paperclip,
   Plus,
   RotateCcw,
   Square,
+  Undo2,
   X,
 } from "lucide-react";
 import { NavRail } from "./shell/NavRail";
@@ -3093,63 +3100,84 @@ export default function App() {
             <span className="brand-text">Grok Desk</span>
             <span className="sub brand-sub">local</span>
             <ModuleInfo moduleId="chat" compact />
+            {projectName ? (
+              <span className="project-chip" title={agent?.cwd || projectName}>
+                {projectName}
+              </span>
+            ) : null}
+          </div>
+          <div className="top-actions">
             {agent?.sessionId ? (
-              <span className="chat-power-btns desktop-only-actions">
+              <span
+                className="chat-power-btns desktop-only-actions"
+                role="toolbar"
+                aria-label="Session tools"
+              >
                 <button
                   type="button"
                   className="icon-btn sm"
                   title="Session info"
+                  aria-label="Session info"
                   onClick={() => setSessionDrawer("info")}
                 >
-                  Info
+                  <Info size={14} strokeWidth={2.25} />
                 </button>
                 <button
                   type="button"
                   className="icon-btn sm"
                   title="Context & usage"
+                  aria-label="Context & usage"
                   onClick={() => setSessionDrawer("context")}
                 >
-                  Ctx
+                  <Gauge size={14} strokeWidth={2.25} />
                 </button>
                 <button
                   type="button"
                   className="icon-btn sm"
                   title="Rewind timeline"
+                  aria-label="Rewind timeline"
                   onClick={() => setSessionDrawer("rewind")}
                 >
-                  Rewind
+                  <Undo2 size={14} strokeWidth={2.25} />
                 </button>
                 <button
                   type="button"
                   className="icon-btn sm"
                   title="Prompt history"
+                  aria-label="Prompt history"
                   onClick={() => setSessionDrawer("history")}
                 >
-                  History
+                  <History size={14} strokeWidth={2.25} />
                 </button>
                 <button
                   type="button"
                   className="icon-btn sm"
                   title="Fork / worktree"
+                  aria-label="Fork / worktree"
                   onClick={() => setForkOpen(true)}
                 >
-                  Fork
+                  <GitBranch size={14} strokeWidth={2.25} />
                 </button>
                 <button
                   type="button"
                   className={`icon-btn sm ${queueLen > 0 ? "primary-btn" : ""}`}
                   title="Prompt queue"
+                  aria-label="Prompt queue"
                   onClick={() => {
                     clientRef.current?.send({ type: "queue_list" });
                     setQueueOpen(true);
                   }}
                 >
-                  Q{queueLen > 0 ? ` ${queueLen}` : ""}
+                  <ListOrdered size={14} strokeWidth={2.25} />
+                  {queueLen > 0 ? (
+                    <span className="chat-power-q">{queueLen}</span>
+                  ) : null}
                 </button>
                 <button
                   type="button"
                   className="icon-btn sm"
                   title="Export transcript"
+                  aria-label="Export transcript"
                   onClick={() => {
                     const body = messages
                       .map((m) => `## ${m.role}\n\n${m.content}\n`)
@@ -3162,17 +3190,10 @@ export default function App() {
                     URL.revokeObjectURL(a.href);
                   }}
                 >
-                  Export
+                  <Download size={14} strokeWidth={2.25} />
                 </button>
               </span>
             ) : null}
-            {projectName ? (
-              <span className="project-chip" title={agent?.cwd || projectName}>
-                {projectName}
-              </span>
-            ) : null}
-          </div>
-          <div className="top-actions">
             <span className={`pill ${statusPill.cls} status-pill`}>
               <span className="dot" />
               <span className="pill-label">{statusPill.label}</span>
