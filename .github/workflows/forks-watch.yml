@@ -67,8 +67,22 @@ jobs:
               });
             }
 
+            // Close any prior open pulses so digests don't treat them as real work.
+            const openPulses = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: 'oss-pulse', per_page: 50,
+            });
+            for (const old of openPulses) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: old.number, state: 'closed',
+              });
+            }
+
             const issue = await github.rest.issues.create({
               owner, repo, title, body, labels: ['oss-pulse'],
+            });
+            // Archive immediately — pulse is a log entry, not an open task.
+            await github.rest.issues.update({
+              owner, repo, issue_number: issue.data.number, state: 'closed',
             });
             const fs = require('fs');
             fs.writeFileSync('/tmp/pulse-body.md', body + `\n\nIssue: ${issue.data.html_url}\n`);

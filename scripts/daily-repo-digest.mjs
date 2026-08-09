@@ -58,8 +58,12 @@ const pullsRecent =
   ghJson(`repos/${REPO}/pulls?state=all&sort=updated&direction=desc&per_page=15`) || [];
 const issuesOpen =
   ghJson(`repos/${REPO}/issues?state=open&per_page=20`) || [];
-// issues API includes PRs — filter
-const issuesOnly = (Array.isArray(issuesOpen) ? issuesOpen : []).filter((i) => !i.pull_request);
+// issues API includes PRs — filter; skip automated oss-pulse log issues
+const issuesOnly = (Array.isArray(issuesOpen) ? issuesOpen : []).filter(
+  (i) =>
+    !i.pull_request &&
+    !(Array.isArray(i.labels) && i.labels.some((l) => (l.name || l) === "oss-pulse"))
+);
 const forks = ghJson(`repos/${REPO}/forks?sort=newest&per_page=30`) || [];
 const commits =
   ghJson(`repos/${REPO}/commits?since=${encodeURIComponent(since)}&per_page=20`) || [];

@@ -31,7 +31,7 @@ If someone sends a malicious PR (e.g. exfiltrating env vars), **don’t merge it
 |----------|------|----------------|
 | **CI** | every PR / push to `main` | Build must pass |
 | **PR safety review** | every PR | Bot comment in **simple English** (secrets, dangerous shell, bind address, etc.). Hard flags fail the check. |
-| **Forks watch** | weekly (Mon) + manual | Opens an `oss-pulse` issue: new forks + open PRs |
+| **Forks watch** | manual (optional) | Posts + auto-closes an `oss-pulse` issue (log only); emails pulse |
 
 You still decide merges. The bot is a smoke alarm, not a lawyer.
 
