@@ -617,8 +617,11 @@ export default function App() {
       const draft = draftRef.current;
       const viewing =
         !suppressPaintRef.current &&
-        (!sid || agentRef.current?.sessionId === sid);
+        Boolean(sid) &&
+        Boolean(agentRef.current?.sessionId) &&
+        agentRef.current!.sessionId === sid;
 
+      busyRef.current = false;
       setBusy(false);
       setBgWorkingBanner(false);
 
@@ -739,10 +742,16 @@ export default function App() {
         return;
       }
 
-      // Server live — rehydrate if we own / should show that session
+      // Server live — record who is live; only claim view busy when viewing that session
       if (liveSid) {
-        turnSessionRef.current = liveSid;
-        setBusy(true);
+        const viewed = agentRef.current?.sessionId;
+        if (!turnSessionRef.current || turnSessionRef.current === liveSid) {
+          turnSessionRef.current = liveSid;
+        } else if (!viewed || viewed === liveSid) {
+          // Viewing the live one (or blank after complete attach) — claim if paint allowed
+          if (!suppressPaintRef.current) turnSessionRef.current = liveSid;
+        }
+        // Always keep draft in map for liveSid
         setSessionListStatus(liveSid, "working");
         const partial = snap.partialDraft;
         if (partial) {
@@ -754,13 +763,26 @@ export default function App() {
           draft.plan = (partial.plan as TurnDraft["plan"]) || [];
           draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
           liveDraftBySessionRef.current.set(liveSid, draft);
-          if (agentRef.current?.sessionId === liveSid) {
+          if (
+            !suppressPaintRef.current &&
+            viewed &&
+            viewed === liveSid
+          ) {
             draftRef.current = draft;
             setLiveDraft(draft);
           }
         }
+        const viewingLive =
+          !suppressPaintRef.current && Boolean(viewed) && viewed === liveSid;
+        if (viewingLive) {
+          setBusy(true);
+          busyRef.current = true;
+        }
         setBgWorkingBanner(
-          Boolean(agentRef.current?.sessionId && agentRef.current.sessionId !== liveSid),
+          Boolean(
+            turnSessionRef.current &&
+              (!viewed || viewed !== turnSessionRef.current),
+          ),
         );
       }
     };
@@ -928,17 +950,27 @@ export default function App() {
         const midTurn = Boolean(
           busyRef.current || draftRef.current || turnSessionRef.current,
         );
-        setAgent((a) =>
-          a
-            ? { ...a, sessionId: info.sessionId, cwd: info.cwd || a.cwd, ready: true }
-            : {
-                agentAlive: true,
-                ready: true,
-                sessionId: info.sessionId,
-                cwd: info.cwd,
-                grokBin: "",
-              },
-        );
+        // User New / parallel blank session / creating phase — never steal live turn
+        const creatingOrSwitching =
+          suppressPaintRef.current ||
+          Boolean((info as { parallel?: boolean }).parallel);
+
+        const bindAgentSession = () => {
+          setAgent((a) => {
+            const next = a
+              ? { ...a, sessionId: info.sessionId, cwd: info.cwd || a.cwd, ready: true }
+              : {
+                  agentAlive: true,
+                  ready: true,
+                  sessionId: info.sessionId,
+                  cwd: info.cwd,
+                  grokBin: "",
+                };
+            agentRef.current = next as any;
+            return next as any;
+          });
+        };
+
         if (info.cwd) preferredCwdRef.current = info.cwd;
         saveLastSession(info.sessionId, info.cwd);
         // Ensure new chats appear in sidebar immediately under the project
@@ -947,10 +979,23 @@ export default function App() {
         );
         setSidebarTick((n) => n + 1);
 
-        // CRITICAL: agent often emits session/new after turn_start. Never wipe the
-        // live stream / messages mid-turn (mobile "green only" + lost reply).
-        if (midTurn) {
-          const oldOwner = turnSessionRef.current || prevSid;
+        // Same-turn session/new rebinding ONLY: delayed session id on the SAME turn
+        // (agent often emits session/new after turn_start). Never remap A → B on New.
+        const oldOwner = turnSessionRef.current || prevSid;
+        // Established live owner with its own draft → parallel/new session, not rebind
+        const parallelSteal =
+          Boolean(turnSessionRef.current) &&
+          turnSessionRef.current !== info.sessionId &&
+          (liveDraftBySessionRef.current.has(turnSessionRef.current!) ||
+            creatingOrSwitching);
+
+        if (
+          midTurn &&
+          !creatingOrSwitching &&
+          !suppressPaintRef.current &&
+          !parallelSteal
+        ) {
+          bindAgentSession();
           if (oldOwner && oldOwner !== info.sessionId) {
             const cached = sessionCacheRef.current.get(oldOwner);
             if (cached?.length) sessionCacheRef.current.set(info.sessionId, cached);
@@ -967,6 +1012,92 @@ export default function App() {
           return;
         }
 
+        // Creating blank / parallel new session while another turn lives: bind B
+        // without stealing live ownership from A.
+        if (
+          creatingOrSwitching ||
+          parallelSteal ||
+          (midTurn &&
+            turnSessionRef.current &&
+            info.sessionId !== turnSessionRef.current)
+        ) {
+          bindAgentSession();
+          setSessionListStatus(info.sessionId, null);
+          const pending = pendingPromptRef.current;
+          if (pending) {
+            const seed: ChatMessage[] = [
+              {
+                id: uid(),
+                role: "user",
+                content: pending.label || pending.text,
+              },
+            ];
+            setMessages(seed);
+            sessionCacheRef.current.set(info.sessionId, seed);
+            const t = (pending.label || pending.text).trim().replace(/\s+/g, " ");
+            setSessionTitles((prev) => ({
+              ...prev,
+              [info.sessionId]:
+                (t.length > 72 ? t.slice(0, 72) + "…" : t) || info.title || "New chat",
+            }));
+          } else {
+            // Empty B — do NOT copy live draft / transcript from A
+            setMessages([]);
+            sessionCacheRef.current.set(info.sessionId, []);
+            setSessionTitles((prev) => ({
+              ...prev,
+              [info.sessionId]: info.title || "New chat",
+            }));
+          }
+          // B is idle in the view; A may still own turnSessionRef
+          busyRef.current = false;
+          setBusy(false);
+          setLiveDraft(null);
+          draftRef.current = null;
+          // Do NOT set turnSessionRef = B
+          setBgWorkingBanner(
+            Boolean(
+              turnSessionRef.current && turnSessionRef.current !== info.sessionId,
+            ),
+          );
+          viewOnlyRef.current = Boolean(
+            turnSessionRef.current && turnSessionRef.current !== info.sessionId,
+          );
+          setViewOnlyBrowse(viewOnlyRef.current);
+          suppressPaintRef.current = false; // clean empty B ready to paint its own events
+          setQueueLen(0);
+          setLoadingSession(false);
+          setSessionPhase("ready");
+          setHistoryOnly(false);
+          setSessionArtifacts([]);
+          setArtifactFocus(null);
+          if (!artifactsPinned) setArtifactsOpen(false);
+          setSidebarTick((n) => n + 1);
+          if (focusComposerRef.current) {
+            focusComposerRef.current = false;
+            window.setTimeout(() => focusComposer(), 50);
+          }
+          if (pending) {
+            pendingPromptRef.current = null;
+            // Pending prompt owns a new turn on B
+            turnSessionRef.current = info.sessionId;
+            setSessionListStatus(info.sessionId, "working");
+            busyRef.current = true;
+            setBusy(true);
+            setBgWorkingBanner(false);
+            viewOnlyRef.current = false;
+            setViewOnlyBrowse(false);
+            setTimeout(() => {
+              clientRef.current?.prompt(pending.text, pending.atts, {
+                sessionId: info.sessionId,
+                clientMsgId: uid(),
+              });
+            }, 80);
+          }
+          return;
+        }
+
+        bindAgentSession();
         setSessionListStatus(info.sessionId, null);
         const pending = pendingPromptRef.current;
         if (pending) {
@@ -994,6 +1125,7 @@ export default function App() {
           }));
         }
         setBusy(false);
+        busyRef.current = false;
         setLiveDraft(null);
         draftRef.current = null;
         viewOnlyRef.current = false;
@@ -1023,8 +1155,8 @@ export default function App() {
         }
       },
       onSessionLoaded: (info) => {
-        setAgent((a) =>
-          a
+        setAgent((a) => {
+          const next = a
             ? { ...a, sessionId: info.sessionId, cwd: info.cwd || a.cwd, ready: true }
             : {
                 agentAlive: true,
@@ -1032,8 +1164,10 @@ export default function App() {
                 sessionId: info.sessionId,
                 cwd: info.cwd,
                 grokBin: "",
-              },
-        );
+              };
+          agentRef.current = next as any;
+          return next as any;
+        });
         if (info.cwd) preferredCwdRef.current = info.cwd;
         saveLastSession(info.sessionId, info.cwd);
         const disk = (info.messages || []).map((m) => ({
@@ -1104,31 +1238,46 @@ export default function App() {
         }
         setMessages(merged);
         sessionCacheRef.current.set(info.sessionId, merged);
+        // This session is "live" only when it owns the turn (not a sibling worker)
+        const ownsLive =
+          turnSessionRef.current === info.sessionId ||
+          (live && turnSessionRef.current === info.sessionId);
         const turnActive = Boolean(
-          (info as { turnActive?: boolean }).turnActive ||
-            (live && turnSessionRef.current === info.sessionId) ||
-            Boolean(partial),
+          ownsLive ||
+            (live && !turnSessionRef.current) ||
+            (Boolean(partial) &&
+              (!turnSessionRef.current || turnSessionRef.current === info.sessionId)),
         );
         const viewOnly = Boolean((info as { viewOnly?: boolean }).viewOnly);
+        suppressPaintRef.current = false;
         if (turnActive && (live || turnSessionRef.current === info.sessionId || partial)) {
           viewOnlyRef.current = false;
           setViewOnlyBrowse(false);
           if (live) {
             draftRef.current = live;
             setLiveDraft(live);
-            turnSessionRef.current = info.sessionId;
+            // Only claim ownership if free or already this session
+            if (!turnSessionRef.current || turnSessionRef.current === info.sessionId) {
+              turnSessionRef.current = info.sessionId;
+            }
           }
+          busyRef.current = true;
           setBusy(true);
+          setBgWorkingBanner(false);
           setHistoryOnly(false);
           setSessionPhase("ready");
-        } else if (viewOnly) {
-          // Browsing another chat while a background turn runs
+        } else if (
+          viewOnly ||
+          (turnSessionRef.current && turnSessionRef.current !== info.sessionId)
+        ) {
+          // Browsing another chat while a background turn runs — view is idle
           viewOnlyRef.current = true;
           setViewOnlyBrowse(true);
           setLiveDraft(null);
           draftRef.current = null;
-          // keep busy if background turn still going
-          setBusy(Boolean(turnSessionRef.current));
+          busyRef.current = false;
+          setBusy(false);
+          setBgWorkingBanner(true);
           setHistoryOnly(true);
           setSessionPhase("history_only");
         } else if (live && turnSessionRef.current === info.sessionId) {
@@ -1136,15 +1285,23 @@ export default function App() {
           setViewOnlyBrowse(false);
           draftRef.current = live;
           setLiveDraft(live);
+          busyRef.current = true;
           setBusy(true);
+          setBgWorkingBanner(false);
           setHistoryOnly(false);
           setSessionPhase("ready");
         } else {
           viewOnlyRef.current = false;
           setViewOnlyBrowse(false);
+          busyRef.current = false;
           setBusy(false);
           setLiveDraft(null);
           draftRef.current = null;
+          setBgWorkingBanner(
+            Boolean(
+              turnSessionRef.current && turnSessionRef.current !== info.sessionId,
+            ),
+          );
           setSessionPhase(info.agentResumed === false ? "history_only" : "ready");
           setHistoryOnly(info.agentResumed === false);
         }
@@ -1194,21 +1351,37 @@ export default function App() {
         setSessionListStatus(sid, s);
       },
       onTurnStart: (info) => {
-        setBusy(true);
         // Server sessionId is source of truth; never steal owner from viewed chat
         const sid =
           info?.sessionId ||
           turnSessionRef.current ||
           null;
-        if (sid) turnSessionRef.current = sid;
-        if (sid) setSessionListStatus(sid, "working");
-        setBgWorkingBanner(true);
+        if (sid) {
+          // Only claim live ownership if no other owner, or same session
+          if (!turnSessionRef.current || turnSessionRef.current === sid) {
+            turnSessionRef.current = sid;
+          }
+          setSessionListStatus(sid, "working");
+        }
         // New-chat mid-turn: never paint old stream into the blank new thread
         const viewing =
           !suppressPaintRef.current &&
-          (!sid ||
-            !agentRef.current?.sessionId ||
-            agentRef.current?.sessionId === sid);
+          Boolean(sid) &&
+          Boolean(agentRef.current?.sessionId) &&
+          agentRef.current!.sessionId === sid;
+        if (viewing) {
+          setBusy(true);
+          busyRef.current = true;
+          setBgWorkingBanner(false);
+        } else {
+          // Background turn — keep view idle; show bg banner if someone else lives
+          setBgWorkingBanner(
+            Boolean(
+              turnSessionRef.current &&
+                turnSessionRef.current !== agentRef.current?.sessionId,
+            ),
+          );
+        }
         // Clear queued badges for the message that just started (view only)
         if (viewing) {
           setMessages((prev) =>
@@ -1218,25 +1391,36 @@ export default function App() {
         // Prefer server draftId so reconnect / partial_draft / desk shadow share one id
         const serverDraftId = info?.draftId ? String(info.draftId) : null;
         // Reconnect may re-emit turn_start — reuse existing streaming draft
-        if (info?.resume && draftRef.current) {
+        if (info?.resume && draftRef.current && viewing) {
           if (serverDraftId && draftRef.current.id !== serverDraftId) {
             draftRef.current = { ...draftRef.current, id: serverDraftId };
           }
-          if (viewing) setLiveDraft({ ...draftRef.current });
+          setLiveDraft({ ...draftRef.current });
+          if (sid) liveDraftBySessionRef.current.set(sid, draftRef.current);
           return;
         }
-        if (draftRef.current && draftRef.current.phase !== "idle") {
+        if (viewing && draftRef.current && draftRef.current.phase !== "idle") {
           if (serverDraftId && draftRef.current.id !== serverDraftId) {
             const oldId = draftRef.current.id;
             draftRef.current = { ...draftRef.current, id: serverDraftId };
-            if (viewing) {
-              setMessages((prev) =>
-                prev.map((m) => (m.id === oldId ? { ...m, id: serverDraftId } : m)),
-              );
-            }
+            setMessages((prev) =>
+              prev.map((m) => (m.id === oldId ? { ...m, id: serverDraftId } : m)),
+            );
           }
-          if (viewing) setLiveDraft({ ...draftRef.current });
+          setLiveDraft({ ...draftRef.current });
+          if (sid) liveDraftBySessionRef.current.set(sid, draftRef.current);
           return;
+        }
+        // Background resume: refresh map only, leave view draftRef alone
+        if (!viewing && sid) {
+          const existingBg = liveDraftBySessionRef.current.get(sid);
+          if (existingBg) {
+            if (serverDraftId && existingBg.id !== serverDraftId) {
+              existingBg.id = serverDraftId;
+            }
+            liveDraftBySessionRef.current.set(sid, existingBg);
+            return;
+          }
         }
         const existing = viewing
           ? messagesRef.current.find((m) => m.streaming && m.role === "assistant")
@@ -1248,9 +1432,9 @@ export default function App() {
           draft.thought = existing.thought || "";
           draft.tools = existing.tools || [];
           draft.plan = existing.plan || [];
-          draftRef.current = draft;
           if (sid) liveDraftBySessionRef.current.set(sid, draft);
           if (viewing) {
+            draftRef.current = draft;
             setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
             if (id !== existing.id) {
               setMessages((prev) =>
@@ -1262,9 +1446,9 @@ export default function App() {
         }
         const id = serverDraftId || uid();
         const draft = createTurnDraft(id);
-        draftRef.current = draft;
         if (sid) liveDraftBySessionRef.current.set(sid, draft);
         if (viewing) {
+          draftRef.current = draft;
           setLiveDraft({ ...draft, tools: [], plan: [] });
           setMessages((prev) => {
             // Avoid double empty assistant rows on reconnect
@@ -1285,13 +1469,17 @@ export default function App() {
       onUpdate: (update, meta) => {
         const updateSid =
           meta?.sessionId || turnSessionRef.current || agentRef.current?.sessionId || null;
-        // Ignore paint into main pane when New is in flight or viewing another chat
+        // Require both sides known and equal — never paint when sessionId is null
         const viewing =
           !suppressPaintRef.current &&
-          (!updateSid || agentRef.current?.sessionId === updateSid);
+          Boolean(updateSid) &&
+          Boolean(agentRef.current?.sessionId) &&
+          agentRef.current!.sessionId === updateSid;
         let draft = draftRef.current;
         // If this update belongs to a different turn owner than current draft, use cache
         if (updateSid && turnSessionRef.current && updateSid !== turnSessionRef.current) {
+          draft = liveDraftBySessionRef.current.get(updateSid) || draft;
+        } else if (updateSid && !viewing) {
           draft = liveDraftBySessionRef.current.get(updateSid) || draft;
         }
         // Reconnect mid-stream: only recreate draft if we already know a live turn owner
@@ -1301,31 +1489,41 @@ export default function App() {
           const canRevive =
             Boolean(liveOwner) &&
             (!updateSid || updateSid === liveOwner) &&
-            (busyRef.current || liveDraftBySessionRef.current.has(liveOwner!));
-          if (!canRevive) {
+            (busyRef.current ||
+              liveDraftBySessionRef.current.has(liveOwner!) ||
+              Boolean(updateSid && liveDraftBySessionRef.current.has(updateSid)));
+          if (!canRevive && !updateSid) {
             // Stale update after turn end — ignore
             return;
           }
-          const existing = liveDraftBySessionRef.current.get(liveOwner!);
+          const ownerKey = updateSid || liveOwner;
+          if (!ownerKey) return;
+          const existing = liveDraftBySessionRef.current.get(ownerKey);
+          if (!existing && !canRevive) return;
           const id = existing?.id || uid();
           draft = existing || createTurnDraft(id);
-          draftRef.current = draft;
-          setBusy(true);
           const sid = updateSid || liveOwner || null;
           if (sid) {
-            turnSessionRef.current = sid;
+            if (!turnSessionRef.current || turnSessionRef.current === sid) {
+              turnSessionRef.current = sid;
+            }
             liveDraftBySessionRef.current.set(sid, draft);
             setSessionListStatus(sid, "working");
           }
-          if (viewing && !existing) {
-            setMessages((prev) => {
-              const next: ChatMessage[] = [
-                ...prev,
-                { id, role: "assistant", content: "", streaming: true },
-              ];
-              if (sid) sessionCacheRef.current.set(sid, next);
-              return next;
-            });
+          if (viewing) {
+            draftRef.current = draft;
+            setBusy(true);
+            busyRef.current = true;
+            if (!existing) {
+              setMessages((prev) => {
+                const next: ChatMessage[] = [
+                  ...prev,
+                  { id, role: "assistant", content: "", streaming: true },
+                ];
+                if (sid) sessionCacheRef.current.set(sid, next);
+                return next;
+              });
+            }
           }
         }
         applyTurnUpdate(draft, update);
@@ -1335,7 +1533,8 @@ export default function App() {
           tools: draft.tools.map((t) => ({ ...t })),
           plan: draft.plan.map((p) => ({ ...p })),
         };
-        if (viewing || !suppressPaintRef.current) draftRef.current = snap;
+        // Only bind draftRef to view when painting this session
+        if (viewing) draftRef.current = snap;
         const turnSid = updateSid || turnSessionRef.current || agentRef.current?.sessionId;
         if (turnSid) {
           liveDraftBySessionRef.current.set(turnSid, snap);
@@ -1426,12 +1625,14 @@ export default function App() {
         draft.plan = (partial.plan as TurnDraft["plan"]) || [];
         draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
         liveDraftBySessionRef.current.set(sid, draft);
-        setBusy(true);
         setSessionListStatus(sid, "working");
         const viewing =
           !suppressPaintRef.current &&
-          (!agentRef.current?.sessionId || agentRef.current.sessionId === sid);
+          Boolean(agentRef.current?.sessionId) &&
+          agentRef.current!.sessionId === sid;
         if (viewing) {
+          setBusy(true);
+          busyRef.current = true;
           draftRef.current = draft;
           setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
           setMessages((prev) => {
@@ -1522,10 +1723,15 @@ export default function App() {
           !endedSid ||
           endedSid === liveOwner;
         if (endsLive) {
+          busyRef.current = false;
           setBusy(false);
           setBgWorkingBanner(false);
           turnSessionRef.current = null;
         }
+        // Prefer map draft for the ended session (view may be on another chat)
+        const draft =
+          (endedSid && liveDraftBySessionRef.current.get(endedSid)) ||
+          draftRef.current;
         if (endedSid) liveDraftBySessionRef.current.delete(endedSid);
         // Only clear observe-mode when the *ended* turn is the one we're viewing
         const viewingId = agentRef.current?.sessionId;
@@ -1536,6 +1742,7 @@ export default function App() {
           setHistoryOnly(false);
           setSessionPhase("ready");
         } else if (viewOnlyRef.current) {
+          busyRef.current = false;
           setBusy(false);
         } else if (endsLive) {
           viewOnlyRef.current = false;
@@ -1548,7 +1755,6 @@ export default function App() {
           else if (endedIsViewing) setSessionListStatus(endedSid, null); // read
           else setSessionListStatus(endedSid, "done"); // green unread
         }
-        const draft = draftRef.current;
         const finalizeRow = (m: ChatMessage): ChatMessage => {
           const isDraft = draft && m.id === draft.id;
           if (isDraft && draft) {
@@ -1576,7 +1782,9 @@ export default function App() {
         if (draft) mergeArtifacts(artifactsFromDraft(draft));
         const stillViewing =
           !suppressPaintRef.current &&
-          (!turnSid || agentRef.current?.sessionId === turnSid);
+          Boolean(turnSid) &&
+          Boolean(agentRef.current?.sessionId) &&
+          agentRef.current!.sessionId === turnSid;
         if (stillViewing) {
           setMessages((prev) => {
             let next = prev.map(finalizeRow);
@@ -1614,12 +1822,8 @@ export default function App() {
         } else {
           setMessages((prev) => prev.map(finalizeRow));
         }
-        if (!suppressPaintRef.current) draftRef.current = null;
-        else if (endsLive) draftRef.current = null;
-        if (
-          !suppressPaintRef.current &&
-          (!turnSid || agentRef.current?.sessionId === turnSid)
-        ) {
+        if (endsLive || stillViewing) draftRef.current = null;
+        if (stillViewing) {
           setLiveDraft(null);
         }
         setSidebarTick((n) => n + 1);
@@ -1690,24 +1894,41 @@ export default function App() {
       if (!client?.isConnected() || client.lastInboundAge() > 15000) {
         void fetchTurnTruth().then((snap) => {
           if (!snap) return;
-          if (!snap.turnActive && (busyRef.current || draftRef.current)) {
+          if (!snap.turnActive && (busyRef.current || draftRef.current || turnSessionRef.current)) {
             // Re-use connect-time finalize via status path simulation
             clientRef.current?.requestStatus();
-            // Direct HTTP finalize path
+            // Direct HTTP finalize path — only paint if viewing the live session
+            const sid = turnSessionRef.current || agentRef.current?.sessionId;
+            const viewing =
+              Boolean(sid) &&
+              Boolean(agentRef.current?.sessionId) &&
+              agentRef.current!.sessionId === sid;
+            busyRef.current = false;
             setBusy(false);
             setBgWorkingBanner(false);
-            setLiveDraft(null);
-            draftRef.current = null;
-            const sid = turnSessionRef.current || agentRef.current?.sessionId;
+            if (viewing) {
+              setLiveDraft(null);
+              draftRef.current = null;
+            }
             if (sid) {
               liveDraftBySessionRef.current.delete(sid);
-              setMessages((prev) => {
-                const next = prev.map((m) =>
-                  m.streaming ? { ...m, streaming: false, phase: "idle" } : m,
+              if (viewing) {
+                setMessages((prev) => {
+                  const next = prev.map((m) =>
+                    m.streaming ? { ...m, streaming: false, phase: "idle" } : m,
+                  );
+                  sessionCacheRef.current.set(sid, next);
+                  return next;
+                });
+              } else {
+                const cached = sessionCacheRef.current.get(sid) || [];
+                sessionCacheRef.current.set(
+                  sid,
+                  cached.map((m) =>
+                    m.streaming ? { ...m, streaming: false, phase: "idle" } : m,
+                  ),
                 );
-                sessionCacheRef.current.set(sid, next);
-                return next;
-              });
+              }
               turnSessionRef.current = null;
               // Pull final transcript
               void (async () => {
@@ -1739,12 +1960,12 @@ export default function App() {
                     }),
                   );
                   if (!disk.length) return;
-                  if (agentRef.current?.sessionId !== sid) return;
                   const merged = pickMessages(sid, disk).map((m) => ({
                     ...m,
                     streaming: false,
                   }));
                   sessionCacheRef.current.set(sid, merged);
+                  if (agentRef.current?.sessionId !== sid) return;
                   setMessages(merged);
                 } catch {
                   /* */
@@ -1780,31 +2001,47 @@ export default function App() {
             client?.requestStatus();
             // Force unlock if status path missed
             setTimeout(() => {
-              if ((busyRef.current || draftRef.current) && snap && !snap.turnActive) {
+              if (
+                (busyRef.current || draftRef.current || turnSessionRef.current) &&
+                snap &&
+                !snap.turnActive
+              ) {
+                const sid = turnSessionRef.current || agentRef.current?.sessionId;
+                const viewing =
+                  Boolean(sid) &&
+                  Boolean(agentRef.current?.sessionId) &&
+                  agentRef.current!.sessionId === sid;
+                const d =
+                  (sid && liveDraftBySessionRef.current.get(sid)) || draftRef.current;
+                busyRef.current = false;
                 setBusy(false);
                 setBgWorkingBanner(false);
-                setLiveDraft(null);
-                const d = draftRef.current;
-                draftRef.current = null;
-                const sid = turnSessionRef.current || agentRef.current?.sessionId;
+                if (viewing) {
+                  setLiveDraft(null);
+                  draftRef.current = null;
+                }
                 if (sid) liveDraftBySessionRef.current.delete(sid);
                 turnSessionRef.current = null;
-                setMessages((prev) =>
-                  prev.map((m) => {
-                    if (!m.streaming && !(d && m.id === d.id)) return m;
-                    return {
-                      ...m,
-                      streaming: false,
-                      content:
-                        (d && m.id === d.id ? d.content || m.content : m.content) ||
-                        (d?.tools?.length ? "" : m.content || "✓"),
-                      thought: (d && m.id === d.id ? d.thought : m.thought) || m.thought,
-                      tools: (d && m.id === d.id ? d.tools : m.tools) || m.tools,
-                      plan: (d && m.id === d.id ? d.plan : m.plan) || m.plan,
-                      phase: "idle",
-                    };
-                  }),
-                );
+                const finalize = (m: ChatMessage): ChatMessage => {
+                  if (!m.streaming && !(d && m.id === d.id)) return m;
+                  return {
+                    ...m,
+                    streaming: false,
+                    content:
+                      (d && m.id === d.id ? d.content || m.content : m.content) ||
+                      (d?.tools?.length ? "" : m.content || "✓"),
+                    thought: (d && m.id === d.id ? d.thought : m.thought) || m.thought,
+                    tools: (d && m.id === d.id ? d.tools : m.tools) || m.tools,
+                    plan: (d && m.id === d.id ? d.plan : m.plan) || m.plan,
+                    phase: "idle",
+                  };
+                };
+                if (viewing) {
+                  setMessages((prev) => prev.map(finalize));
+                } else if (sid) {
+                  const cached = sessionCacheRef.current.get(sid) || [];
+                  sessionCacheRef.current.set(sid, cached.map(finalize));
+                }
               }
             }, 400);
           }
@@ -1965,7 +2202,8 @@ export default function App() {
         liveDraftBySessionRef.current.set(sid, draft);
         const viewing =
           !suppressPaintRef.current &&
-          (!agentRef.current?.sessionId || agentRef.current.sessionId === sid);
+          Boolean(agentRef.current?.sessionId) &&
+          agentRef.current!.sessionId === sid;
         if (!viewing) {
           const cached = sessionCacheRef.current.get(sid) || [];
           sessionCacheRef.current.set(
@@ -2146,8 +2384,10 @@ export default function App() {
         turnSessionRef.current = sid;
         setSessionListStatus(sid, "working");
       }
-      if (!busyRef.current) setBusy(true);
-      else setQueueLen((n) => n + 1);
+      if (!busyRef.current) {
+        busyRef.current = true;
+        setBusy(true);
+      } else setQueueLen((n) => n + 1);
       clientRef.current?.prompt(text, atts, { sessionId: sid, clientMsgId });
       setSidebarTick((n) => n + 1);
       scrollToBottom();
@@ -2262,8 +2502,10 @@ export default function App() {
       turnSessionRef.current = sid;
       setSessionListStatus(sid, "working");
     }
-    if (!busy) setBusy(true);
-    else setQueueLen((n) => n + 1);
+    if (!busyRef.current) {
+      busyRef.current = true;
+      setBusy(true);
+    } else setQueueLen((n) => n + 1);
     clientRef.current?.prompt(text, atts, { sessionId: sid, clientMsgId });
     setAttachments([]);
     setSidebarTick((n) => n + 1);
@@ -2273,6 +2515,7 @@ export default function App() {
 
   /** Drop mid-turn UI so New / Open folder / switch session always work. */
   const resetTurnUi = useCallback(() => {
+    busyRef.current = false;
     setBusy(false);
     setLiveDraft(null);
     draftRef.current = null;
@@ -2323,27 +2566,32 @@ export default function App() {
   const newChat = useCallback(
     (cwd?: string) => {
       const prevLive = turnSessionRef.current;
-      // New abandons any live turn — clear amber immediately + honest banner
-      if (prevLive || busyRef.current) {
-        if (prevLive) {
-          setSessionListStatus(prevLive, null);
-          liveDraftBySessionRef.current.delete(prevLive);
-        }
-        setPrevStoppedBanner(true);
-        window.setTimeout(() => setPrevStoppedBanner(false), 3200);
+      // Leaving mid-turn A: daemon continues A on a parallel worker. Keep ownership
+      // + live draft for A so the stream never remaps onto blank B.
+      const leavingLive = Boolean(prevLive || busyRef.current);
+      if (prevLive) {
+        setSessionListStatus(prevLive, "working");
+        // Do NOT delete liveDraftBySessionRef for prevLive
       }
-      turnSessionRef.current = null;
+      // Keep turnSessionRef on A (bg banner / ownership). Do not null it.
       suppressPaintRef.current = true; // block old stream painting into blank thread
-      setBgWorkingBanner(false);
+      setBgWorkingBanner(leavingLive);
       stashSession();
       setError(null);
       setNewMenuOpen(false);
-      resetTurnUi();
-      setMessages([]);
+      // View-only unlock: composer free on B while A may still stream in map
+      busyRef.current = false;
+      setBusy(false);
       setLiveDraft(null);
       draftRef.current = null;
+      setQueueLen(0);
+      setMessages([]);
       // Detach agent session so late updates for A fail the viewing check
-      setAgent((a) => (a ? { ...a, sessionId: null } : a));
+      setAgent((a) => {
+        const next = a ? { ...a, sessionId: null as any, ready: false } : a;
+        agentRef.current = next as any;
+        return next as any;
+      });
       setSessionPhase("creating");
       setLoadingSession(true);
       setHistoryOnly(false);
@@ -2359,7 +2607,7 @@ export default function App() {
       // Sync focus BEFORE any await — iOS won't open keyboard on delayed focus
       focusComposer({ sync: true });
     },
-    [agent?.cwd, resetTurnUi, stashSession, closeMobileSidebar, focusComposer, setSessionListStatus],
+    [agent?.cwd, stashSession, closeMobileSidebar, focusComposer, setSessionListStatus],
   );
 
   const openFolder = useCallback(async () => {
@@ -2373,17 +2621,30 @@ export default function App() {
         folder = window.prompt("Folder path to open as project:", agent?.cwd || "") || null;
       }
       if (!folder) return;
+      const prevLive = turnSessionRef.current;
+      const leavingLive = Boolean(prevLive || busyRef.current);
+      if (prevLive) setSessionListStatus(prevLive, "working");
       stashSession();
       setError(null);
-      resetTurnUi();
+      // View unlock only — keep A live ownership / draft map if daemon continues
+      busyRef.current = false;
+      setBusy(false);
+      setLiveDraft(null);
+      draftRef.current = null;
+      setQueueLen(0);
       setMessages([]);
       setSessionPhase("creating");
       setLoadingSession(true);
       setHistoryOnly(false);
       preferredCwdRef.current = folder;
       suppressPaintRef.current = true;
-      turnSessionRef.current = null;
-      setAgent((a) => (a ? { ...a, sessionId: null } : a));
+      // Keep turnSessionRef on prevLive so bg banner / ownership survive
+      setBgWorkingBanner(leavingLive);
+      setAgent((a) => {
+        const next = a ? { ...a, sessionId: null as any, ready: false } : a;
+        agentRef.current = next as any;
+        return next as any;
+      });
       closeMobileSidebar();
       focusComposerRef.current = true;
       clientRef.current?.newSession(folder);
@@ -2394,7 +2655,7 @@ export default function App() {
       setLoadingSession(false);
       setSessionPhase("error");
     }
-  }, [agent?.cwd, resetTurnUi, stashSession, closeMobileSidebar, focusComposer]);
+  }, [agent?.cwd, stashSession, closeMobileSidebar, focusComposer, setSessionListStatus]);
 
   const openSession = useCallback(
     (s: SessionMeta) => {
@@ -2408,7 +2669,10 @@ export default function App() {
       const liveSid = turnSessionRef.current;
       const isLive =
         Boolean(liveSid) &&
-        (busyRef.current || busy || liveDraftBySessionRef.current.has(liveSid!));
+        (busyRef.current ||
+          busy ||
+          liveDraftBySessionRef.current.has(liveSid!) ||
+          Boolean(liveSid));
       const isBackgroundLive = Boolean(liveSid && liveSid === s.id && isLive);
       if (!isBackgroundLive) setSessionListStatus(s.id, null);
       stashSession();
@@ -2418,28 +2682,52 @@ export default function App() {
       // Another chat is working — view transcript only, do NOT kill that turn
       // Use turnSessionRef (set optimistically on send) not only React busy
       const viewOnly = Boolean(isLive && liveSid && liveSid !== s.id);
+      // Block A's stream from painting into B while loadSession settles
+      suppressPaintRef.current = true;
       if (!keepLive && !viewOnly) resetTurnUi();
       if (viewOnly) {
-        // Stay globally "busy" for the other session's turn; this chat is history
+        // Stay tracking A as live owner; clear VIEW draft only (not A's map entry)
         setLiveDraft(null);
+        draftRef.current = null;
+        busyRef.current = false;
+        setBusy(false);
+        setBgWorkingBanner(true);
       }
       setSessionPhase("loading");
       setLoadingSession(true);
       setHistoryOnly(false);
+      // Load B from cache only — never wipe A's liveDraftBySessionRef
       const cached = sessionCacheRef.current.get(s.id);
       setMessages(cached && cached.length ? cached : []);
+      // Sync agentRef early so viewing checks key off B immediately
+      setAgent((a) => {
+        const next = a
+          ? { ...a, sessionId: s.id, cwd: s.cwd || a.cwd, ready: false }
+          : a;
+        agentRef.current = next as any;
+        return next as any;
+      });
       if (keepLive) {
         const draft = liveDraftBySessionRef.current.get(s.id);
         if (draft) {
           draftRef.current = draft;
           setLiveDraft(draft);
         }
+        busyRef.current = true;
         setBusy(true);
+        setBgWorkingBanner(false);
+      } else if (!viewOnly) {
+        setLiveDraft(null);
+        draftRef.current = null;
       }
       if (s.cwd) preferredCwdRef.current = s.cwd;
       saveLastSession(s.id, s.cwd);
       closeMobileSidebar();
       clientRef.current?.loadSession(s.id, s.cwd, { viewOnly });
+      // onSessionLoaded will clear suppressPaint via ready path; safety unlock
+      window.setTimeout(() => {
+        suppressPaintRef.current = false;
+      }, 0);
       window.setTimeout(() => {
         setLoadingSession((v) => {
           if (v) setSessionPhase((p) => (p === "loading" ? "history_only" : p));
