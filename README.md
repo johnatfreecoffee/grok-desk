@@ -88,6 +88,26 @@ Copy `.env.example` → `.env`. **Never commit `.env`.**
 - Tool permissions: Ask / Auto / YOLO chips (phone can default YOLO)
 - Radar email / push are opt-in and env-configured
 
+
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Port in use | `lsof -ti:8787 \| xargs kill` then `npm start` |
+| Agent not ready | Confirm `grok --version` and CLI login work in a terminal |
+| Blank UI | `npm run build --prefix web` then restart daemon |
+| Phone can’t connect | Mac awake, Tailscale on both devices, re-run `./scripts/phone-serve.sh` |
+| Voice missing | Set `XAI_API_KEY` in `.env` or Settings |
+
+## Install checklist
+
+1. Install [Node 20+](https://nodejs.org/) and [Grok CLI](https://x.ai/build); complete CLI login  
+2. Clone this repo  
+3. `npm install && npm install --prefix web && npm run build`  
+4. `npm start` → open http://127.0.0.1:8787  
+5. (Optional) `npm run make-app` for the Mac menubar app · `./scripts/install-launchd.sh` for always-on  
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome — especially closing remaining rows in `docs/PARITY.md`.
