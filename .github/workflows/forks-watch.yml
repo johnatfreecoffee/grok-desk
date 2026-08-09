@@ -1,0 +1,77 @@
+# Autonomous fork watch — weekly summary issue so you notice new forks / activity.
+name: Forks watch
+
+on:
+  schedule:
+    # Mondays 15:00 UTC
+    - cron: "0 15 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const { data: forks } = await github.rest.repos.listForks({
+              owner, repo, sort: 'newest', per_page: 30,
+            });
+            const { data: pulls } = await github.rest.pulls.list({
+              owner, repo, state: 'open', per_page: 20,
+            });
+
+            const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
+            const newForks = forks.filter(f => new Date(f.created_at).getTime() >= weekAgo);
+
+            let body = `## Weekly open-source pulse (simple English)\n\n`;
+            body += `**Repo:** ${owner}/${repo}\n\n`;
+            body += `### Forks\n`;
+            body += `- Total forks: **${forks.length}**\n`;
+            body += `- New in last 7 days: **${newForks.length}**\n`;
+            if (newForks.length) {
+              body += newForks.map(f =>
+                `- @${f.owner.login} → ${f.html_url} (created ${f.created_at.slice(0,10)})`
+              ).join('\n') + '\n';
+            } else {
+              body += `- Nobody new forked this week (that’s normal early on).\n`;
+            }
+            body += `\n### Open pull requests\n`;
+            if (!pulls.length) {
+              body += `- None open. You’re caught up.\n`;
+            } else {
+              body += pulls.map(p =>
+                `- #${p.number} ${p.title} (from @${p.user.login}) ${p.html_url}`
+              ).join('\n') + '\n';
+              body += `\n**What to do:** open each PR → read the **Auto review** comment → merge only if it looks good and CI is green.\n`;
+            }
+            body += `\n### Remember\n`;
+            body += `- Forks are **copies**. People can’t edit your \`main\` unless you merge a PR.\n`;
+            body += `- Never paste API keys into issues or PRs.\n`;
+            body += `\n<sub>Automated by forks-watch.yml · <!-- grok-desk-forks-watch --></sub>\n`;
+
+            const title = `OSS pulse · ${new Date().toISOString().slice(0, 10)}`;
+            // Upsert: find open issue with marker
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'oss-pulse', per_page: 5,
+            });
+            // ensure label
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: 'oss-pulse' });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner, repo, name: 'oss-pulse', color: '0ea5e9',
+                description: 'Automated weekly open-source activity',
+              });
+            }
+
+            // Always open a fresh weekly issue (history)
+            await github.rest.issues.create({
+              owner, repo, title, body, labels: ['oss-pulse'],
+            });

@@ -25,17 +25,24 @@ Open source does **not** mean strangers can write to production or see your secr
 
 If someone sends a malicious PR (e.g. exfiltrating env vars), **don’t merge it**. CI is not a substitute for reading the diff.
 
+### Automated review (already on)
+
+| Workflow | When | What you get |
+|----------|------|----------------|
+| **CI** | every PR / push to `main` | Build must pass |
+| **PR safety review** | every PR | Bot comment in **simple English** (secrets, dangerous shell, bind address, etc.). Hard flags fail the check. |
+| **Forks watch** | weekly (Mon) + manual | Opens an `oss-pulse` issue: new forks + open PRs |
+
+You still decide merges. The bot is a smoke alarm, not a lawyer.
+
 ### Recommended GitHub settings (maintainers)
 
-In the repo on GitHub:
+Already applied where possible:
 
-1. **Settings → Branches → Branch protection** for `main`:  
-   - Require PR before merge  
-   - Require status checks to pass (`CI` / `build`)  
-   - Optionally require 1 review  
-2. **Settings → Actions** — allow Actions for this repo (already used by CI).  
-3. **Settings → Secrets** — only for *deploy* secrets if you add any later; this project needs none for the local desk.  
-4. Never add collaborator **Admin** lightly; prefer **Write** only for trusted co-maintainers.
+1. **Branch protection on `main`:** status check `build` required; force-push off  
+2. Prefer **PRs** for everything that isn’t a trivial docs typo from you  
+3. **Actions** enabled for CI + safety review  
+4. Never add collaborator **Admin** lightly; prefer **Write** only for trusted co-maintainers
 
 ## Setup (contributors)
 
