@@ -1,9 +1,9 @@
 # Autonomous fork watch — weekly summary issue + email to John.
 name: Forks watch
 
+# Superseded for "wake up" mail by daily-digest.yml (every day).
+# Kept for manual / optional Monday extra pulse.
 on:
-  schedule:
-    - cron: "0 15 * * 1"
   workflow_dispatch:
 
 permissions:
