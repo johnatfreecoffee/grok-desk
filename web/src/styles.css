@@ -906,32 +906,47 @@ body.desk-app .shell.no-sidebar .topbar {
     gap: 6px;
     padding: calc(8px + var(--sat)) calc(8px + var(--sar)) 8px calc(8px + var(--sal));
     flex-wrap: nowrap;
-    overflow: hidden;
+    overflow: visible;
   }
   .topbar .brand {
     font-size: 14px;
-    gap: 6px;
+    gap: 8px;
     min-width: 0;
     flex: 1 1 auto;
     overflow: hidden;
   }
-  .topbar .brand-sub,
-  .topbar .project-chip {
+  .topbar .brand-sub {
     display: none;
+  }
+  .topbar .desktop-only-brand {
+    display: none !important;
+  }
+  .topbar .mobile-only-brand {
+    display: inline;
+    font-size: 14px;
+    font-weight: 650;
+    white-space: nowrap;
+    max-width: 42vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .topbar .project-chip {
+    display: inline-flex !important;
+    max-width: 42vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 1;
+    min-width: 0;
   }
   .topbar .brand-mark {
     width: 22px;
     height: 22px;
     display: block;
+    flex-shrink: 0;
   }
-  .topbar .brand-text {
-    display: inline;
-    font-size: 14px;
-    font-weight: 650;
-    white-space: nowrap;
-  }
-  .topbar .brand {
-    gap: 8px;
+  .topbar .brand-text:not(.mobile-only-brand) {
+    display: none;
   }
   .topbar .top-actions {
     gap: 4px;
@@ -941,12 +956,18 @@ body.desk-app .shell.no-sidebar .topbar {
   .topbar .desktop-artifacts-btn {
     display: none !important;
   }
-  .topbar .pill.status-pill {
-    max-width: 7.5rem;
-    padding: 4px 8px;
-    font-size: 11px;
+  .topbar .mobile-only-actions {
+    display: flex !important;
   }
+  .topbar .pill.status-pill {
+    max-width: none;
+    padding: 4px 6px;
+    font-size: 11px;
+    min-width: 0;
+  }
+  /* Dot-only status on narrow phones — short Ready on slightly wider */
   .topbar .pill.status-pill .pill-label {
+    max-width: 3.2rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -961,6 +982,10 @@ body.desk-app .shell.no-sidebar .topbar {
     min-width: 40px;
     min-height: 40px;
     padding: 0 8px;
+  }
+  .topbar .overflow-menu {
+    min-width: 200px;
+    z-index: 40;
   }
   /* Collapse/expand alone — not a Projects pill */
   .mobile-menu-btn {
@@ -997,13 +1022,8 @@ body.desk-app .shell.no-sidebar .topbar {
     border-top: 1px solid var(--border) !important;
     box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.45) !important;
   }
-  .topbar .brand-text {
-    max-width: 28vw;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
   .topbar .pill.status-pill .pill-label {
-    max-width: 4.5rem;
+    max-width: 3.2rem;
   }
   .sess-status-dot,
   .sess-dot-working,
@@ -1974,6 +1994,57 @@ body.desk-app .topbar {
   overflow: hidden;
 }
 
+.working-strip .strip-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.strip-stop-btn,
+.strip-send-now-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+
+.strip-stop-btn {
+  border-color: rgba(230, 180, 80, 0.4);
+  background: rgba(230, 180, 80, 0.12);
+  color: var(--amber);
+}
+
+.strip-stop-icon {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: currentColor;
+  display: inline-block;
+}
+
+.strip-send-now-btn {
+  border-color: rgba(56, 189, 248, 0.4);
+  background: var(--blue-bg);
+  color: var(--blue);
+}
+
+.strip-stop-btn:hover,
+.strip-send-now-btn:hover {
+  filter: brightness(1.08);
+}
+
 .work-pulse {
   width: 8px;
   height: 8px;
@@ -2457,15 +2528,51 @@ body.desk-app .topbar {
   padding: 10px 14px 12px;
 }
 
+.composer-modes {
+  display: flex;
+  gap: 6px;
+  padding: 0 2px 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.composer-modes::-webkit-scrollbar {
+  display: none;
+}
+.composer-modes .mode-chip {
+  display: inline-flex;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  padding: 5px 11px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.composer-modes .mode-chip.active {
+  background: var(--blue-bg);
+  color: var(--blue);
+  border-color: rgba(56, 189, 248, 0.4);
+}
+
 .composer.pill {
-  display: grid;
-  grid-template-columns: auto auto 1fr auto auto;
-  gap: 8px;
-  align-items: end;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
   background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: 20px;
   padding: 8px 10px 8px 8px;
+}
+
+.composer.pill .composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
 }
 
 .composer.pill:focus-within {
@@ -2481,6 +2588,9 @@ body.desk-app .topbar {
   box-shadow: none;
   font-size: 16px;
   touch-action: manipulation;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
 }
 
 .composer.pill textarea:focus {
@@ -2493,10 +2603,55 @@ body.desk-app .topbar {
   border-radius: 12px;
 }
 
+.composer.pill .send-btn.icon-send {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  border-radius: 999px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: var(--blue-dim);
+  color: #041018;
+  border: 1px solid transparent;
+  flex-shrink: 0;
+}
+
+.composer.pill .send-btn.icon-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.composer.pill.is-busy .send-btn.icon-send {
+  background: var(--bg-soft);
+  color: var(--blue);
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
+.send-now-btn {
+  font-size: 11px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  background: var(--blue-bg);
+  color: var(--blue);
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-weight: 650;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.send-now-btn:hover {
+  filter: brightness(1.08);
+}
+
 .composer.pill.mail-locked {
   opacity: 0.75;
 }
 
+/* Legacy stop-btn kept for other surfaces */
 .stop-btn {
   height: 40px;
   min-width: 40px;
@@ -2512,6 +2667,12 @@ body.desk-app .topbar {
 
 .stop-btn:hover {
   filter: brightness(1.1);
+}
+
+/* Desktop defaults for mobile-only helpers (mobile media overrides) */
+.mobile-only-brand,
+.mobile-only-actions {
+  display: none;
 }
 
 /* Quieter tool density */
@@ -3637,11 +3798,29 @@ body.desk-app .topbar {
 }
 
 @media (max-width: 720px) {
-  .mode-chip-row {
-    display: none;
+  /* Topbar mode chips only — composer modes stay visible */
+  .topbar .mode-chip-row,
+  .mode-chip-row.desktop-only-actions {
+    display: none !important;
+  }
+  .composer-modes {
+    display: flex;
+  }
+  .composer-modes .mode-chip {
+    display: inline-flex;
   }
   .model-picker-label {
     max-width: 56px;
+  }
+  .working-strip {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+  .strip-stop-btn,
+  .strip-send-now-btn {
+    height: 32px;
+    padding: 0 12px;
+    font-size: 12px;
   }
 }
 
@@ -3891,9 +4070,14 @@ body.desk-app .topbar {
 .module-info-backdrop {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
   background: rgba(0, 0, 0, 0.6);
-  /* no pointer close — user must use Got it / X */
-  pointer-events: none;
+  cursor: pointer;
+  pointer-events: auto;
 }
 .module-info-modal {
   position: relative;
@@ -3906,6 +4090,7 @@ body.desk-app .topbar {
   background: var(--bg-elev);
   box-shadow: 0 28px 72px rgba(0, 0, 0, 0.55);
   overflow: hidden;
+  z-index: 1;
 }
 .module-info-head {
   display: flex;
@@ -3914,6 +4099,23 @@ body.desk-app .topbar {
   gap: 12px;
   padding: 16px 16px 10px;
   border-bottom: 1px solid var(--border);
+}
+.module-info-close {
+  min-width: 36px;
+  min-height: 36px;
+}
+@media (max-width: 720px) {
+  .module-info-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .module-info-foot .primary-btn {
+    min-height: 44px;
+    padding: 0 18px;
+  }
+  .module-info-modal {
+    max-height: min(88dvh, 720px);
+  }
 }
 .module-info-kicker {
   font-size: 10px;

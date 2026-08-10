@@ -143,11 +143,15 @@ export function WorkingStrip({
   label,
   queueLen,
   onOpenQueue,
+  onStop,
+  onSendNow,
 }: {
   phase: string;
   label: string;
   queueLen: number;
   onOpenQueue?: () => void;
+  onStop?: () => void;
+  onSendNow?: () => void;
 }) {
   return (
     <div className="working-strip">
@@ -157,6 +161,32 @@ export function WorkingStrip({
         <button type="button" className="work-queue linkish" onClick={onOpenQueue}>
           {queueLen} queued — open queue
         </button>
+      )}
+      {(onStop || onSendNow) && (
+        <div className="strip-actions">
+          {onStop ? (
+            <button
+              type="button"
+              className="strip-stop-btn"
+              onClick={onStop}
+              title="Stop (Esc)"
+              aria-label="Stop"
+            >
+              <span className="strip-stop-icon" aria-hidden />
+              Stop
+            </button>
+          ) : null}
+          {onSendNow ? (
+            <button
+              type="button"
+              className="strip-send-now-btn"
+              onClick={onSendNow}
+              title="Stop current turn and send now"
+            >
+              Send now
+            </button>
+          ) : null}
+        </div>
       )}
     </div>
   );

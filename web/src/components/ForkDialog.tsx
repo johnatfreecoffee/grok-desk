@@ -17,7 +17,12 @@ export function ForkDialog({ open, cwd, onClose, onFork }: Props) {
 
   return (
     <div className="module-info-overlay" role="dialog" aria-modal="true" aria-label="Fork session">
-      <div className="module-info-backdrop" aria-hidden />
+      <button
+        type="button"
+        className="module-info-backdrop"
+        aria-label="Close"
+        onClick={onClose}
+      />
       <div className="module-info-modal" style={{ maxHeight: "auto" }}>
         <header className="module-info-head">
           <div>

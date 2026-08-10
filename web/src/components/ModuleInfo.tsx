@@ -10,16 +10,35 @@ type Props = {
   className?: string;
   /** Optional override copy */
   help?: ModuleHelp;
+  /** Controlled open (optional) */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  /** Hide the trigger button (modal still works when open is controlled) */
+  hideTrigger?: boolean;
 };
 
 /**
- * Info button + modal. Must close via button (backdrop does not dismiss).
- * Reopen anytime with the same button.
+ * Info button + modal. Closes via backdrop, Esc, X, Got it, or re-tap Info.
  */
-export function ModuleInfo({ moduleId, compact, className = "", help: helpProp }: Props) {
-  const [open, setOpen] = useState(false);
+export function ModuleInfo({
+  moduleId,
+  compact,
+  className = "",
+  help: helpProp,
+  open: openProp,
+  onOpenChange,
+  hideTrigger,
+}: Props) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const controlled = openProp !== undefined;
+  const open = controlled ? openProp : internalOpen;
   const titleId = useId();
   const help = helpProp || getModuleHelp(moduleId);
+
+  const setOpen = (next: boolean) => {
+    if (!controlled) setInternalOpen(next);
+    onOpenChange?.(next);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -32,27 +51,34 @@ export function ModuleInfo({ moduleId, compact, className = "", help: helpProp }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [open]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- setOpen identity not needed
+  }, [open, controlled]);
 
   return (
     <>
-      <button
-        type="button"
-        className={`module-info-btn ${compact ? "sm" : ""} ${className}`.trim()}
-        title={`About ${help.title}`}
-        aria-label={`About ${help.title}`}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        onClick={() => setOpen(true)}
-      >
-        <Info size={compact ? 14 : 16} strokeWidth={2.25} />
-        {!compact ? <span className="module-info-label">Info</span> : null}
-      </button>
+      {!hideTrigger ? (
+        <button
+          type="button"
+          className={`module-info-btn ${compact ? "sm" : ""} ${className}`.trim()}
+          title={`About ${help.title}`}
+          aria-label={`About ${help.title}`}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
+          <Info size={compact ? 14 : 16} strokeWidth={2.25} />
+          {!compact ? <span className="module-info-label">Info</span> : null}
+        </button>
+      ) : null}
 
       {open ? (
         <div className="module-info-overlay" role="presentation">
-          {/* Backdrop — does NOT close (user must use Close) */}
-          <div className="module-info-backdrop" aria-hidden />
+          <button
+            type="button"
+            className="module-info-backdrop"
+            aria-label="Close help"
+            onClick={() => setOpen(false)}
+          />
           <div
             className="module-info-modal"
             role="dialog"
@@ -67,11 +93,11 @@ export function ModuleInfo({ moduleId, compact, className = "", help: helpProp }
               </div>
               <button
                 type="button"
-                className="icon-btn sm"
+                className="icon-btn sm module-info-close"
                 aria-label="Close help"
                 onClick={() => setOpen(false)}
               >
-                <X size={16} strokeWidth={2} />
+                <X size={18} strokeWidth={2} />
               </button>
             </header>
 
@@ -104,7 +130,9 @@ export function ModuleInfo({ moduleId, compact, className = "", help: helpProp }
               <button type="button" className="icon-btn primary-btn" onClick={() => setOpen(false)}>
                 Got it
               </button>
-              <span className="module-info-foot-hint">Esc or Got it to close · reopen anytime with Info</span>
+              <span className="module-info-foot-hint">
+                Esc, tap outside, or Got it to close · reopen anytime with Info
+              </span>
             </footer>
           </div>
         </div>

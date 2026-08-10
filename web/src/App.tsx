@@ -26,6 +26,7 @@ import {
 } from "./lib/voiceCues";
 import { copyTextToClipboard } from "./lib/clipboard";
 import {
+  ArrowUp,
   ChevronDown,
   Copy,
   Download,
@@ -35,12 +36,12 @@ import {
   History,
   Info,
   ListOrdered,
+  MoreHorizontal,
   PanelLeft,
   PanelRight,
   Paperclip,
   Plus,
   RotateCcw,
-  Square,
   Undo2,
   X,
 } from "lucide-react";
@@ -258,6 +259,8 @@ export default function App() {
   const [sidebarTick, setSidebarTick] = useState(0);
   const [loadingSession, setLoadingSession] = useState(false);
   const [newMenuOpen, setNewMenuOpen] = useState(false);
+  const [overflowMenuOpen, setOverflowMenuOpen] = useState(false);
+  const [chatHelpOpen, setChatHelpOpen] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentPreview[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [queueLen, setQueueLen] = useState(0);
@@ -316,6 +319,12 @@ export default function App() {
     atts: Array<{ name: string; mime: string; dataBase64?: string }>;
     label: string;
   } | null>(null);
+  /** Stop current turn then force-send this prompt when busy clears. */
+  const pendingForceSendRef = useRef<{
+    text: string;
+    atts: Array<{ name: string; mime: string; dataBase64?: string }>;
+    label: string;
+  } | null>(null);
   const historyOnlyRef = useRef(false);
   /** Viewing another chat while a different session is still working (do not kill it). */
   const viewOnlyRef = useRef(false);
@@ -337,6 +346,30 @@ export default function App() {
   useEffect(() => {
     agentRef.current = agent;
   }, [agent]);
+
+  // Close + / overflow menus on outside click or Escape
+  useEffect(() => {
+    if (!newMenuOpen && !overflowMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t) return;
+      if (t.closest(".new-menu-wrap")) return;
+      setNewMenuOpen(false);
+      setOverflowMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setNewMenuOpen(false);
+        setOverflowMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [newMenuOpen, overflowMenuOpen]);
   useEffect(() => {
     historyOnlyRef.current = historyOnly;
   }, [historyOnly]);
@@ -2563,6 +2596,124 @@ export default function App() {
     resetTurnUi();
   }, [busy, resetTurnUi]);
 
+  const flushForceSend = useCallback(() => {
+    const p = pendingForceSendRef.current;
+    if (!p) return;
+    pendingForceSendRef.current = null;
+    const sid = agentRef.current?.sessionId;
+    if (sid?.startsWith("mail:")) return;
+    if (
+      viewOnlyRef.current &&
+      turnSessionRef.current &&
+      turnSessionRef.current !== agentRef.current?.sessionId
+    ) {
+      setError(
+        "Another chat is still working in the background. Open that chat to follow it.",
+      );
+      return;
+    }
+    if (historyOnlyRef.current && !viewOnlyRef.current) {
+      pendingPromptRef.current = p;
+      setHistoryOnly(false);
+      viewOnlyRef.current = false;
+      setViewOnlyBrowse(false);
+      setSessionPhase("creating");
+      setLoadingSession(true);
+      const cwd =
+        preferredCwdRef.current ||
+        agentRef.current?.cwd ||
+        loadLastSession()?.cwd ||
+        undefined;
+      if (cwd) preferredCwdRef.current = cwd;
+      clientRef.current?.newSession(cwd);
+      setSidebarTick((n) => n + 1);
+      scrollToBottom();
+      return;
+    }
+    const clientMsgId = uid();
+    if (sid) {
+      turnSessionRef.current = sid;
+      setSessionListStatus(sid, "working");
+    }
+    busyRef.current = true;
+    setBusy(true);
+    clientRef.current?.prompt(p.text, p.atts, { sessionId: sid, clientMsgId });
+    setSidebarTick((n) => n + 1);
+    scrollToBottom();
+  }, [scrollToBottom, setSessionListStatus]);
+
+  useEffect(() => {
+    if (busy || !pendingForceSendRef.current) return;
+    const t = window.setTimeout(() => flushForceSend(), 50);
+    return () => window.clearTimeout(t);
+  }, [busy, flushForceSend]);
+
+  /** Stop the active turn (if any) then send the current draft immediately. */
+  const sendNow = useCallback(() => {
+    const text = input.trim();
+    if (!text && attachments.length === 0) return;
+    const sid = agentRef.current?.sessionId;
+    if (sid?.startsWith("mail:")) {
+      setError("Email agent threads are read-only here — reply by email to continue.");
+      return;
+    }
+    if (viewOnlyBrowse) return;
+    if (!busy) {
+      send();
+      return;
+    }
+    const atts = attachments.map((a) => ({
+      name: a.name,
+      mime: a.mime,
+      dataBase64: a.dataBase64,
+    }));
+    const label =
+      text ||
+      (attachments.length
+        ? `Attached ${attachments.map((a) => a.name).join(", ")}`
+        : "");
+    const attViews = attachments.map((a) => ({
+      id: a.id,
+      name: a.name,
+      mime: a.mime,
+      previewUrl: a.previewUrl,
+    }));
+    pendingForceSendRef.current = { text, atts, label };
+    setInput("");
+    setError(null);
+    setAttachments([]);
+    setMessages((prev) => {
+      const next: ChatMessage[] = [
+        ...prev,
+        {
+          id: uid(),
+          role: "user",
+          content: label,
+          queued: false,
+          attachments: attViews,
+        },
+      ];
+      if (sid) sessionCacheRef.current.set(sid, next);
+      return next;
+    });
+    if (taRef.current) taRef.current.style.height = "auto";
+    stopTurn();
+  }, [input, attachments, busy, viewOnlyBrowse, send, stopTurn]);
+
+  const setPermissionModeChip = useCallback((id: "agent" | "auto" | "plan" | "yolo") => {
+    setModeChip(id);
+    if (id === "plan") {
+      setDeskView("plan");
+      clientRef.current?.setPermissionMode("ask");
+    } else if (id === "yolo") {
+      clientRef.current?.setPermissionMode("always-approve");
+    } else if (id === "auto") {
+      clientRef.current?.setPermissionMode("auto");
+    } else {
+      clientRef.current?.setPermissionMode("ask");
+    }
+  }, []);
+
   const newChat = useCallback(
     (cwd?: string) => {
       const prevLive = turnSessionRef.current;
@@ -2579,6 +2730,7 @@ export default function App() {
       stashSession();
       setError(null);
       setNewMenuOpen(false);
+      setOverflowMenuOpen(false);
       // View-only unlock: composer free on B while A may still stream in map
       busyRef.current = false;
       setBusy(false);
@@ -3385,14 +3537,22 @@ export default function App() {
               </button>
             )}
             <img className="brand-mark" src="/icon.svg" alt="" />
-            <span className="brand-text">Grok Desk</span>
-            <span className="sub brand-sub">local</span>
-            <ModuleInfo moduleId="chat" compact />
+            <span className="brand-text desktop-only-brand">Grok Desk</span>
+            <span className="sub brand-sub desktop-only-brand">local</span>
+            <ModuleInfo
+              moduleId="chat"
+              compact
+              className="desktop-only-brand"
+              open={chatHelpOpen}
+              onOpenChange={setChatHelpOpen}
+            />
             {projectName ? (
               <span className="project-chip" title={agent?.cwd || projectName}>
                 {projectName}
               </span>
-            ) : null}
+            ) : (
+              <span className="brand-text mobile-only-brand">Grok Desk</span>
+            )}
           </div>
           <div className="top-actions">
             {agent?.sessionId ? (
@@ -3499,19 +3659,7 @@ export default function App() {
                   key={m.id}
                   type="button"
                   className={`mode-chip ${modeChip === m.id ? "active" : ""}`}
-                  onClick={() => {
-                    setModeChip(m.id);
-                    if (m.id === "plan") {
-                      setDeskView("plan");
-                      clientRef.current?.setPermissionMode("ask");
-                    } else if (m.id === "yolo") {
-                      clientRef.current?.setPermissionMode("always-approve");
-                    } else if (m.id === "auto") {
-                      clientRef.current?.setPermissionMode("auto");
-                    } else {
-                      clientRef.current?.setPermissionMode("ask");
-                    }
-                  }}
+                  onClick={() => setPermissionModeChip(m.id)}
                 >
                   {m.label}
                 </button>
@@ -3557,7 +3705,7 @@ export default function App() {
             </span>
             <button
               type="button"
-              className={`icon-btn ${copyFlash ? "primary-btn" : ""}`}
+              className={`icon-btn desktop-only-actions ${copyFlash ? "primary-btn" : ""}`}
               title="Copy whole chat (Termius paste)"
               aria-label="Copy whole chat"
               onClick={() => void copyWholeChat()}
@@ -3580,17 +3728,115 @@ export default function App() {
             >
               <PanelRight size={15} strokeWidth={2} />
             </button>
+            <div className="new-menu-wrap overflow-menu-wrap mobile-only-actions">
+              <button
+                type="button"
+                className="icon-btn"
+                title="More"
+                aria-label="More actions"
+                aria-expanded={overflowMenuOpen}
+                onClick={() => {
+                  setOverflowMenuOpen((v) => !v);
+                  setNewMenuOpen(false);
+                }}
+              >
+                <MoreHorizontal size={18} strokeWidth={2.25} />
+              </button>
+              {overflowMenuOpen ? (
+                <div className="new-menu overflow-menu">
+                  {agent?.sessionId ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
+                          setSessionDrawer("info");
+                        }}
+                      >
+                        <Info size={15} /> Session info
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
+                          setSessionDrawer("context");
+                        }}
+                      >
+                        <Gauge size={15} /> Context
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
+                          clientRef.current?.send({ type: "queue_list" });
+                          setQueueOpen(true);
+                        }}
+                      >
+                        <ListOrdered size={15} /> Queue{queueLen > 0 ? ` (${queueLen})` : ""}
+                      </button>
+                    </>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOverflowMenuOpen(false);
+                      void copyWholeChat();
+                    }}
+                    disabled={messages.length === 0}
+                  >
+                    <Copy size={15} /> {copyFlash ? "Copied" : "Copy chat"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOverflowMenuOpen(false);
+                      setArtifactsOpen((v) => {
+                        const next = !v;
+                        setArtifactsPinned(next);
+                        return next;
+                      });
+                    }}
+                  >
+                    <PanelRight size={15} /> Artifacts
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOverflowMenuOpen(false);
+                      setChatHelpOpen(true);
+                    }}
+                  >
+                    <Info size={15} /> How chat works
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOverflowMenuOpen(false);
+                      void restart();
+                    }}
+                    disabled={restarting}
+                  >
+                    <RotateCcw size={15} /> Restart
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOverflowMenuOpen(false);
+                      void openFolder();
+                    }}
+                  >
+                    <FolderOpen size={15} /> Open folder…
+                  </button>
+                </div>
+              ) : null}
+            </div>
             <div className="new-menu-wrap">
               <button
                 className="icon-btn primary-btn"
                 type="button"
                 onClick={() => {
-                  // Mobile: dropdown is flaky (Safari) — + always starts a new chat now
-                  if (isMobileViewport()) {
-                    newChat();
-                    return;
-                  }
                   setNewMenuOpen((v) => !v);
+                  setOverflowMenuOpen(false);
                 }}
                 disabled={restarting}
                 title="New chat (⌘N)"
@@ -3600,7 +3846,7 @@ export default function App() {
                 <span className="new-btn-label">New</span>
                 <ChevronDown size={14} strokeWidth={2} className="new-btn-chevron" />
               </button>
-              {newMenuOpen && !isMobileViewport() && (
+              {newMenuOpen ? (
                 <div className="new-menu">
                   <button type="button" onClick={() => newChat()}>
                     <Plus size={15} /> New chat here
@@ -3609,7 +3855,7 @@ export default function App() {
                     <FolderOpen size={15} /> Open folder…
                   </button>
                 </div>
-              )}
+              ) : null}
             </div>
           </div>
         </header>
@@ -3856,6 +4102,10 @@ export default function App() {
               clientRef.current?.send({ type: "queue_list" });
               setQueueOpen(true);
             }}
+            onStop={stopTurn}
+            onSendNow={
+              input.trim() || attachments.length ? sendNow : undefined
+            }
           />
         )}
 
@@ -3911,7 +4161,29 @@ export default function App() {
               ))}
             </div>
           )}
-          <div className={`composer pill${isMailSession ? " mail-locked" : ""}`}>
+          <div className="composer-modes" title="Agent mode">
+            {(
+              [
+                { id: "agent" as const, label: "Ask" },
+                { id: "auto" as const, label: "Auto" },
+                { id: "plan" as const, label: "Plan" },
+                { id: "yolo" as const, label: "YOLO" },
+              ] as const
+            ).map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className={`mode-chip ${modeChip === m.id ? "active" : ""}`}
+                onClick={() => setPermissionModeChip(m.id)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          <div
+            className={`composer pill shell${busy ? " is-busy" : ""}${isMailSession ? " mail-locked" : ""}`}
+          >
+          <div className="composer-row">
           <VoiceWaveButton
             active={voiceActive}
             status={voiceStatus}
@@ -3994,15 +4266,22 @@ export default function App() {
               }
             }}
           />
-          {busy ? (
-            <button type="button" className="stop-btn" onClick={stopTurn} title="Stop (Esc)">
-              <Square size={12} fill="currentColor" /> Stop
+          {busy && (input.trim() || attachments.length > 0) ? (
+            <button
+              type="button"
+              className="send-now-btn"
+              onClick={sendNow}
+              title="Stop & send now"
+            >
+              Send now
             </button>
           ) : null}
           <button
             type="button"
-            className="send-btn"
+            className="send-btn icon-send"
             onClick={send}
+            title={busy ? "Queue follow-up" : "Send"}
+            aria-label={busy ? "Queue follow-up" : "Send"}
             disabled={
               (!input.trim() && attachments.length === 0) ||
               voiceActive ||
@@ -4010,8 +4289,13 @@ export default function App() {
               isMailSession
             }
           >
-            {busy ? "Queue" : "Send"}
+            {busy ? (
+              <ListOrdered size={16} strokeWidth={2.25} />
+            ) : (
+              <ArrowUp size={18} strokeWidth={2.5} />
+            )}
           </button>
+          </div>
           </div>
           </div>
         </div>
