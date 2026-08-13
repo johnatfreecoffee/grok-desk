@@ -52,6 +52,9 @@ if (!sidA) throw new Error("session A missing id");
 console.log("✓ session A", sidA.slice(0, 8));
 
 const ends = [];
+function ended(sid) {
+  return ends.find((e) => e.sessionId === sid) || null;
+}
 ws.on("message", (raw) => {
   try {
     const m = JSON.parse(String(raw));
@@ -92,19 +95,15 @@ ws.send(
 await wait(ws, (m) => m.type === "turn_start" && m.sessionId === sidB, 60000);
 console.log("✓ B turn_start while A live");
 
-const endA = await wait(
-  ws,
-  (m) => m.type === "turn_end" && m.sessionId === sidA,
-  180000,
-);
+const endA =
+  ended(sidA) ||
+  (await wait(ws, (m) => m.type === "turn_end" && m.sessionId === sidA, 180000));
 if (endA.abandoned) throw new Error("A turn abandoned");
 console.log("✓ A finished (not abandoned)");
 
-const endB = await wait(
-  ws,
-  (m) => m.type === "turn_end" && m.sessionId === sidB,
-  180000,
-);
+const endB =
+  ended(sidB) ||
+  (await wait(ws, (m) => m.type === "turn_end" && m.sessionId === sidB, 180000));
 if (endB.abandoned) throw new Error("B turn abandoned");
 console.log("✓ B finished");
 
