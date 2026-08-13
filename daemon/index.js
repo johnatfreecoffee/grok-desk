@@ -2080,6 +2080,12 @@ wss.on("connection", (ws) => {
           try {
             worker = pool.spawn(cwd);
           } catch (e) {
+            send({
+              type: "session_status",
+              state: "error",
+              error: e.message || String(e),
+              code: e.code || "POOL_FULL",
+            });
             send({ type: "error", error: e.message || String(e), code: e.code || "POOL_FULL" });
             return;
           }

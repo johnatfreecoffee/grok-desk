@@ -411,8 +411,10 @@ export class DeskClient {
           this.handlers.onPartialDraft?.(msg as never);
           break;
         case "update":
+          // Untagged stream events are dropped — never paint onto "current view"
+          if (!msg.sessionId) break;
           this.handlers.onUpdate?.(msg.update as Record<string, unknown>, {
-            sessionId: msg.sessionId ? String(msg.sessionId) : undefined,
+            sessionId: String(msg.sessionId),
             turnEpoch:
               typeof msg.turnEpoch === "number" ? msg.turnEpoch : undefined,
           });

@@ -1343,77 +1343,73 @@ export function loadTranscript(sessionId, cwd) {
   };
 }
 
-/** Merge by normalized content; keep order of primary, append missing from secondary. */
+/** Merge by message id first; content fingerprint only as last-ditch dedupe. */
 function mergeTranscripts(primary, secondary) {
-  const seen = new Set(primary.map((m) => messageDedupeKey(m.role, m.content)));
-  const out = primary.map((m) => {
-    if (m.role === "user") {
-      return { ...m, content: stripAgentOnlySuffixes(m.content) || m.content };
-    }
-    return m;
-  });
-  for (const m of secondary) {
-    const content =
-      m.role === "user" ? stripAgentOnlySuffixes(m.content) || m.content : m.content;
-    const key = messageDedupeKey(m.role, content);
-    if (seen.has(key)) {
-      // Prefer secondary when it has richer live-turn metadata (thought/tools)
-      const idx = out.findIndex((x) => messageDedupeKey(x.role, x.content) === key);
-      if (idx >= 0) {
-        const prev = out[idx];
-        if (
-          m.role === "assistant" &&
-          ((m.thought && !prev.thought) ||
-            (m.tools?.length && !(prev.tools && prev.tools.length)) ||
-            (m.plan?.length && !(prev.plan && prev.plan.length)) ||
-            ((m.content?.length || 0) > (prev.content?.length || 0) + 20))
-        ) {
-          out[idx] = {
-            ...prev,
-            content:
-              (m.content?.length || 0) > (prev.content?.length || 0)
-                ? content
-                : prev.content,
-            thought: prev.thought || m.thought,
-            tools: prev.tools?.length ? prev.tools : m.tools,
-            plan: prev.plan?.length ? prev.plan : m.plan,
-          };
-        }
-      }
-      continue;
-    }
-    // Prefix merge: partial desk assistant vs full CLI assistant of same turn
-    if (m.role === "assistant" && content) {
-      const prefixIdx = out.findIndex(
-        (x) =>
-          x.role === "assistant" &&
-          content.startsWith(String(x.content || "").slice(0, 80)) &&
-          (content.length || 0) > (x.content?.length || 0) + 10,
-      );
-      if (prefixIdx >= 0) {
-        const prev = out[prefixIdx];
-        out[prefixIdx] = {
-          ...prev,
-          content,
-          thought: m.thought || prev.thought,
-          tools: m.tools?.length ? m.tools : prev.tools,
-          plan: m.plan?.length ? m.plan : prev.plan,
-        };
-        seen.add(key);
-        continue;
+  const byId = new Map();
+  const take = (m) => {
+    if (!m) return;
+    const id = m.id || null;
+    if (id) {
+      if (!byId.has(id)) {
+        byId.set(id, m);
+      } else {
+        const prev = byId.get(id);
+        const richer =
+          (m.content?.length || 0) > (prev.content?.length || 0) ? m : prev;
+        byId.set(id, {
+          ...richer,
+          thought: richer.thought || prev.thought || m.thought,
+          tools: richer.tools?.length ? richer.tools : prev.tools || m.tools,
+          plan: richer.plan?.length ? richer.plan : prev.plan || m.plan,
+        });
       }
     }
-    seen.add(key);
-    out.push({
-      id: m.id,
-      role: m.role,
-      content,
-      thought: m.thought,
-      tools: m.tools,
-      plan: m.plan,
-    });
+  };
+  for (const m of primary) take(m);
+  for (const m of secondary) take(m);
+
+  const out = [];
+  const usedIds = new Set();
+  const seen = new Set();
+  for (const m of primary) {
+    if (m?.id && byId.has(m.id) && !usedIds.has(m.id)) {
+      usedIds.add(m.id);
+      const row = byId.get(m.id);
+      const cleaned =
+        row.role === "user"
+          ? { ...row, content: stripAgentOnlySuffixes(row.content) || row.content }
+          : row;
+      out.push(cleaned);
+      seen.add(messageDedupeKey(cleaned.role, cleaned.content));
+    }
   }
-  return out;
+  for (const m of secondary) {
+    if (m?.id && byId.has(m.id) && !usedIds.has(m.id)) {
+      usedIds.add(m.id);
+      const row = byId.get(m.id);
+      const content =
+        row.role === "user" ? stripAgentOnlySuffixes(row.content) || row.content : row.content;
+      const key = messageDedupeKey(row.role, content);
+      if (seen.has(key) && content) continue;
+      seen.add(key);
+      out.push({ ...row, content });
+    }
+  }
+  // Content-only rows (ACP history ids like ch_u_N vs desk_u_*)
+  const seenAfterIds = new Set(out.map((m) => messageDedupeKey(m.role, m.content)));
+  const rest = [];
+  for (const src of [primary, secondary]) {
+    for (const m of src) {
+      if (m?.id && usedIds.has(m.id)) continue;
+      const content =
+        m.role === "user" ? stripAgentOnlySuffixes(m.content) || m.content : m.content;
+      const key = messageDedupeKey(m.role, content);
+      if (seenAfterIds.has(key)) continue;
+      seenAfterIds.add(key);
+      rest.push({ ...m, content });
+    }
+  }
+  return out.concat(rest);
 }
 
 export function findSessionCwd(sessionId) {
