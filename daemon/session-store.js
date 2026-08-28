@@ -85,15 +85,20 @@ function saveDeskIndex(idx) {
     });
 }
 
+function isSubagentKind(s) {
+  if (!s || typeof s !== "object") return false;
+  if (s.is_subagent === true) return true;
+  const k = String(s.session_kind || s.kind || "").toLowerCase();
+  return k === "subagent" || k === "subagent_resume" || k.startsWith("subagent");
+}
+
 /** True when this on-disk session is a Grok Build subagent (not a user chat). */
 export function isSubagentSession(sessionId, cwd) {
   if (!sessionId || String(sessionId).startsWith("mail:")) return false;
   const dir = findSessionDir(sessionId, cwd);
   if (!dir) return false;
   const s = readSummary(dir);
-  if (s && (s.session_kind === "subagent" || s.kind === "subagent" || s.is_subagent === true)) {
-    return true;
-  }
+  if (isSubagentKind(s)) return true;
   // Linked under a parent session's subagents/ folder
   try {
     const root = sessionsRoot();
@@ -469,6 +474,40 @@ function chatHistoryFingerprint(sessionDir) {
   }
 }
 
+/** Last ACP updates.jsonl timestamp — real chat, not session/load mtime. */
+function lastUpdatesTimestampIso(sessionDir) {
+  const p = path.join(sessionDir, "updates.jsonl");
+  try {
+    if (!fs.existsSync(p)) return null;
+    const st = fs.statSync(p);
+    if (!st.size) return null;
+    const fd = fs.openSync(p, "r");
+    try {
+      const n = Math.min(st.size, 32768);
+      const buf = Buffer.alloc(n);
+      fs.readSync(fd, buf, 0, n, st.size - n);
+      const text = buf.toString("utf8");
+      let last = null;
+      const re = /"timestamp"\s*:\s*(\d+(?:\.\d+)?)/g;
+      let m;
+      while ((m = re.exec(text))) {
+        last = Number(m[1]);
+      }
+      if (!Number.isFinite(last) || last <= 0) return null;
+      const ms = last < 1e12 ? last * 1000 : last;
+      return new Date(ms).toISOString();
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function lastActivityIso(sessionDir, fp) {
+  return lastUpdatesTimestampIso(sessionDir) || fp?.mtimeIso || null;
+}
+
 /** sessionId → last desk message `at` (one JSON read for whole list). */
 function deskLastMessageAtMap() {
   const store = loadDeskMessagesStore();
@@ -501,29 +540,28 @@ function resolveInteractionAt(sessionDir, sessionId, deskLastAt, deskRec, create
   let freeze = null; // { lastInteractionAt, chatHash, chatBytes }
 
   if (fp.hash) {
-    if (prevHash && prevHash === fp.hash && prevIx) {
+    const created = createdAtFallback ? String(createdAtFallback) : "";
+    const frozenAtCreated =
+      Boolean(prevIx && created) &&
+      (prevIx === created ||
+        (Number.isFinite(Date.parse(prevIx)) &&
+          Number.isFinite(Date.parse(created)) &&
+          Math.abs(Date.parse(prevIx) - Date.parse(created)) < 2000));
+    const activity = lastActivityIso(sessionDir, fp);
+
+    if (prevHash && prevHash === fp.hash && prevIx && !frozenAtCreated) {
       // Content unchanged (open rewrite) — keep frozen interaction time
       candidates.push(String(prevIx));
     } else if (prevHash && prevHash !== fp.hash) {
       // Real new messages — content changed
-      const t = fp.mtimeIso || new Date().toISOString();
+      const t = activity || fp.mtimeIso || new Date().toISOString();
       candidates.push(t);
       freeze = { lastInteractionAt: t, chatHash: fp.hash, chatBytes: fp.bytes };
-    } else if (prevIx && prevHash) {
-      candidates.push(String(prevIx));
     } else {
-      // First observation: freeze fingerprint. Prefer stable time — if mtime is
-      // "just now" it's almost certainly an open/load rewrite (poison), so fall
-      // back to created_at. Hash keeps future opens from reordering.
-      const mtimeMs = fp.mtimeIso ? Date.parse(fp.mtimeIso) : NaN;
-      const mtimeFresh =
-        Number.isFinite(mtimeMs) && Date.now() - mtimeMs < 15 * 60 * 1000;
+      // First observation, or poisoned freeze-at-created_at (CLI chat then stuck at 1d).
+      // Use last updates.jsonl time — not created_at, not a fresh open mtime.
       const t =
-        prevIx ||
-        (!mtimeFresh && fp.mtimeIso) ||
-        createdAtFallback ||
-        fp.mtimeIso ||
-        new Date().toISOString();
+        activity || prevIx || fp.mtimeIso || created || new Date().toISOString();
       candidates.push(String(t));
       freeze = {
         lastInteractionAt: String(t),
@@ -575,8 +613,7 @@ function sessionMeta(sessionDir, fallbackCwd, deskSessionIds, deskLastAtMap, des
   const deskLastAt = deskLastAtMap?.[id] || null;
   const deskRec = deskIdx?.sessionIds?.[id] || null;
   const pinned = Boolean(pinnedSessions?.[id]);
-  const isSub =
-    Boolean(s && (s.session_kind === "subagent" || s.kind === "subagent" || s.is_subagent === true));
+  const isSub = isSubagentKind(s);
   if (!s) {
     const origin = classifyOrigin(id, fallbackCwd, null, deskSessionIds);
     return {
@@ -703,11 +740,25 @@ export function listProjects(opts = {}) {
 
     // Collect sessions for this project
     let diskCount = 0;
+    const childIds = new Set();
+    try {
+      for (const sEnt of fs.readdirSync(groupDir, { withFileTypes: true })) {
+        if (!sEnt.isDirectory()) continue;
+        const subDir = path.join(groupDir, sEnt.name, "subagents");
+        if (!fs.existsSync(subDir)) continue;
+        for (const kid of fs.readdirSync(subDir, { withFileTypes: true })) {
+          if (kid.name && kid.name[0] !== ".") childIds.add(kid.name);
+        }
+      }
+    } catch {
+      /* */
+    }
     const sessions = [];
     for (const sEnt of fs.readdirSync(groupDir, { withFileTypes: true })) {
       if (!sEnt.isDirectory()) continue;
       diskCount += 1;
       if (!showAll && !deskSessionIds.has(sEnt.name)) continue;
+      if (!showSubagents && childIds.has(sEnt.name)) continue;
       const meta = sessionMeta(
         path.join(groupDir, sEnt.name),
         cwd,
