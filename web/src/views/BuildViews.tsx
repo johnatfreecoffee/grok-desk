@@ -37,7 +37,9 @@ import {
   Users,
   Plus,
   Trash2,
+  Clock,
 } from "lucide-react";
+import type { AutomationJob } from "../lib/buildClient";
 import { ModuleInfo } from "../components/ModuleInfo";
 
 type SessionRow = {
@@ -2090,6 +2092,9 @@ export function UsageView({ activeSessionId, cwd }: CommonProps) {
   }, [load]);
 
   const su = data?.sessionUsage;
+  const acct = data?.account;
+  const heat = data?.heatmap;
+  const max = Math.max(1, heat?.max || 0);
 
   return (
     <Panel
@@ -2103,62 +2108,305 @@ export function UsageView({ activeSessionId, cwd }: CommonProps) {
       }
     >
       <p className="build-lede">
-        Session stats from disk · SuperGrok $ balance only if API exposes it (not inventing numbers).
+        SuperGrok quota from the CLI when signed in. Heatmap is local activity — not the bill.
       </p>
       {!data ? (
         <div className="build-empty">Loading…</div>
       ) : (
-        <div className="doctor-list">
-          <div className="doctor-row ok">
-            <span className="agent-dot st-done" />
-            <strong>version</strong>
-            <span className="build-muted">{data.version?.version || "unknown"}</span>
+        <>
+          <div className="quota-card">
+            <div className="quota-top">
+              <strong>{acct?.plan || "Grok"}</strong>
+              <span className="build-muted">{acct?.email || acct?.source || ""}</span>
+            </div>
+            {acct?.usedPercent != null ? (
+              <>
+                <div className="quota-bar" aria-hidden>
+                  <span style={{ width: `${Math.min(100, acct.usedPercent)}%` }} />
+                </div>
+                <p className="quota-readout">
+                  {Math.round(acct.usedPercent)}% used
+                  {acct.remainingPercent != null ? ` · ${Math.round(acct.remainingPercent)}% left` : ""}
+                  {acct.creditsRemaining != null ? ` · ${acct.creditsRemaining} remaining` : ""}
+                </p>
+              </>
+            ) : (
+              <p className="build-muted">{acct?.note || data.note || "No remaining-balance number from CLI."}</p>
+            )}
+            {acct?.products && acct.products.length > 0 ? (
+              <ul className="quota-products">
+                {acct.products.map((p) => (
+                  <li key={p.name}>
+                    {p.name}
+                    {p.usedPercent != null ? ` · ${Math.round(p.usedPercent)}%` : ""}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
           </div>
-          <div className={`doctor-row ${data.auth?.present ? "ok" : "bad"}`}>
-            <span className={`agent-dot st-${data.auth?.present ? "done" : "error"}`} />
-            <strong>auth</strong>
-            <span className="build-muted">
-              {data.auth?.present
-                ? `${data.auth.method || "session"}${data.auth.hasToken ? " · signed in" : ""}`
-                : "not signed in"}
-            </span>
+
+          {heat?.days?.length ? (
+            <div className="heat-wrap">
+              <h3 className="build-h3">Last 16 weeks</h3>
+              <div className="heat-grid" title="Local sessions per day">
+                {heat.days.map((d) => {
+                  const t = d.sessions / max;
+                  const lvl = d.sessions === 0 ? 0 : t < 0.25 ? 1 : t < 0.5 ? 2 : t < 0.75 ? 3 : 4;
+                  return (
+                    <span
+                      key={d.date}
+                      className={`heat-cell lv-${lvl}`}
+                      title={`${d.date} · ${d.sessions} session${d.sessions === 1 ? "" : "s"}`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="doctor-list">
+            <div className="doctor-row ok">
+              <span className="agent-dot st-done" />
+              <strong>version</strong>
+              <span className="build-muted">{data.version?.version || "unknown"}</span>
+            </div>
+            <div className={`doctor-row ${data.auth?.present ? "ok" : "bad"}`}>
+              <span className={`agent-dot st-${data.auth?.present ? "done" : "error"}`} />
+              <strong>auth</strong>
+              <span className="build-muted">
+                {data.auth?.present
+                  ? `${data.auth.method || "session"}${data.auth.hasToken ? " · signed in" : ""}`
+                  : "not signed in"}
+              </span>
+            </div>
+            <div className="doctor-row ok">
+              <span className="agent-dot st-done" />
+              <strong>session</strong>
+              <span className="build-muted">
+                {su
+                  ? [
+                      su.turns != null ? `${su.turns} turns` : null,
+                      su.model,
+                      su.inputTokens != null ? `in ${su.inputTokens}` : null,
+                      su.outputTokens != null ? `out ${su.outputTokens}` : null,
+                      su.contextUsed != null && su.contextLimit
+                        ? `ctx ${su.contextUsed}/${su.contextLimit}`
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ") || "open a chat"
+                  : "open a chat for session stats"}
+              </span>
+            </div>
           </div>
-          <div className="doctor-row ok">
-            <span className="agent-dot st-done" />
-            <strong>credits</strong>
-            <span className="build-muted">
-              {data.account?.creditsRemaining != null
-                ? String(data.account.creditsRemaining)
-                : "n/a (no local balance API)"}
-            </span>
-          </div>
-          <div className="doctor-row ok">
-            <span className="agent-dot st-done" />
-            <strong>session</strong>
-            <span className="build-muted">
-              {su
-                ? [
-                    su.turns != null ? `${su.turns} turns` : null,
-                    su.model,
-                    su.inputTokens != null ? `in ${su.inputTokens}` : null,
-                    su.outputTokens != null ? `out ${su.outputTokens}` : null,
-                    su.reasoningTokens != null ? `reason ${su.reasoningTokens}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ") || "open a chat"
-                : "open a chat for session stats"}
-            </span>
-          </div>
-          <div className="doctor-row ok">
-            <span className="agent-dot st-done" />
-            <strong>models</strong>
-            <span className="build-muted">
-              {data.modelCount} cached — {(data.models || []).map((m) => m.name || m.id).join(", ")}
-            </span>
-          </div>
-          {data.note ? <p className="build-muted">{data.note}</p> : null}
-        </div>
+        </>
       )}
+    </Panel>
+  );
+}
+
+const EMPTY_AUTO = {
+  title: "",
+  prompt: "",
+  frequency: "daily" as AutomationJob["frequency"],
+  time: "09:00",
+  enabled: true,
+};
+
+export function AutomationsView({ cwd }: CommonProps) {
+  const [jobs, setJobs] = useState<AutomationJob[]>([]);
+  const [history, setHistory] = useState<
+    { id: string; name: string; at: string; outcome: string; error: string | null }[]
+  >([]);
+  const [form, setForm] = useState(EMPTY_AUTO);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    void buildApi
+      .automations()
+      .then((r) => {
+        setJobs(r.jobs || []);
+        setHistory(r.history || []);
+      })
+      .catch((e) => setErr(String(e)));
+  }, []);
+
+  useEffect(() => {
+    load();
+    const t = window.setInterval(load, 12_000);
+    return () => window.clearInterval(t);
+  }, [load]);
+
+  async function save() {
+    const prompt = form.prompt.trim();
+    if (!prompt) {
+      setErr("Prompt required");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      const body = { ...form, title: form.title.trim() || "Untitled", cwd: cwd || "" };
+      if (editing) await buildApi.automationUpdate(editing, body);
+      else await buildApi.automationCreate(body);
+      setForm(EMPTY_AUTO);
+      setEditing(null);
+      load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel
+      title="Scheduled automations"
+      helpId="automations"
+      icon={<Clock size={20} strokeWidth={2} />}
+      actions={
+        <button type="button" className="icon-btn" onClick={load}>
+          <RefreshCw size={14} />
+        </button>
+      }
+    >
+      <p className="build-lede">
+        Local jobs. The desk checks every 30s and runs due prompts on a spare worker — your live chat stays put.
+      </p>
+
+      <div className="auto-form">
+        <input
+          className="build-search"
+          placeholder="Title"
+          value={form.title}
+          onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))}
+        />
+        <textarea
+          className="build-search"
+          style={{ minHeight: 88, resize: "vertical" }}
+          placeholder="Prompt to run…"
+          value={form.prompt}
+          onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
+        />
+        <div className="auto-form-row">
+          <select
+            className="build-search"
+            value={form.frequency}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, frequency: e.target.value as AutomationJob["frequency"] }))
+            }
+          >
+            <option value="once">Once</option>
+            <option value="hourly">Hourly</option>
+            <option value="daily">Daily</option>
+            <option value="weekdays">Weekdays</option>
+            <option value="weekly">Weekly</option>
+          </select>
+          <input
+            className="build-search"
+            type="time"
+            value={form.time}
+            onChange={(e) => setForm((f) => ({ ...f, time: e.target.value }))}
+          />
+          <button type="button" className="icon-btn primary-btn" disabled={busy} onClick={() => void save()}>
+            {editing ? "Update" : "Save"}
+          </button>
+          {editing ? (
+            <button
+              type="button"
+              className="icon-btn sm"
+              onClick={() => {
+                setEditing(null);
+                setForm(EMPTY_AUTO);
+              }}
+            >
+              Cancel
+            </button>
+          ) : null}
+        </div>
+        {err ? <p className="build-muted" style={{ color: "var(--red)" }}>{err}</p> : null}
+      </div>
+
+      {jobs.length === 0 ? (
+        <div className="build-empty">No schedules yet. Add one above, or ask Grok to write a grok-automation fence.</div>
+      ) : (
+        jobs.map((j) => (
+          <div key={j.id} className="wf-run-row">
+            <div className="wf-run-top">
+              <strong>{j.title}</strong>
+              <span className={`src-chip ${j.enabled ? "src-desk" : "src-cli"}`}>
+                {j.enabled ? j.frequency : "off"}
+              </span>
+            </div>
+            <div className="wf-run-meta">
+              {j.time} · next {j.nextRunAt ? new Date(j.nextRunAt).toLocaleString() : "—"}
+              {j.lastStatus ? ` · last ${j.lastStatus}` : ""}
+            </div>
+            <p className="auto-prompt">{j.prompt}</p>
+            <div className="wf-run-actions">
+              <button
+                type="button"
+                className="icon-btn sm"
+                onClick={() => {
+                  setEditing(j.id);
+                  setForm({
+                    title: j.title,
+                    prompt: j.prompt,
+                    frequency: j.frequency,
+                    time: j.time,
+                    enabled: j.enabled,
+                  });
+                }}
+              >
+                Edit
+              </button>
+              <button
+                type="button"
+                className="icon-btn sm"
+                onClick={() => void buildApi.automationUpdate(j.id, { enabled: !j.enabled }).then(load)}
+              >
+                {j.enabled ? "Disable" : "Enable"}
+              </button>
+              <button
+                type="button"
+                className="icon-btn sm"
+                onClick={() => void buildApi.automationRun(j.id).then(load).catch((e) => setErr(String(e)))}
+              >
+                <Play size={12} /> Run now
+              </button>
+              <button
+                type="button"
+                className="icon-btn sm danger-btn"
+                onClick={() => {
+                  if (!window.confirm(`Delete “${j.title}”?`)) return;
+                  void buildApi.automationDelete(j.id).then(load);
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          </div>
+        ))
+      )}
+
+      {history.length > 0 ? (
+        <>
+          <h3 className="build-h3">Recent runs</h3>
+          {history
+            .slice()
+            .reverse()
+            .slice(0, 12)
+            .map((h) => (
+              <div key={h.id} className="wf-run-meta" style={{ marginBottom: 6 }}>
+                {h.name} · {h.outcome}
+                {h.at ? ` · ${new Date(h.at).toLocaleString()}` : ""}
+                {h.error ? ` · ${h.error}` : ""}
+              </div>
+            ))}
+        </>
+      ) : null}
     </Panel>
   );
 }

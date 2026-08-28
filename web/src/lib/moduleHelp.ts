@@ -27,7 +27,7 @@ export const MODULE_HELP: Record<string, ModuleHelp> = {
     id: "chat",
     title: "Chat",
     summary: "Main conversation with Grok on this Mac.",
-    what: "Streams thoughts, tools, and replies from the local Grok CLI agent (ACP). Attachments, queue, stop, voice (if keyed), and artifacts rail live here.",
+    what: "Streams thoughts, tools, and replies from the local Grok CLI agent (ACP). Attachments, queue, stop, Speak (subscription TTS), optional live mic, and artifacts rail live here.",
     how: [
       "Type a message and Send (Enter). While busy, Send queues a follow-up.",
       "⌘N new chat · ⌘O folder · ⌘B sidebar · ⌘. artifacts · ⌘K command palette · Esc stop.",
@@ -191,13 +191,25 @@ export const MODULE_HELP: Record<string, ModuleHelp> = {
   usage: {
     id: "usage",
     title: "Usage & account",
-    summary: "Auth, models, and session stats.",
-    what: "Shows signed-in state, cached models, and per-session turn/token stats when available. SuperGrok dollar balance is not in local files.",
+    summary: "SuperGrok quota, local heatmap, and this-session tokens.",
+    what: "Reads CLI billing when you are signed in (plan / used%). Does not invent remaining dollars. The 16-week heatmap is local session activity, not the bill.",
     how: [
-      "Open a chat for session-level stats.",
-      "Refresh to re-read disk summaries.",
-      "Use TUI /usage or account console for billing credits.",
+      "Sign in with grok login to see quota.",
+      "Open a chat for session token / context stats.",
+      "The composer chip is this chat’s context window.",
     ],
+  },
+  automations: {
+    id: "automations",
+    title: "Scheduled automations",
+    summary: "Local cron for Grok — daily brief, weekly sweep, one-shot later.",
+    what: "Jobs live in Application Support. The daemon ticks every 30s and fires due jobs on a free ACP worker so the chat you are in stays put.",
+    how: [
+      "Add a title, prompt, and frequency, then Save.",
+      "Run now fires immediately on a spare worker.",
+      "Grok can also write a ```grok-automation``` JSON fence in chat to add one.",
+    ],
+    tips: ["Disable a job instead of deleting it if you might want it back."],
   },
   doctor: {
     id: "doctor",
@@ -213,9 +225,10 @@ export const MODULE_HELP: Record<string, ModuleHelp> = {
   settings: {
     id: "settings",
     title: "Settings",
-    summary: "Desk prefs, push, voice key, session limits, permission mode.",
-    what: "Persists to Application Support (not wiped by app rebuild). Includes phone push, session sidebar limits, and permission defaults.",
+    summary: "Desk prefs, push, Speak voice, session limits, permission mode.",
+    what: "Persists to Application Support (not wiped by app rebuild). Includes phone push, session sidebar limits, Speak voice (speak.toml), and permission defaults.",
     how: [
+      "Pick Speak voice — subscription TTS, shared with TUI ~/.grok/speak.toml.",
       "Toggle phone push and notify-on-turn-end.",
       "Set max sessions/projects shown in the sidebar.",
       "permissionMode: ask vs always-approve; phoneAlwaysApprove keeps mobile YOLO.",

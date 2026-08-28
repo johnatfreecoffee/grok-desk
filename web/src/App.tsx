@@ -9,8 +9,11 @@ import {
 } from "./lib/acpClient";
 import { GrokVoiceSession, type VoiceStatus } from "./lib/voiceRealtime";
 import { Sidebar, SettingsModal, type SessionMeta } from "./components/Sidebar";
+import { AuthGate } from "./components/AuthGate";
 import { VoiceWaveButton } from "./components/VoiceWaveButton";
 import { LiveTurn, WorkingStrip } from "./components/LiveTurn";
+import { MediaLightbox, guessMediaKind, type MediaItem } from "./components/MediaLightbox";
+import { extractAutomationFence } from "./lib/automations";
 import { ArtifactPane } from "./components/ArtifactPane";
 import { applyTurnUpdate, createTurnDraft, type TurnDraft } from "./lib/turnState";
 import {
@@ -31,6 +34,7 @@ import {
   stopThinkingChime,
 } from "./lib/voiceCues";
 import { copyTextToClipboard } from "./lib/clipboard";
+import { SpeakBar } from "./components/SpeakBar";
 import {
   ArrowUp,
   ChevronDown,
@@ -70,6 +74,7 @@ import {
   UsageView,
   WorkflowsView,
   WorktreesView,
+  AutomationsView,
 } from "./views/BuildViews";
 import { ModelPicker } from "./components/ModelPicker";
 import { PermissionCard, type PermissionRequest } from "./components/PermissionCard";
@@ -231,12 +236,49 @@ function persistSessionStatuses(map: Record<string, SessionListStatus>) {
 }
 
 export default function App() {
+  const [authPhase, setAuthPhase] = useState<"loading" | "gate" | "ready">("loading");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/auth/status", { credentials: "include" });
+        const d = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (d.configured && !d.authenticated) setAuthPhase("gate");
+        else setAuthPhase("ready");
+      } catch {
+        if (!cancelled) setAuthPhase("ready");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (authPhase === "loading") {
+    return (
+      <div className="auth-gate">
+        <div className="auth-gate-card">
+          <p className="auth-gate-sub">Checking lock…</p>
+        </div>
+      </div>
+    );
+  }
+  if (authPhase === "gate") {
+    return <AuthGate onAuthed={() => setAuthPhase("ready")} />;
+  }
+  return <DeskApp />;
+}
+
+function DeskApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [agent, setAgent] = useState<AgentStatus | null>(null);
   const [voiceConfigured, setVoiceConfigured] = useState(false);
+  const [speakReady, setSpeakReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voiceActive, setVoiceActive] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("idle");
@@ -294,6 +336,9 @@ export default function App() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [forkOpen, setForkOpen] = useState(false);
+  const [pinBottom, setPinBottom] = useState(true);
+  const [mediaItem, setMediaItem] = useState<MediaItem | null>(null);
+  const [contextChip, setContextChip] = useState<{ used: number; limit: number } | null>(null);
   const [liveAgents, setLiveAgents] = useState<
     { workerId: string; sessionId: string | null; cwd: string | null; busy: boolean; isDefault?: boolean }[]
   >([]);
@@ -318,6 +363,7 @@ export default function App() {
   const storeRef = useRef(new SessionStore());
   /** Live turn drafts that survive session switch / sidebar open-close. */
   const liveDraftBySessionRef = useRef<Map<string, TurnDraft>>(new Map());
+  const appliedAutoRef = useRef<Set<string>>(new Set());
   const messagesRef = useRef<ChatMessage[]>([]);
   const agentRef = useRef<AgentStatus | null>(null);
   /** Session that owns the in-flight turn (survives navigate-away). */
@@ -516,11 +562,25 @@ export default function App() {
     return hydrateMessages(disk, cached, draft);
   }, []);
 
-  const scrollToBottom = useCallback(() => {
+  const pinBottomRef = useRef(true);
+  const scrollToBottom = useCallback((force = false) => {
     requestAnimationFrame(() => {
       const el = scrollerRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
+      if (!el) return;
+      if (force || pinBottomRef.current) el.scrollTop = el.scrollHeight;
     });
+  }, []);
+
+  const onMessagesScroll = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    pinBottomRef.current = near;
+    setPinBottom(near);
+  }, []);
+
+  const openMedia = useCallback((url: string, name?: string) => {
+    setMediaItem({ url, name, kind: guessMediaKind(url, name) });
   }, []);
 
   const restart = useCallback(async () => {
@@ -771,6 +831,9 @@ export default function App() {
       onStatus: (info) => {
         if (info.agent) setAgent(info.agent);
         if (typeof info.voiceConfigured === "boolean") setVoiceConfigured(info.voiceConfigured);
+        if (typeof (info as { speakReady?: boolean }).speakReady === "boolean") {
+          setSpeakReady(Boolean((info as { speakReady?: boolean }).speakReady));
+        }
         const snap = info as TurnSnapshot;
         if (snap.agents) setLiveAgents(snap.agents);
         if (snap.liveSessionIds) setLiveSessionIds(snap.liveSessionIds);
@@ -831,9 +894,13 @@ export default function App() {
       onHello: (info) => {
         setAgent(info.agent);
         setVoiceConfigured(info.voiceConfigured);
+        if (typeof (info as { speakReady?: boolean }).speakReady === "boolean") {
+          setSpeakReady(Boolean((info as { speakReady?: boolean }).speakReady));
+        }
         const hello = info as {
           agent: AgentStatus;
           voiceConfigured: boolean;
+          speakReady?: boolean;
           turnActive?: boolean;
           activeSessionId?: string;
           bridgeSessionId?: string;
@@ -1274,7 +1341,7 @@ export default function App() {
         setArtifactFocus(null);
         if (!artifactsPinned) setArtifactsOpen(false);
         if (info.loadError && !String(info.sessionId || "").startsWith("mail:")) {
-          setError(`History loaded — send to continue in a fresh turn (${info.loadError})`);
+          setError(`Opened this chat. Send stays here — attaching agent (${info.loadError})`);
         }
         setSidebarTick((n) => n + 1);
         scrollToBottom();
@@ -1327,6 +1394,8 @@ export default function App() {
           setBusy(true);
           busyRef.current = true;
           setBgWorkingBanner(false);
+          setHistoryOnly(false);
+          setSessionPhase("ready");
         } else {
           // Background turn — keep view idle; show bg banner if someone else lives
           setBgWorkingBanner(
@@ -2001,7 +2070,55 @@ export default function App() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages.length, scrollToBottom]);
+  }, [messages.length, liveDraft?.content, scrollToBottom]);
+
+  useEffect(() => {
+    const last = [...messages].reverse().find((m) => m.role === "assistant" && !m.streaming);
+    if (!last || appliedAutoRef.current.has(last.id)) return;
+    const { cleaned, payload } = extractAutomationFence(last.content || "");
+    if (!payload) return;
+    appliedAutoRef.current.add(last.id);
+    if (cleaned !== last.content) {
+      setMessages((prev) => prev.map((m) => (m.id === last.id ? { ...m, content: cleaned } : m)));
+    }
+    void buildApi
+      .automationCreate({
+        title: payload.title,
+        prompt: payload.prompt,
+        frequency: payload.frequency,
+        time: payload.time,
+        weekdays: payload.weekdays,
+        enabled: payload.enabled,
+        cwd: payload.cwd || agentRef.current?.cwd || "",
+      })
+      .catch(() => {});
+  }, [messages]);
+
+  useEffect(() => {
+    const sid = agent?.sessionId;
+    if (!sid) {
+      setContextChip(null);
+      return;
+    }
+    let cancelled = false;
+    const pull = () => {
+      void buildApi
+        .usage(sid, agent?.cwd)
+        .then((d) => {
+          if (cancelled) return;
+          const used = d.sessionUsage?.contextUsed;
+          const limit = d.sessionUsage?.contextLimit;
+          if (used != null && limit) setContextChip({ used: Number(used), limit: Number(limit) });
+        })
+        .catch(() => {});
+    };
+    pull();
+    const id = window.setInterval(pull, 20_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [agent?.sessionId, agent?.cwd]);
 
   /**
    * Live transcript sync — when this session is also advanced from CLI (or
@@ -2272,6 +2389,8 @@ export default function App() {
     (raw: string) => {
       const text = raw.trim();
       if (!text) return;
+      pinBottomRef.current = true;
+      setPinBottom(true);
       const sid = agentRef.current?.sessionId;
       if (sid?.startsWith("mail:")) {
         setError("Email agent threads are read-only here — reply by email to continue.");
@@ -2331,6 +2450,8 @@ export default function App() {
   const send = useCallback(() => {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
+    pinBottomRef.current = true;
+    setPinBottom(true);
     const sid = agentRef.current?.sessionId;
     // Mail sessions are read-only in Desk
     if (sid?.startsWith("mail:")) {
@@ -2395,8 +2516,8 @@ export default function App() {
       const title = t.length > 72 ? `${t.slice(0, 72)}…` : t;
       setSessionTitles((prev) => ({ ...prev, [sid]: title }));
     }
-    // Pending new-chat (ACP id not back yet) or failed resume → hold and create
-    if (isPendingId(sid) || (historyOnlyRef.current && !sid)) {
+    // Pending new-chat (ACP id not back yet) — hold and create
+    if (isPendingId(sid) || (!sid && historyOnlyRef.current)) {
       pendingPromptRef.current = { text, atts, label };
       setHistoryOnly(false);
       viewOnlyRef.current = false;
@@ -2415,26 +2536,14 @@ export default function App() {
       scrollToBottom();
       return;
     }
-    // Failed resume on a real session: continue in a fresh session so we never
-    // prompt the wrong ACP id. A live sibling is not a reason to do this.
-    if (historyOnlyRef.current && sid && !storeRef.current.isLive(sid)) {
-      pendingPromptRef.current = { text, atts, label };
+    // Real session id (CLI or Desk): always prompt that id. Daemon loads it.
+    // Never session/new — that forked the chat John was already in.
+    if (historyOnlyRef.current && sid) {
       setHistoryOnly(false);
+      historyOnlyRef.current = false;
       viewOnlyRef.current = false;
       setViewOnlyBrowse(false);
-      setSessionPhase("creating");
-      setLoadingSession(true);
-      const cwd =
-        preferredCwdRef.current ||
-        agentRef.current?.cwd ||
-        loadLastSession()?.cwd ||
-        undefined;
-      if (cwd) preferredCwdRef.current = cwd;
-      clientRef.current?.newSession(cwd);
-      setAttachments([]);
-      setSidebarTick((n) => n + 1);
-      scrollToBottom();
-      return;
+      setSessionPhase("ready");
     }
     const clientMsgId = uid();
     if (sid) {
@@ -2508,7 +2617,7 @@ export default function App() {
     pendingForceSendRef.current = null;
     const sid = agentRef.current?.sessionId;
     if (sid?.startsWith("mail:")) return;
-    if (isPendingId(sid) || (historyOnlyRef.current && !sid)) {
+    if (isPendingId(sid) || (!sid && historyOnlyRef.current)) {
       pendingPromptRef.current = p;
       setHistoryOnly(false);
       viewOnlyRef.current = false;
@@ -2526,23 +2635,12 @@ export default function App() {
       scrollToBottom();
       return;
     }
-    if (historyOnlyRef.current && sid && !storeRef.current.isLive(sid)) {
-      pendingPromptRef.current = p;
+    if (historyOnlyRef.current && sid) {
       setHistoryOnly(false);
+      historyOnlyRef.current = false;
       viewOnlyRef.current = false;
       setViewOnlyBrowse(false);
-      setSessionPhase("creating");
-      setLoadingSession(true);
-      const cwd =
-        preferredCwdRef.current ||
-        agentRef.current?.cwd ||
-        loadLastSession()?.cwd ||
-        undefined;
-      if (cwd) preferredCwdRef.current = cwd;
-      clientRef.current?.newSession(cwd);
-      setSidebarTick((n) => n + 1);
-      scrollToBottom();
-      return;
+      setSessionPhase("ready");
     }
     const clientMsgId = uid();
     if (sid) {
@@ -2805,7 +2903,7 @@ export default function App() {
           if (v) setSessionPhase((p) => (p === "loading" ? "history_only" : p));
           return false;
         });
-      }, 15000);
+      }, 45000);
     },
     [
       agent?.sessionId,
@@ -2946,7 +3044,7 @@ export default function App() {
     if (sessionPhase === "creating") return { cls: "warn", label: "Starting chat…" };
     if (sessionPhase === "loading") return { cls: "warn", label: "Opening…" };
     if (isMailSession) return { cls: "warn", label: "Mail · read-only" };
-    if (historyOnly) return { cls: "warn", label: "History only" };
+    if (historyOnly) return { cls: "warn", label: "Same chat" };
     if (agent?.ready) return { cls: "ok", label: "Ready" };
     if (agent?.agentAlive) return { cls: "warn", label: "Agent starting…" };
     return { cls: "warn", label: "Connecting…" };
@@ -2963,7 +3061,7 @@ export default function App() {
     if (isMailSession) return "Reply by email to continue";
     if (voiceActive) return "Listening… type to inject a note";
     if (busy) return "Queue a follow-up…";
-    if (historyOnly) return "Send to continue in a fresh turn…";
+    if (historyOnly) return "Continue this chat…";
     if (projectName && messages.length === 0) return `Ask anything about ${projectName}…`;
     return "Message Grok…";
   }, [isMailSession, voiceActive, busy, historyOnly, projectName, messages.length]);
@@ -2988,7 +3086,7 @@ export default function App() {
         }
         return false;
       });
-    }, 20000);
+    }, 45000);
     return () => window.clearTimeout(t);
   }, [sessionPhase]);
 
@@ -3116,6 +3214,11 @@ export default function App() {
           return;
         }
       }
+      if (mediaItem && e.key === "Escape") {
+        e.preventDefault();
+        setMediaItem(null);
+        return;
+      }
       if (btwOpen && e.key === "Escape") {
         e.preventDefault();
         setBtwOpen(false);
@@ -3150,7 +3253,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [newChat, openFolder, busy, stopTurn, permRequest]);
+  }, [newChat, openFolder, busy, stopTurn, permRequest, mediaItem]);
 
   const revealPath = useCallback((p: string) => {
     void copyTextToClipboard(p);
@@ -3280,6 +3383,8 @@ export default function App() {
         return <MediaStudio {...common} />;
       case "usage":
         return <UsageView {...common} />;
+      case "automations":
+        return <AutomationsView {...common} />;
       default:
         return null;
     }
@@ -3595,21 +3700,21 @@ export default function App() {
                   sendText(cmd);
                 }}
               />
-              {voiceConfigured ? (
-                <span className="pill ok">
+              {speakReady ? (
+                <span className="pill ok" title="Subscription TTS — no API key">
                   <span className="dot" />
-                  voice ready
+                  speak ready
                 </span>
               ) : (
                 <button
                   type="button"
                   className="pill"
-                  title="Add an xAI key in Settings for voice"
+                  title="Grok login + grok-speak for reply voice"
                   onClick={() => setSettingsOpen(true)}
                   style={{ cursor: "pointer", border: "none" }}
                 >
                   <span className="dot" />
-                  voice off
+                  speak off
                 </button>
               )}
               <button
@@ -3904,11 +4009,12 @@ export default function App() {
         )}
         {historyOnly && !viewOnlyBrowse && !agent?.sessionId?.startsWith("mail:") && (
           <div className="banner" role="status">
-            Showing saved history. Agent didn’t fully resume — send a message to continue in a fresh turn.
+            This is the same chat. Send continues it — attaching the agent if needed.
           </div>
         )}
 
-        <div className="messages" ref={scrollerRef}>
+        <div className="messages" ref={scrollerRef} onScroll={onMessagesScroll}>
+          <div className="messages-inner">
           {messages.length === 0 && sessionPhase !== "loading" && (
             <div className="empty">
               <h1>{isDesktop ? "Grok Desk" : "Local Grok"}</h1>
@@ -3921,36 +4027,45 @@ export default function App() {
                       ? "Start typing below — or open a project with New."
                       : "Tap + for a new chat, or open the sidebar for projects."}
               </p>
-              {!voiceConfigured && isDesktop && (
+              {!speakReady && isDesktop && (
                 <p className="empty-note">
-                  Voice optional — add a key in{" "}
+                  Speak uses your Grok login.{" "}
                   <button type="button" className="linkish" onClick={() => setSettingsOpen(true)}>
                     Settings
-                  </button>
-                  .
+                  </button>{" "}
+                  for voice.
                 </p>
               )}
             </div>
           )}
           {messages.map((m) => (
             <div key={m.id} className={`msg ${m.role}${m.queued ? " queued" : ""}`}>
-              <div className="role">
+              <div className="role sr-only">
                 {m.role === "user" ? "you" : m.role === "assistant" ? "grok" : m.role}
                 {m.streaming ? " · live" : ""}
-                {m.queued ? (
-                  <span className="queued-badge">queued</span>
-                ) : null}
-                {showTimestamps && (m as { createdAt?: string }).createdAt ? (
-                  <span className="msg-ts">
-                    {new Date(String((m as { createdAt?: string }).createdAt)).toLocaleTimeString()}
-                  </span>
-                ) : null}
               </div>
+              {(m.queued || (showTimestamps && (m as { createdAt?: string }).createdAt)) && (
+                <div className="msg-meta">
+                  {m.queued ? <span className="queued-badge">queued</span> : null}
+                  {showTimestamps && (m as { createdAt?: string }).createdAt ? (
+                    <span className="msg-ts">
+                      {new Date(String((m as { createdAt?: string }).createdAt)).toLocaleTimeString()}
+                    </span>
+                  ) : null}
+                </div>
+              )}
               {m.attachments && m.attachments.length > 0 && (
                 <div className="msg-atts">
                   {m.attachments.map((a) =>
                     a.previewUrl ? (
-                      <img key={a.id} src={a.previewUrl} alt={a.name} className="msg-att-img" />
+                      <button
+                        key={a.id}
+                        type="button"
+                        className="msg-att-btn"
+                        onClick={() => openMedia(a.previewUrl || "", a.name)}
+                      >
+                        <img src={a.previewUrl} alt={a.name} className="msg-att-img" />
+                      </button>
                     ) : (
                       <span key={a.id} className="msg-att-chip">
                         {a.name}
@@ -3980,6 +4095,7 @@ export default function App() {
                           }
                     }
                     streaming={Boolean(m.streaming)}
+                    onMedia={openMedia}
                     onToolClick={(toolId) => {
                       setArtifactsOpen(true);
                       setArtifactsPinned(true);
@@ -3988,13 +4104,16 @@ export default function App() {
                     }}
                   />
                   {m.content && !m.streaming ? (
-                    <button
-                      type="button"
-                      className="copy-reply-btn"
-                      onClick={() => void copyTextToClipboard(m.content)}
-                    >
-                      <Copy size={12} /> Copy
-                    </button>
+                    <div className="msg-actions">
+                      <SpeakBar text={m.content} messageId={m.id} />
+                      <button
+                        type="button"
+                        className="copy-reply-btn"
+                        onClick={() => void copyTextToClipboard(m.content)}
+                      >
+                        <Copy size={12} /> Copy
+                      </button>
+                    </div>
                   ) : null}
                 </>
               ) : (
@@ -4008,6 +4127,20 @@ export default function App() {
           ))}
         </div>
         </div>
+        {!pinBottom && messages.length > 0 ? (
+          <button
+            type="button"
+            className="jump-latest"
+            onClick={() => {
+              pinBottomRef.current = true;
+              setPinBottom(true);
+              scrollToBottom(true);
+            }}
+          >
+            <ChevronDown size={16} strokeWidth={2.4} />
+            Latest
+          </button>
+        ) : null}
 
         <div className="app-footer">
         {busy &&
@@ -4036,12 +4169,21 @@ export default function App() {
 
         <div className="hint">
           {agent?.cwd ? projectLabel(agent.cwd) : " "}
-          {agent?.sessionId ? ` · ${agent.sessionId.slice(0, 8)}` : ""}
           {busy ? " · working" : ""}
           {sessionPhase === "creating" ? " · starting chat" : ""}
           {sessionPhase === "loading" ? " · opening" : ""}
           {historyOnly ? " · history only" : ""}
           {voiceActive ? ` · voice ${voiceStatus}` : ""}
+          {contextChip ? (
+            <button
+              type="button"
+              className="context-chip"
+              title="Open usage"
+              onClick={() => setDeskView("usage")}
+            >
+              {Math.round((contextChip.used / Math.max(1, contextChip.limit)) * 100)}% ctx
+            </button>
+          ) : null}
         </div>
 
         <div
@@ -4225,6 +4367,7 @@ export default function App() {
         </div>
         </div>
       </div>
+      </div>
 
       <ArtifactPane
         open={artifactsOpen}
@@ -4240,12 +4383,20 @@ export default function App() {
       </>
       )}
 
+      <MediaLightbox item={mediaItem} onClose={() => setMediaItem(null)} />
+
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         onSaved={(vc) => {
           setSidebarTick((n) => n + 1);
           if (typeof vc === "boolean") setVoiceConfigured(vc);
+          void fetch("/api/speak/settings")
+            .then((r) => r.json())
+            .then((d) => {
+              if (typeof d.speakReady === "boolean") setSpeakReady(d.speakReady);
+            })
+            .catch(() => {});
           // refresh status from daemon
           clientRef.current?.send({ type: "status" });
           // sync display prefs

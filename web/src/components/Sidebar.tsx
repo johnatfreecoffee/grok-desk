@@ -714,6 +714,12 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
   const [voiceKeyMasked, setVoiceKeyMasked] = useState<string | null>(null);
   const [xaiKeyDraft, setXaiKeyDraft] = useState("");
   const [clearKey, setClearKey] = useState(false);
+  const [speakReady, setSpeakReady] = useState(false);
+  const [speakVoice, setSpeakVoice] = useState("rex");
+  const [speakMode, setSpeakMode] = useState("concise");
+  const [speakVoices, setSpeakVoices] = useState<Array<{ id: string; name: string; detail: string }>>(
+    [],
+  );
   const [pushBusy, setPushBusy] = useState(false);
   const [pushMsg, setPushMsg] = useState<string | null>(null);
   const [pushState, setPushState] = useState<{
@@ -735,8 +741,22 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
         setSettings(d.settings);
         setVoiceConfigured(Boolean(d.voiceConfigured));
         setVoiceKeyMasked(d.voiceKeyMasked || null);
+        if (typeof d.speakReady === "boolean") setSpeakReady(d.speakReady);
+        if (d.speakVoice) setSpeakVoice(d.speakVoice);
+        if (d.speakMode) setSpeakMode(d.speakMode);
+        if (Array.isArray(d.speakVoices)) setSpeakVoices(d.speakVoices);
       })
       .catch(() => setSettings(null));
+    fetch("/api/speak/settings")
+      .then((r) => r.json())
+      .then((d) => {
+        if (typeof d.speakReady === "boolean") setSpeakReady(d.speakReady);
+        const st = d.settings || {};
+        if (st.voice) setSpeakVoice(st.voice);
+        if (st.mode) setSpeakMode(st.mode);
+        if (Array.isArray(d.speakVoices) && d.speakVoices.length) setSpeakVoices(d.speakVoices);
+      })
+      .catch(() => {});
     void getPushState().then(setPushState);
     fetch("/api/push/status")
       .then((r) => r.json())
@@ -788,6 +808,11 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
       setVoiceKeyMasked(data.voiceKeyMasked || null);
       setXaiKeyDraft("");
       setClearKey(false);
+      await fetch("/api/speak/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice: speakVoice, mode: speakMode }),
+      }).catch(() => {});
       onSaved(Boolean(data.voiceConfigured));
       onClose();
     } finally {
@@ -804,10 +829,48 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
         </div>
 
         <div className="settings-section">
-          <div className="settings-section-title">Voice</div>
+          <div className="settings-section-title">Speak</div>
+          <p className={speakReady ? "settings-ok" : "settings-callout"}>
+            {speakReady
+              ? "Uses your Grok login (subscription TTS). No API key."
+              : "Needs grok login and grok-speak on this Mac."}
+          </p>
+          <label className="field">
+            <span>Voice</span>
+            <select
+              value={speakVoice}
+              onChange={(e) => setSpeakVoice(e.target.value)}
+            >
+              {(speakVoices.length
+                ? speakVoices
+                : [{ id: "rex", name: "Rex", detail: "Confident and clear" }]
+              ).map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name} — {v.detail}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Default mode</span>
+            <select value={speakMode} onChange={(e) => setSpeakMode(e.target.value)}>
+              <option value="concise">Concise</option>
+              <option value="casual">Casual</option>
+              <option value="full">Full</option>
+              <option value="verbatim">Verbatim</option>
+            </select>
+          </label>
+          <p className="modal-hint">
+            Per-reply Concise / Casual / Full on a message does not change this default. Shared with
+            TUI <code>~/.grok/speak.toml</code>.
+          </p>
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-section-title">Live mic (optional)</div>
           {!voiceConfigured && !xaiKeyDraft.trim() && !clearKey && (
             <p className="settings-callout">
-              Enter an xAI API key to use voice mode. Text chat works without a key.
+              Only for talk-back mic. Reply Speak above does not need a key.
             </p>
           )}
           {voiceConfigured && !clearKey && (
@@ -844,15 +907,15 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
                   if (e.target.checked) setXaiKeyDraft("");
                 }}
               />
-              <span>Remove key (disable voice)</span>
+              <span>Remove key (disable live mic)</span>
             </label>
           )}
           <p className="modal-hint">
-            Only used when you start voice. Get a key at{" "}
+            Optional. Only for the mic button. Get a key at{" "}
             <a href="https://console.x.ai" target="_blank" rel="noreferrer">
               console.x.ai
             </a>
-            . Stored locally in this app — not for text chat.
+            . Reply Speak uses your Grok login instead.
           </p>
         </div>
 
@@ -979,6 +1042,50 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
             />
             <span>Show message timestamps</span>
           </label>
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-section-title">App</div>
+          <p className="modal-hint">Hard-refresh the PWA after a Desk update, or end this lock session.</p>
+          <div className="settings-app-actions">
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => {
+                void (async () => {
+                  try {
+                    if ("serviceWorker" in navigator) {
+                      const regs = await navigator.serviceWorker.getRegistrations();
+                      for (const r of regs) await r.unregister();
+                    }
+                    if (typeof caches !== "undefined") {
+                      const keys = await caches.keys();
+                      for (const k of keys) await caches.delete(k);
+                    }
+                  } finally {
+                    location.reload();
+                  }
+                })();
+              }}
+            >
+              Refresh
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => {
+                void (async () => {
+                  try {
+                    await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+                  } finally {
+                    location.reload();
+                  }
+                })();
+              }}
+            >
+              Sign out
+            </button>
+          </div>
         </div>
 
         <div className="settings-section">

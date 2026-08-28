@@ -3,7 +3,7 @@
   "productName": "Grok Desk",
   "version": "0.1.0",
   "private": false,
-  "description": "Local visual desk for Grok Build — CLI agent text + optional xAI realtime voice",
+  "description": "Local visual desk for Grok Build — CLI agent text + subscription Speak TTS + optional realtime mic",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -23,6 +23,10 @@
     "app": "npm run make-app && open -a 'Grok Desk'",
     "app:dev": "electron .",
     "make-app": "bash scripts/make-app.sh",
+    "pack": "bash scripts/pack.sh",
+    "pack:linux": "bash scripts/pack.sh linux",
+    "pack:win": "bash scripts/pack.sh win",
+    "test:auto": "node --experimental-strip-types scripts/smoke-automations.mjs",
     "phone": "bash scripts/phone-serve.sh",
     "always-on": "bash scripts/install-launchd.sh",
     "radar": "node daemon/radar/scanner.mjs",
@@ -31,6 +35,8 @@
     "smoke": "node scripts/smoke-desk.mjs",
     "smoke:turns": "node scripts/smoke-turn-resilience.mjs",
     "smoke:isolation": "node scripts/smoke-thread-isolation.mjs",
+    "smoke:resume": "node scripts/smoke-session-resume.mjs",
+    "test:speak": "node scripts/speak-unit.mjs",
     "test:store": "node --experimental-strip-types scripts/session-store-unit.mjs"
   },
   "dependencies": {

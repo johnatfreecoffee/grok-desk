@@ -56,7 +56,8 @@ This project was **built with Grok Build** (dogfooded end-to-end) and is open so
 - **Node.js ≥ 20**
 - **[Grok CLI](https://x.ai/build)** installed and **logged in** (`grok --version` works in Terminal)
 - Optional: [Tailscale](https://tailscale.com/) on Mac + phone for remote UI
-- Optional: xAI API key only if you want **voice**
+- Optional: [grok-speak](https://github.com/johnatfreecoffee/grok-speak) for **reply Speak** (subscription TTS — same Grok login, no API key)
+- Optional: xAI API key only if you want **live mic**
 
 ---
 

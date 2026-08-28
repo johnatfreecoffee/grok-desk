@@ -47,10 +47,12 @@ Legend: ✅ native · 🟡 partial · ❌ missing · N/A not applicable
 | `/import-claude` | 🟡 | Prompt inject (CLI import) |
 | `/config-agents` `/personas` | ✅ | Roles view — agents + personas browse |
 | `/login` `/logout` | 🟡 | Account/usage |
-| `/usage` | 🟡 | Session stats; no $ balance |
+| `/usage` | ✅ | CLI SuperGrok quota + 16-week local heatmap + session tokens |
+| `/automations` `/schedule` | ✅ | Local scheduled jobs; ACP pool fire |
 | `/privacy` | ✅ | Settings Privacy section |
 | `/settings` | 🟡 | Desk settings modal |
 | `/timestamps` | ✅ | Toggle + settings |
+| `/speak` family | ✅ | Per-reply Concise/Casual/Full + player; Settings voice via `speak.toml` (subscription TTS, no API key) |
 | `ask_user_question` | ✅ | QuestionCard via x.ai/ask_user_question |
 | Multi-agent pool | ✅ | ACP pool |
 | Permissions cards | ✅ | |

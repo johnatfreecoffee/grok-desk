@@ -16,7 +16,14 @@ import {
   mergeWorktree,
   removeWorktree,
 } from "../worktree-ops.js";
-import { collectSessionUsage, probeAccountCredits } from "../usage-collect.js";
+import { collectSessionUsage, collectUsageHeatmap, probeAccountCredits } from "../usage-collect.js";
+import {
+  createAutomation,
+  deleteAutomation,
+  listAutomations,
+  runAutomationNow,
+  updateAutomation,
+} from "../automations.js";
 import {
   deleteSession,
   findSessionDir,
@@ -67,6 +74,7 @@ export const SLASH_REGISTRY = [
   { id: "deep-research", cmd: "/deep-research", category: "automation", label: "Deep research", action: "prompt:/deep-research" },
   { id: "workflow", cmd: "/workflow", category: "automation", label: "Run workflow", action: "prompt:/workflow " },
   { id: "workflows", cmd: "/workflows", category: "automation", label: "Workflow runs", action: "view:workflows" },
+  { id: "automations", cmd: "/automations", aliases: ["/schedule", "/scheduled"], category: "automation", label: "Scheduled automations", action: "view:automations" },
   { id: "worktrees", cmd: "/worktrees", category: "session", label: "Git worktrees", action: "view:worktrees" },
   { id: "media", cmd: "/media", category: "media", label: "Media studio", action: "view:media" },
   { id: "config-agents", cmd: "/config-agents", aliases: ["/agents"], category: "agents", label: "Agent definitions", action: "view:personas" },
@@ -81,7 +89,7 @@ export const SLASH_REGISTRY = [
   { id: "imagine-video", cmd: "/imagine-video", category: "media", label: "Generate video", action: "prompt:/imagine-video" },
   { id: "login", cmd: "/login", category: "account", label: "Login", action: "prompt:/login" },
   { id: "logout", cmd: "/logout", category: "account", label: "Logout", action: "prompt:/logout" },
-  { id: "usage", cmd: "/usage", aliases: ["/cost"], category: "account", label: "Usage", action: "view:settings" },
+  { id: "usage", cmd: "/usage", aliases: ["/cost"], category: "account", label: "Usage", action: "view:usage" },
   { id: "settings", cmd: "/settings", aliases: ["/config", "/preferences", "/prefs"], category: "system", label: "Settings", action: "view:settings" },
   { id: "doctor", cmd: "/doctor", category: "system", label: "Doctor", action: "prompt:/doctor" },
   { id: "release-notes", cmd: "/release-notes", aliases: ["/changelog"], category: "system", label: "Release notes", action: "view:radar" },
@@ -923,6 +931,7 @@ async function usageSnapshot(sessionId, cwd) {
   const ver = readVersion();
   const account = await probeAccountCredits();
   const sessionUsage = sessionId ? collectSessionUsage(sessionId, cwd) : null;
+  const heatmap = collectUsageHeatmap(112);
   return {
     ok: true,
     version: ver,
@@ -931,6 +940,7 @@ async function usageSnapshot(sessionId, cwd) {
     models: models.map((m) => ({ id: m.id, name: m.name })),
     account,
     sessionUsage,
+    heatmap,
     note:
       account?.note ||
       "SuperGrok quota is account-side — no local remaining balance file.",
@@ -1140,6 +1150,39 @@ export async function handleBuildApi(req, res, sendJson, readBody) {
     const sessionId = url.searchParams.get("sessionId") || null;
     const cwd = url.searchParams.get("cwd") || null;
     sendJson(res, 200, await usageSnapshot(sessionId, cwd));
+    return true;
+  }
+
+  if (url.pathname === "/api/build/automations" && req.method === "GET") {
+    sendJson(res, 200, { ok: true, ...listAutomations() });
+    return true;
+  }
+
+  if (url.pathname === "/api/build/automations" && req.method === "POST") {
+    try {
+      const body = (await readBody(req)) || {};
+      const action = String(body.action || "create");
+      if (action === "create") {
+        sendJson(res, 200, { ok: true, job: createAutomation(body) });
+        return true;
+      }
+      if (action === "update" && body.id) {
+        sendJson(res, 200, { ok: true, job: updateAutomation(body.id, body) });
+        return true;
+      }
+      if (action === "delete" && body.id) {
+        sendJson(res, 200, deleteAutomation(body.id));
+        return true;
+      }
+      if (action === "run" && body.id) {
+        const out = await runAutomationNow(body.id, "run_now");
+        sendJson(res, 200, out);
+        return true;
+      }
+      sendJson(res, 400, { ok: false, error: `unknown action ${action}` });
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e.message || String(e) });
+    }
     return true;
   }
 

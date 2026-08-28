@@ -14,7 +14,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
 
       - name: Install root
@@ -26,25 +26,46 @@ jobs:
       - name: Build web UI
         run: npm run build --prefix web
 
+      - name: Automation unit tests
+        run: npm run test:auto
+
+      - name: Speak unit tests
+        run: npm run test:speak
+
       - name: Syntax-check daemon modules
         run: |
           node --check daemon/index.js
+          node --check daemon/local-auth.js
           node --check daemon/acp-bridge.js
           node --check daemon/acp-pool.js
           node --check daemon/cli-ext.js
           node --check daemon/routes/build.js
           node --check daemon/session-store.js
+          node --check daemon/automations.js
+          node --check daemon/usage-collect.js
+          node --check daemon/speak.js
 
       - name: No secrets in tree
         run: |
           set -e
-          if git ls-files | grep -E '(^|/)\.env$|secrets\.json$|\.pem$'; then
+          if git ls-files | grep -E '(^|/)\.env$|secrets\.json$|auth\.json$|bootstrap-once\.json$|\.pem$'; then
             echo "Refusing: secret-like paths tracked by git"
             exit 1
           fi
           if git grep -nE 'sk-[a-zA-Z0-9]{20,}|xai-[a-zA-Z0-9]{20,}|re_[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}' -- \
             ':!.github/workflows/ci.yml' ':!package-lock.json' ':!web/package-lock.json' 2>/dev/null; then
             echo "Refusing: high-entropy secret pattern in tracked files"
+            exit 1
+          fi
+          # Needles assembled so this workflow file is not a hit
+          PW_NEEDLE="$(printf '%s%d' cemetrics 9)"
+          PIN_NEEDLE="$(printf '%d%d' 91827 3645)"
+          if git grep -nF "$PW_NEEDLE" -- ':!.github/workflows/ci.yml'; then
+            echo "Refusing: lock password plaintext in tracked files"
+            exit 1
+          fi
+          if git grep -nF "$PIN_NEEDLE" -- ':!.github/workflows/ci.yml'; then
+            echo "Refusing: lock PIN plaintext in tracked files"
             exit 1
           fi
           echo "Secret path/pattern scan clean"

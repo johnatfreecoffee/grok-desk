@@ -94,12 +94,14 @@ type Handlers = {
     info: {
       agent: AgentStatus;
       voiceConfigured: boolean;
+      speakReady?: boolean;
     } & TurnSnapshot,
   ) => void;
   onStatus?: (
     info: {
       agent: AgentStatus;
       voiceConfigured: boolean;
+      speakReady?: boolean;
     } & TurnSnapshot,
   ) => void;
   onReady?: (info: { agent: AgentStatus } & TurnSnapshot) => void;

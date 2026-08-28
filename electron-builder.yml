@@ -1,0 +1,33 @@
+appId: dev.freecoffee.grok-desk
+productName: Grok Desk
+copyright: Local Grok desk
+asar: false
+directories:
+  output: dist-electron
+files:
+  - desktop/**/*
+  - daemon/**/*
+  - web/dist/**/*
+  - package.json
+  - scripts/start.sh
+extraResources:
+  - from: assets
+    to: assets
+win:
+  target:
+    - nsis
+    - portable
+  icon: assets/icon-1024.png
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+  icon: assets/icon-1024.png
+mac:
+  target: dmg
+  icon: assets/GrokDesk.icns
+  category: public.app-category.developer-tools
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

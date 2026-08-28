@@ -43,12 +43,14 @@ export function collectSessionUsage(sessionId, cwd) {
   if (!dir) return { ok: false, error: "session not found" };
 
   const summary = readJson(path.join(dir, "summary.json")) || {};
+  const signals = readJson(path.join(dir, "signals.json")) || {};
   const info = summary.info || {};
   const turns =
     summary.next_trace_turn ||
     summary.num_chat_messages ||
     summary.num_messages ||
     info.turn_count ||
+    signals.turnCount ||
     null;
 
   let inputTokens = null;
@@ -65,6 +67,12 @@ export function collectSessionUsage(sessionId, cwd) {
     reasoningTokens = u.reasoning ?? u.reasoning_tokens ?? null;
     contextUsed = u.context_used ?? u.context_tokens ?? null;
     contextLimit = u.context_limit ?? u.context_window ?? null;
+  }
+  if (contextUsed == null && signals.contextTokensUsed != null) {
+    contextUsed = signals.contextTokensUsed;
+  }
+  if (contextLimit == null && signals.contextWindowTokens != null) {
+    contextLimit = signals.contextWindowTokens;
   }
 
   // scan last portion of updates.jsonl for usage events
@@ -112,14 +120,185 @@ export function collectSessionUsage(sessionId, cwd) {
   };
 }
 
-/** Probe for account credits — currently none local; returns null remaining. */
-export async function probeAccountCredits() {
-  // Future: if cli-chat-proxy exposes balance, wire here.
-  // Deliberately do not invent numbers.
+function readOfficialAuth() {
+  const authPath = path.join(GROK_HOME, "auth.json");
+  const raw = readJson(authPath);
+  if (!raw || typeof raw !== "object") return null;
+  const rec = Object.values(raw).find((v) => v && typeof v === "object" && v.key);
+  if (!rec) return null;
   return {
-    creditsRemaining: null,
-    plan: null,
-    source: "unknown",
-    note: "SuperGrok remaining balance is not exposed via local CLI files. Use /usage in TUI or account console.",
+    token: rec.key,
+    email: rec.email || null,
+    userId: rec.user_id || rec.principal_id || null,
+    expiresAt: rec.expires_at || null,
   };
+}
+
+function mapTier(raw) {
+  if (!raw) return null;
+  const s = String(raw);
+  if (/heavy/i.test(s) || s === "SuperGrokPro") return "SuperGrok Heavy";
+  if (/super/i.test(s)) return "SuperGrok";
+  return s;
+}
+
+/**
+ * SuperGrok quota — official CLI billing JSON. Never invent remaining $.
+ * Token stays on the daemon; UI only sees redacted numbers.
+ */
+export async function probeAccountCredits() {
+  const auth = readOfficialAuth();
+  if (!auth?.token) {
+    return {
+      creditsRemaining: null,
+      usedPercent: null,
+      remainingPercent: null,
+      plan: null,
+      email: null,
+      source: "unsigned",
+      products: [],
+      periodStart: null,
+      periodEnd: null,
+      note: "Sign in with grok login to read SuperGrok quota.",
+    };
+  }
+
+  const headers = {
+    Authorization: `Bearer ${auth.token}`,
+    "x-grok-client-mode": "cli",
+    Accept: "application/json",
+  };
+
+  let billing = null;
+  let settings = null;
+  try {
+    const r = await fetch("https://cli-chat-proxy.grok.com/v1/billing?format=credits", {
+      headers,
+    });
+    if (r.ok) billing = await r.json();
+  } catch {
+    /* */
+  }
+  try {
+    const r = await fetch("https://cli-chat-proxy.grok.com/v1/settings", { headers });
+    if (r.ok) settings = await r.json();
+  } catch {
+    /* */
+  }
+
+  const cfg = billing?.config || billing || {};
+  const usedPercent =
+    typeof cfg.creditUsagePercent === "number"
+      ? cfg.creditUsagePercent
+      : typeof billing?.creditUsagePercent === "number"
+        ? billing.creditUsagePercent
+        : null;
+  const products = Array.isArray(cfg.productUsage || billing?.productUsage)
+    ? (cfg.productUsage || billing.productUsage).map((p) => ({
+        name: p.name || p.product || p.id || "usage",
+        usedPercent: p.creditUsagePercent ?? p.usedPercent ?? null,
+        remaining: p.remaining ?? p.creditsRemaining ?? null,
+      }))
+    : [];
+  const plan =
+    mapTier(settings?.subscription_tier_display) ||
+    mapTier(settings?.subscriptionTier) ||
+    mapTier(cfg.subscriptionTier) ||
+    null;
+
+  if (usedPercent == null && !products.length) {
+    return {
+      creditsRemaining: null,
+      usedPercent: null,
+      remainingPercent: null,
+      plan,
+      email: auth.email,
+      source: "cli-unreadable",
+      products: [],
+      periodStart: cfg.periodStart || cfg.period_start || null,
+      periodEnd: cfg.periodEnd || cfg.period_end || null,
+      note: "CLI signed in, but billing did not return a remaining balance.",
+    };
+  }
+
+  const remainingPercent =
+    usedPercent != null ? Math.max(0, Math.min(100, 100 - usedPercent)) : null;
+
+  return {
+    creditsRemaining: cfg.creditsRemaining ?? billing?.creditsRemaining ?? null,
+    usedPercent,
+    remainingPercent,
+    plan,
+    email: auth.email,
+    source: "cli-billing",
+    products,
+    periodStart: cfg.periodStart || cfg.period_start || null,
+    periodEnd: cfg.periodEnd || cfg.period_end || null,
+    note: null,
+  };
+}
+
+/** Local activity heatmap from session mtimes — not SuperGrok billing. */
+export function collectUsageHeatmap(days = 112) {
+  const root = path.join(GROK_HOME, "sessions");
+  const byDay = new Map();
+  const cutoff = Date.now() - days * 86400000;
+  if (!fs.existsSync(root)) return { days: [], max: 0 };
+
+  const walk = (dir, depth) => {
+    if (depth > 3) return;
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of ents) {
+      if (!ent.isDirectory()) continue;
+      const p = path.join(dir, ent.name);
+      const summary = readJson(path.join(p, "summary.json"));
+      if (summary) {
+        const ts = Date.parse(
+          summary.last_active_at || summary.updated_at || summary.created_at || "",
+        );
+        let when = Number.isFinite(ts) ? ts : 0;
+        if (!when) {
+          try {
+            when = fs.statSync(path.join(p, "summary.json")).mtimeMs;
+          } catch {
+            when = 0;
+          }
+        }
+        if (when >= cutoff) {
+          const day = new Date(when).toISOString().slice(0, 10);
+          const prev = byDay.get(day) || { date: day, sessions: 0, tokens: 0 };
+          prev.sessions += 1;
+          const u = summary.usage || summary.token_usage || {};
+          const tok =
+            Number(u.input || u.input_tokens || 0) +
+            Number(u.output || u.output_tokens || 0);
+          prev.tokens += tok;
+          byDay.set(day, prev);
+        }
+        continue;
+      }
+      walk(p, depth + 1);
+    }
+  };
+  walk(root, 0);
+
+  const out = [];
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  let max = 0;
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start.getTime());
+    d.setDate(start.getDate() + i);
+    const key = d.toISOString().slice(0, 10);
+    const row = byDay.get(key) || { date: key, sessions: 0, tokens: 0 };
+    max = Math.max(max, row.sessions);
+    out.push(row);
+  }
+  return { days: out, max };
 }

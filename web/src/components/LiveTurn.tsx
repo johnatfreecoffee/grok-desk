@@ -1,6 +1,7 @@
 /**
  * Live assistant turn — CLI-flavored: thinking stream, tools, agents, plan.
  */
+import { useEffect, useState } from "react";
 import type { PlanEntry, ToolCallView, TurnDraft } from "../lib/turnState";
 import { toolIconLabel } from "../lib/turnState";
 import { MarkdownBody } from "./MarkdownBody";
@@ -61,9 +62,52 @@ type Props = {
   draft: TurnDraft;
   streaming?: boolean;
   onToolClick?: (toolId: string) => void;
+  onMedia?: (url: string, name?: string) => void;
 };
 
-export function LiveTurn({ draft, streaming, onToolClick }: Props) {
+function ToolsStack({
+  tools,
+  streaming,
+  onToolClick,
+}: {
+  tools: ToolCallView[];
+  streaming?: boolean;
+  onToolClick?: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(Boolean(streaming));
+  useEffect(() => {
+    if (streaming) setOpen(true);
+    else setOpen(false);
+  }, [streaming]);
+
+  if (!tools.length) return null;
+  const last = tools[tools.length - 1];
+  const running = tools.filter((t) => t.status === "in_progress" || t.status === "pending").length;
+  if (!open) {
+    return (
+      <button type="button" className="tools-summary" onClick={() => setOpen(true)}>
+        {tools.length} tool{tools.length === 1 ? "" : "s"}
+        {running ? ` · ${running} running` : ""}
+        {last?.title ? ` · ${last.title}` : ""}
+      </button>
+    );
+  }
+
+  return (
+    <div className="tools-stack">
+      {tools.map((t) => (
+        <ToolRow key={t.id} t={t} onClick={onToolClick} />
+      ))}
+      {!streaming ? (
+        <button type="button" className="tools-summary dim" onClick={() => setOpen(false)}>
+          Hide tools
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+export function LiveTurn({ draft, streaming, onToolClick, onMedia }: Props) {
   const thinking = Boolean(draft.thought);
   // Stay open while streaming (any phase) so phone shows sequence, not a blank green pulse
   const showThoughtOpen =
@@ -100,13 +144,7 @@ export function LiveTurn({ draft, streaming, onToolClick }: Props) {
 
       {draft.plan.length > 0 && <PlanBlock plan={draft.plan} />}
 
-      {draft.tools.length > 0 && (
-        <div className="tools-stack">
-          {draft.tools.map((t) => (
-            <ToolRow key={t.id} t={t} onClick={onToolClick} />
-          ))}
-        </div>
-      )}
+      <ToolsStack tools={draft.tools} streaming={streaming} onToolClick={onToolClick} />
 
       {(draft.content || streaming) && (
         <div className="bubble assistant-bubble">
@@ -114,6 +152,7 @@ export function LiveTurn({ draft, streaming, onToolClick }: Props) {
             <MarkdownBody
               content={draft.content}
               streaming={Boolean(streaming && draft.phase === "writing")}
+              onMedia={onMedia}
             />
           ) : streaming && (draft.phase === "thinking" || draft.phase === "tooling") ? (
             <span className="inline-thinking">

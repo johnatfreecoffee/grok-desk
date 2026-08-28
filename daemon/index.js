@@ -3,6 +3,7 @@
  * - HTTP: serves the PWA, status, voice-token mint
  * - WS /ws: chat bridge to `grok agent stdio` (CLI subscription — no API)
  * Voice hits xAI only when POST /api/voice-token is called.
+ * Speak (TTS) uses grok-speak + subscription OAuth — no API key.
  */
 import http from "node:http";
 import fs from "node:fs";
@@ -12,6 +13,14 @@ import { WebSocketServer } from "ws";
 import { loadEnv, ROOT } from "./load-env.js";
 import { AcpPool } from "./acp-pool.js";
 import { mintVoiceToken } from "./voice-token.js";
+import {
+  speakStatusPayload,
+  synthesizeSpeak,
+  readClip,
+  isClipId,
+  loadSpeakSettings,
+  saveSpeakSettings,
+} from "./speak.js";
 import {
   listProjects,
   loadTranscript,
@@ -40,6 +49,16 @@ import {
   ensureVapidKeys,
 } from "./push.js";
 import { handleBuildApi } from "./routes/build.js";
+import {
+  runDueAutomations,
+  setAutomationFireHandler,
+} from "./automations.js";
+import {
+  handleAuthApi,
+  requireSession,
+  sessionFromRequest,
+  authConfigured,
+} from "./local-auth.js";
 
 loadEnv();
 ensureUserDataMigrated();
@@ -49,6 +68,7 @@ function voiceStatusPayload() {
   return {
     voiceConfigured: configured,
     voiceKeyMasked: configured ? maskXaiKey() : null,
+    ...speakStatusPayload(),
   };
 }
 
@@ -227,6 +247,35 @@ async function handleApi(req, res) {
     return true;
   }
 
+  if (url.pathname.startsWith("/api/auth")) {
+    return handleAuthApi(req, res);
+  }
+
+  // Liveness for Electron / launchd / phone-serve — must stay 200 even when locked.
+  if (url.pathname === "/api/health" && req.method === "GET") {
+    sendJson(res, 200, { ok: true });
+    return true;
+  }
+  if (url.pathname === "/api/status" && req.method === "GET") {
+    const sess = sessionFromRequest(req);
+    if (authConfigured() && !sess) {
+      sendJson(res, 200, { ok: true, locked: true, port: PORT });
+      return true;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      port: PORT,
+      ...voiceStatusPayload(),
+      agent: bridge.status(),
+      ...turnSnapshot(),
+    });
+    return true;
+  }
+
+  if (url.pathname.startsWith("/api/") && !requireSession(req, res)) {
+    return true;
+  }
+
   // Visual Build surface (skills / MCP / models / radar) — never touches turns
   if (url.pathname.startsWith("/api/build")) {
     return handleBuildApi(req, res, sendJson, readBody);
@@ -257,17 +306,6 @@ async function handleApi(req, res) {
   if (url.pathname === "/api/queue/cancel" && req.method === "POST") {
     const body = await readBody(req).catch(() => ({}));
     sendJson(res, 200, { ok: true, ...cancelQueueItem(body.clientMsgId || body.id) });
-    return true;
-  }
-
-  if (url.pathname === "/api/status" && req.method === "GET") {
-    sendJson(res, 200, {
-      ok: true,
-      port: PORT,
-      ...voiceStatusPayload(),
-      agent: bridge.status(),
-      ...turnSnapshot(),
-    });
     return true;
   }
 
@@ -391,6 +429,55 @@ async function handleApi(req, res) {
     } catch (e) {
       sendJson(res, 500, { ok: false, error: e.message || String(e) });
     }
+    return true;
+  }
+
+  if (url.pathname === "/api/speak/settings" && req.method === "GET") {
+    sendJson(res, 200, { ok: true, settings: loadSpeakSettings(), ...speakStatusPayload() });
+    return true;
+  }
+
+  if (url.pathname === "/api/speak/settings" && req.method === "POST") {
+    try {
+      const body = await readBody(req).catch(() => ({}));
+      const settings = saveSpeakSettings(body || {});
+      sendJson(res, 200, { ok: true, settings, ...speakStatusPayload() });
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/speak" && req.method === "POST") {
+    try {
+      const body = await readBody(req).catch(() => ({}));
+      const result = await synthesizeSpeak({
+        text: body.text,
+        mode: body.mode,
+        voice: body.voice,
+      });
+      sendJson(res, 200, result);
+    } catch (e) {
+      sendJson(res, e.status || 500, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  const clipMatch = url.pathname.match(/^\/api\/speak\/clip\/([^/]+?)(?:\.mp3)?$/);
+  if (clipMatch && req.method === "GET") {
+    const id = decodeURIComponent(clipMatch[1]).replace(/\.mp3$/i, "");
+    const clip = isClipId(id) ? readClip(id) : null;
+    if (!clip?.audioPath || !fs.existsSync(clip.audioPath)) {
+      sendJson(res, 404, { ok: false, error: "clip not found" });
+      return true;
+    }
+    const stat = fs.statSync(clip.audioPath);
+    res.writeHead(200, {
+      "Content-Type": "audio/mpeg",
+      "Content-Length": stat.size,
+      "Cache-Control": "private, max-age=86400",
+    });
+    fs.createReadStream(clip.audioPath).pipe(res);
     return true;
   }
 
@@ -1056,18 +1143,15 @@ async function runPromptJob(text, attachments, opts = {}) {
     await bridge.ensure();
     if (gen !== globalTurnGen) return;
 
-    // Bind to requested session if idle path asked for a specific id
-    if (opts.sessionId && bridge.sessionId && opts.sessionId !== bridge.sessionId) {
-      // Should not run wrong session while busy — caller should only start matching jobs
-      console.warn(
-        "[desk] runPromptJob session mismatch requested=",
-        opts.sessionId,
-        "bridge=",
-        bridge.sessionId,
-      );
-    }
-
-    if (!bridge.sessionId) {
+    // Named session → load it. Never session/new for a real CLI/Desk id.
+    if (opts.sessionId) {
+      if (bridge.sessionId !== opts.sessionId) {
+        const cwd = findSessionCwd(opts.sessionId) || bridge.cwd;
+        console.log("[desk] runPromptJob load", String(opts.sessionId).slice(0, 8));
+        await bridge.loadSession(opts.sessionId, cwd);
+        pool.bindSession(pool.defaultWorker, opts.sessionId, cwd);
+      }
+    } else if (!bridge.sessionId) {
       const session = await bridge.newSession(bridge.cwd);
       if (gen !== globalTurnGen) return;
       trackDeskSession(session.sessionId, bridge.cwd);
@@ -1799,7 +1883,11 @@ pool.on("agent_exit", (info) => {
   broadcastAgents();
 });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  if (!sessionFromRequest(req)) {
+    ws.close(4401, "auth required");
+    return;
+  }
   console.log("[ws] client connected");
   /** Bumped on load/new so a late ACP resume can't clobber the active session. */
   let loadGen = 0;
@@ -2357,7 +2445,7 @@ wss.on("connection", (ws) => {
         const gen = ++loadGen;
         let loaded = null;
         let loadError = null;
-        const RESUME_MS = 12000;
+        const RESUME_MS = 30000;
         try {
           loaded = await Promise.race([
             loadBridge.loadSession(sessionId, cwd),
@@ -2477,8 +2565,8 @@ wss.on("connection", (ws) => {
       // Claim slot synchronously so a second prompt on this tick enqueues
       const claimEpoch = claimBusy("prompt");
 
-      // Idle but prompt targets a different session → load then run
-      if (sessionId && bridge.sessionId && sessionId !== bridge.sessionId) {
+      // Idle — load the named session even if the worker has no bound id yet
+      if (sessionId && sessionId !== bridge.sessionId) {
         try {
           const cwd = findSessionCwd(sessionId) || bridge.cwd;
           console.log("[desk] prompt bind → load", sessionId.slice(0, 8));
@@ -2534,9 +2622,13 @@ server.listen(PORT, "127.0.0.1", async () => {
   console.log(`\n  Grok Desk  →  http://127.0.0.1:${PORT}`);
   console.log(`  Text chat  →  Grok CLI agent (no API key needed)`);
   console.log(
-    `  Voice      →  ${resolveXaiApiKey() ? "xAI key set (Settings or .env)" : "add key in Settings to enable"}`,
+    `  Speak      →  ${speakStatusPayload().speakReady ? "subscription TTS ready" : "grok login + grok-speak"}`,
+  );
+  console.log(
+    `  Live mic   →  ${resolveXaiApiKey() ? "xAI key set (optional)" : "off (TTS does not need a key)"}`,
   );
   console.log(`  Prefs      →  ${userDataDir()}`);
+  console.log(`  Lock       →  ${authConfigured() ? "on" : "off"}`);
   console.log(`  Source     →  ${getDeskSourceDir()}\n`);
   // Clean subagent ids that polluted desk-index from earlier builds
   try {
@@ -2550,6 +2642,45 @@ server.listen(PORT, "127.0.0.1", async () => {
   } catch (e) {
     console.warn("[push] VAPID init failed:", e.message);
   }
+  setAutomationFireHandler(async (job) => {
+    const cwd = job.cwd ? path.resolve(String(job.cwd)) : bridge.cwd;
+    const text = String(job.prompt || "").trim();
+    if (!text) throw new Error("empty automation prompt");
+    let worker = pool.acquire({ cwd, preferFree: true });
+    if (!worker) {
+      const err = new Error("agent pool busy");
+      err.code = "BUSY";
+      throw err;
+    }
+    await worker.bridge.ensure();
+    worker.bridge.cwd = cwd;
+    const session = await worker.bridge.newSession(cwd);
+    pool.bindSession(worker, session.sessionId, cwd);
+    trackDeskSession(session.sessionId, cwd);
+    broadcastProjectsTick("automation");
+    broadcastAgents();
+    void runParallelPrompt(worker, text, [], {
+      sessionId: session.sessionId,
+      cwd,
+      clientMsgId: `auto_${job.id}_${Date.now().toString(36)}`,
+    });
+    if (job.notify) {
+      void notifyPush({
+        title: "Scheduled · Grok Desk",
+        body: (job.title || "Automation").slice(0, 140),
+        tag: `auto-${job.id}`,
+        url: "/",
+        status: "info",
+      }).catch(() => {});
+    }
+    return { sessionId: session.sessionId };
+  });
+  setInterval(() => {
+    const busy = pool.anyBusy() && pool.size() >= pool.max;
+    void runDueAutomations({ busy }).catch((e) =>
+      console.warn("[auto] tick failed:", e.message),
+    );
+  }, 30_000);
   // Warm the agent process only — no orphan session/new
   bridge.ensure().catch((e) => console.warn("[acp] warm start failed:", e.message));
 });

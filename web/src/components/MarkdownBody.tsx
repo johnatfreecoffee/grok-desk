@@ -54,9 +54,18 @@ type Props = {
   className?: string;
   /** Show streaming caret after content */
   streaming?: boolean;
+  onMedia?: (url: string, name?: string) => void;
 };
 
-export function MarkdownBody({ content, className = "", streaming }: Props) {
+function mediaName(url: string) {
+  try {
+    return decodeURIComponent(url.split("/").pop() || url);
+  } catch {
+    return url;
+  }
+}
+
+export function MarkdownBody({ content, className = "", streaming, onMedia }: Props) {
   if (!content && !streaming) return null;
 
   return (
@@ -65,11 +74,53 @@ export function MarkdownBody({ content, className = "", streaming }: Props) {
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
-            a: ({ href, children }) => (
-              <a href={href} target="_blank" rel="noreferrer noopener">
-                {children}
-              </a>
-            ),
+            a: ({ href, children }) => {
+              const url = href || "";
+              const name = mediaName(url);
+              if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(url)) {
+                return (
+                  <video
+                    className="md-video"
+                    src={url}
+                    controls
+                    playsInline
+                    onClick={() => onMedia?.(url, name)}
+                  />
+                );
+              }
+              if (/\.(mp3|wav|m4a|ogg)(\?|$)/i.test(url)) {
+                return <audio className="md-audio" src={url} controls />;
+              }
+              if (/\.(pdf|docx?|xlsx?|pptx?)(\?|$)/i.test(url)) {
+                return (
+                  <button
+                    type="button"
+                    className="md-file-card"
+                    onClick={() => (onMedia ? onMedia(url, name) : window.open(url, "_blank"))}
+                  >
+                    <span className="md-file-kind">{name.split(".").pop()}</span>
+                    <span className="md-file-name">{name}</span>
+                  </button>
+                );
+              }
+              return (
+                <a href={href} target="_blank" rel="noreferrer noopener">
+                  {children}
+                </a>
+              );
+            },
+            img: ({ src, alt }) => {
+              const url = src || "";
+              return (
+                <button
+                  type="button"
+                  className="md-img-btn"
+                  onClick={() => onMedia?.(url, alt || mediaName(url))}
+                >
+                  <img className="md-img" src={url} alt={alt || ""} />
+                </button>
+              );
+            },
             code: ({ className: cn, children }) => (
               <CodeBlock className={cn}>{children}</CodeBlock>
             ),

@@ -144,6 +144,35 @@ export type SubagentInfo = {
   turns: number | null;
 };
 
+export type AutomationJob = {
+  id: string;
+  title: string;
+  prompt: string;
+  enabled: boolean;
+  cwd: string;
+  model: string;
+  frequency: "once" | "hourly" | "daily" | "weekdays" | "weekly";
+  time: string;
+  weekdays: number[];
+  notify: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  nextRunAt: string | null;
+};
+
+export type AutomationHistory = {
+  id: string;
+  scheduleId: string;
+  name: string;
+  at: string;
+  outcome: string;
+  error: string | null;
+  sessionId: string | null;
+  source: string;
+};
+
 export type DeskView =
   | "chat"
   | "home"
@@ -162,6 +191,7 @@ export type DeskView =
   | "worktrees"
   | "media"
   | "usage"
+  | "automations"
   | "personas";
 
 export const buildApi = {
@@ -284,7 +314,19 @@ export const buildApi = {
       modelCount: number;
       models: { id: string; name: string }[];
       note?: string;
-      account?: { creditsRemaining: number | null; source: string; note?: string };
+      account?: {
+        creditsRemaining: number | null;
+        usedPercent: number | null;
+        remainingPercent: number | null;
+        plan: string | null;
+        email: string | null;
+        source: string;
+        note?: string | null;
+        products?: { name: string; usedPercent: number | null; remaining: number | null }[];
+        periodStart?: string | null;
+        periodEnd?: string | null;
+      };
+      heatmap?: { days: { date: string; sessions: number; tokens: number }[]; max: number };
       sessionUsage?: {
         turns?: number | null;
         model?: string | null;
@@ -304,6 +346,30 @@ export const buildApi = {
           : ""
       }`,
     ),
+  automations: () =>
+    get<{
+      ok: boolean;
+      jobs: AutomationJob[];
+      history: AutomationHistory[];
+    }>("/api/build/automations"),
+  automationCreate: (body: Record<string, unknown>) =>
+    post<{ ok: boolean; job: AutomationJob; error?: string }>("/api/build/automations", {
+      action: "create",
+      ...body,
+    }),
+  automationUpdate: (id: string, body: Record<string, unknown>) =>
+    post<{ ok: boolean; job: AutomationJob; error?: string }>("/api/build/automations", {
+      action: "update",
+      id,
+      ...body,
+    }),
+  automationDelete: (id: string) =>
+    post<{ ok: boolean; error?: string }>("/api/build/automations", { action: "delete", id }),
+  automationRun: (id: string) =>
+    post<{ ok: boolean; sessionId?: string | null; error?: string }>("/api/build/automations", {
+      action: "run",
+      id,
+    }),
   file: (filePath: string, cwd?: string | null) =>
     get<{ ok: boolean; content?: string; path?: string; error?: string; truncated?: boolean }>(
       `/api/build/file?path=${encodeURIComponent(filePath)}${

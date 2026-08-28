@@ -15,6 +15,9 @@ data/
 *.pem
 *.key
 secrets.json
+auth.json
+auth-sessions.json
+bootstrap-once.json
 
 # local desktop build artifacts
 Grok Desk.app/

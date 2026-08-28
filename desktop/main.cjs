@@ -29,6 +29,7 @@ if (process.platform === "darwin") {
 const ROOT = path.resolve(__dirname, "..");
 const PORT = Number(process.env.PORT || 8787);
 const DESK_URL = `http://127.0.0.1:${PORT}`;
+const PACKAGED = app.isPackaged;
 
 let mainWindow = null;
 let daemonProc = null;
@@ -39,7 +40,12 @@ function log(...args) {
 }
 
 function resolveNode() {
-  if (process.env.NODE_BIN && fs.existsSync(process.env.NODE_BIN)) return process.env.NODE_BIN;
+  if (process.env.NODE_BIN && fs.existsSync(process.env.NODE_BIN)) {
+    return { bin: process.env.NODE_BIN, env: {} };
+  }
+  if (PACKAGED) {
+    return { bin: process.execPath, env: { ELECTRON_RUN_AS_NODE: "1" } };
+  }
   // Electron's process.execPath is Electron itself — use system node
   const candidates = [
     "/usr/local/bin/node",
@@ -49,51 +55,65 @@ function resolveNode() {
 
   for (const c of candidates) {
     if (c.includes("nvm")) continue;
-    if (fs.existsSync(c)) return c;
+    if (fs.existsSync(c)) return { bin: c, env: {} };
   }
-  return "node";
+  return { bin: "node", env: {} };
+}
+
+/** Engine is up if it answers HTTP. 401 = local lock on, still ready. */
+function engineListening(statusCode) {
+  return Number(statusCode) >= 200 && Number(statusCode) < 500;
+}
+
+function probeEngine(pathname) {
+  return new Promise((resolve) => {
+    const req = http.get(`${DESK_URL}${pathname}`, (res) => {
+      let body = "";
+      res.on("data", (c) => (body += c));
+      res.on("end", () => {
+        resolve({ statusCode: res.statusCode, body });
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.setTimeout(1500, () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
 }
 
 function waitForHealth(timeoutMs = 45000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
-    const tick = () => {
-      const req = http.get(`${DESK_URL}/api/status`, (res) => {
-        let body = "";
-        res.on("data", (c) => (body += c));
-        res.on("end", () => {
-          if (res.statusCode === 200) return resolve(JSON.parse(body || "{}"));
-          retry();
-        });
-      });
-      req.on("error", retry);
-      req.setTimeout(1500, () => {
-        req.destroy();
-        retry();
-      });
+    const tick = async () => {
+      const hit = (await probeEngine("/api/health")) || (await probeEngine("/api/status"));
+      if (hit && engineListening(hit.statusCode)) {
+        try {
+          return resolve(JSON.parse(hit.body || "{}"));
+        } catch {
+          return resolve({ ok: true });
+        }
+      }
+      retry();
     };
     const retry = () => {
       if (Date.now() - start > timeoutMs) {
         reject(new Error("Daemon did not become ready in time"));
         return;
       }
-      setTimeout(tick, 250);
+      setTimeout(() => {
+        void tick();
+      }, 250);
     };
-    tick();
+    void tick();
   });
 }
 
 function isPortUp() {
-  return new Promise((resolve) => {
-    const req = http.get(`${DESK_URL}/api/status`, (res) => {
-      res.resume();
-      resolve(res.statusCode === 200);
-    });
-    req.on("error", () => resolve(false));
-    req.setTimeout(800, () => {
-      req.destroy();
-      resolve(false);
-    });
+  return probeEngine("/api/health").then(async (hit) => {
+    if (hit && engineListening(hit.statusCode)) return true;
+    const status = await probeEngine("/api/status");
+    return Boolean(status && engineListening(status.statusCode));
   });
 }
 
@@ -143,19 +163,21 @@ async function startDaemon() {
   fs.mkdirSync(logDir, { recursive: true });
   const out = fs.openSync(path.join(logDir, "daemon.out.log"), "a");
   const err = fs.openSync(path.join(logDir, "daemon.err.log"), "a");
+  const pathSep = process.platform === "win32" ? ";" : ":";
 
-  log("starting daemon", node, entry);
+  log("starting daemon", node.bin, entry);
   ownsDaemon = true;
-  daemonProc = spawn(node, [entry], {
+  daemonProc = spawn(node.bin, [entry], {
     cwd: ROOT,
     env: {
       ...process.env,
+      ...node.env,
       PATH: [
         "/usr/local/bin",
         "/opt/homebrew/bin",
         path.join(process.env.HOME || "", ".grok", "bin"),
         process.env.PATH || "",
-      ].join(":"),
+      ].join(pathSep),
       PORT: String(PORT),
     },
     stdio: ["ignore", out, err],
