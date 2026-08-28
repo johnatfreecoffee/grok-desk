@@ -27,7 +27,7 @@ export const MODULE_HELP: Record<string, ModuleHelp> = {
     id: "chat",
     title: "Chat",
     summary: "Main conversation with Grok on this Mac.",
-    what: "Streams thoughts, tools, and replies from the local Grok CLI agent (ACP). Attachments, queue, stop, Speak (subscription TTS), optional live mic, and artifacts rail live here.",
+    what: "Streams thoughts, tools, and replies from the local Grok CLI agent (ACP). Attachments, queue, stop, Speak (subscription TTS), dictation (TUI /voice STT), and artifacts rail live here.",
     how: [
       "Type a message and Send (Enter). While busy, Send queues a follow-up.",
       "⌘N new chat · ⌘O folder · ⌘B sidebar · ⌘. artifacts · ⌘K command palette · Esc stop.",

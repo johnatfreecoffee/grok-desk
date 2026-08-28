@@ -704,16 +704,12 @@ export function Sidebar({
 type SettingsProps = {
   open: boolean;
   onClose: () => void;
-  onSaved: (voiceConfigured?: boolean) => void;
+  onSaved?: () => void;
 };
 
 export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
   const [settings, setSettings] = useState<DeskSettings | null>(null);
   const [saving, setSaving] = useState(false);
-  const [voiceConfigured, setVoiceConfigured] = useState(false);
-  const [voiceKeyMasked, setVoiceKeyMasked] = useState<string | null>(null);
-  const [xaiKeyDraft, setXaiKeyDraft] = useState("");
-  const [clearKey, setClearKey] = useState(false);
   const [speakReady, setSpeakReady] = useState(false);
   const [speakVoice, setSpeakVoice] = useState("rex");
   const [speakMode, setSpeakMode] = useState("concise");
@@ -732,15 +728,11 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
 
   useEffect(() => {
     if (!open) return;
-    setXaiKeyDraft("");
-    setClearKey(false);
     setPushMsg(null);
     fetch("/api/settings")
       .then((r) => r.json())
       .then((d) => {
         setSettings(d.settings);
-        setVoiceConfigured(Boolean(d.voiceConfigured));
-        setVoiceKeyMasked(d.voiceKeyMasked || null);
         if (typeof d.speakReady === "boolean") setSpeakReady(d.speakReady);
         if (d.speakVoice) setSpeakVoice(d.speakVoice);
         if (d.speakMode) setSpeakMode(d.speakMode);
@@ -795,8 +787,6 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
     setSaving(true);
     try {
       const body: Record<string, unknown> = { ...settings };
-      if (clearKey) body.clearXaiApiKey = true;
-      else if (xaiKeyDraft.trim()) body.xaiApiKey = xaiKeyDraft.trim();
       const resp = await fetch("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -804,16 +794,12 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(data.error || "Save failed");
-      setVoiceConfigured(Boolean(data.voiceConfigured));
-      setVoiceKeyMasked(data.voiceKeyMasked || null);
-      setXaiKeyDraft("");
-      setClearKey(false);
       await fetch("/api/speak/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ voice: speakVoice, mode: speakMode }),
       }).catch(() => {});
-      onSaved(Boolean(data.voiceConfigured));
+      onSaved?.();
       onClose();
     } finally {
       setSaving(false);
@@ -832,8 +818,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
           <div className="settings-section-title">Speak</div>
           <p className={speakReady ? "settings-ok" : "settings-callout"}>
             {speakReady
-              ? "Uses your Grok login (subscription TTS). No API key."
-              : "Needs grok login and grok-speak on this Mac."}
+              ? "Uses your Grok login (subscription). Dictation and Speak — no API key."
+              : "Needs grok login. Dictation uses the same TUI /voice STT."}
           </p>
           <label className="field">
             <span>Voice</span>
@@ -863,59 +849,6 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
           <p className="modal-hint">
             Per-reply Concise / Casual / Full on a message does not change this default. Shared with
             TUI <code>~/.grok/speak.toml</code>.
-          </p>
-        </div>
-
-        <div className="settings-section">
-          <div className="settings-section-title">Live mic (optional)</div>
-          {!voiceConfigured && !xaiKeyDraft.trim() && !clearKey && (
-            <p className="settings-callout">
-              Only for talk-back mic. Reply Speak above does not need a key.
-            </p>
-          )}
-          {voiceConfigured && !clearKey && (
-            <p className="settings-ok">
-              Key on file{voiceKeyMasked ? `: ${voiceKeyMasked}` : ""}. Paste a new one to replace.
-            </p>
-          )}
-          <label className="field">
-            <span>xAI API key</span>
-            <input
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              placeholder={
-                voiceConfigured && !clearKey
-                  ? "Paste new key to replace…"
-                  : "xai-… paste from console.x.ai"
-              }
-              value={clearKey ? "" : xaiKeyDraft}
-              disabled={clearKey}
-              onChange={(e) => {
-                setClearKey(false);
-                setXaiKeyDraft(e.target.value);
-              }}
-            />
-          </label>
-          {voiceConfigured && (
-            <label className="field check">
-              <input
-                type="checkbox"
-                checked={clearKey}
-                onChange={(e) => {
-                  setClearKey(e.target.checked);
-                  if (e.target.checked) setXaiKeyDraft("");
-                }}
-              />
-              <span>Remove key (disable live mic)</span>
-            </label>
-          )}
-          <p className="modal-hint">
-            Optional. Only for the mic button. Get a key at{" "}
-            <a href="https://console.x.ai" target="_blank" rel="noreferrer">
-              console.x.ai
-            </a>
-            . Reply Speak uses your Grok login instead.
           </p>
         </div>
 

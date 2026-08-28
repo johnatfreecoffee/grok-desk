@@ -44,6 +44,7 @@ jobs:
           node --check daemon/automations.js
           node --check daemon/usage-collect.js
           node --check daemon/speak.js
+          node --check daemon/stt.js
 
       - name: No secrets in tree
         run: |

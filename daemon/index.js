@@ -21,6 +21,7 @@ import {
   loadSpeakSettings,
   saveSpeakSettings,
 } from "./speak.js";
+import { transcribeAudio } from "./stt.js";
 import {
   listProjects,
   loadTranscript,
@@ -36,7 +37,7 @@ import {
   sessionsRoot,
   pruneSubagentsFromDeskIndex,
 } from "./session-store.js";
-import { hasXaiApiKey, maskXaiKey, saveSecrets, resolveXaiApiKey } from "./secrets.js";
+import { hasXaiApiKey, maskXaiKey, saveSecrets } from "./secrets.js";
 import { saveUpload, isImageMime } from "./uploads.js";
 import { ensureUserDataMigrated, userDataDir } from "./user-data.js";
 import {
@@ -444,6 +445,25 @@ async function handleApi(req, res) {
       sendJson(res, 200, { ok: true, settings, ...speakStatusPayload() });
     } catch (e) {
       sendJson(res, 400, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/stt" && req.method === "POST") {
+    try {
+      const body = await readBody(req).catch(() => ({}));
+      const b64 = String(body.audioBase64 || "").replace(/\s/g, "");
+      if (!b64) {
+        sendJson(res, 400, { ok: false, error: "No audio" });
+        return true;
+      }
+      const result = await transcribeAudio({
+        buffer: Buffer.from(b64, "base64"),
+        mime: body.mime,
+      });
+      sendJson(res, 200, result);
+    } catch (e) {
+      sendJson(res, e.status || 500, { ok: false, error: e.message || String(e) });
     }
     return true;
   }
@@ -2624,9 +2644,7 @@ server.listen(PORT, "127.0.0.1", async () => {
   console.log(
     `  Speak      →  ${speakStatusPayload().speakReady ? "subscription TTS ready" : "grok login + grok-speak"}`,
   );
-  console.log(
-    `  Live mic   →  ${resolveXaiApiKey() ? "xAI key set (optional)" : "off (TTS does not need a key)"}`,
-  );
+  console.log("  Dictate    →  TUI /voice (Grok STT, subscription login)");
   console.log(`  Prefs      →  ${userDataDir()}`);
   console.log(`  Lock       →  ${authConfigured() ? "on" : "off"}`);
   console.log(`  Source     →  ${getDeskSourceDir()}\n`);

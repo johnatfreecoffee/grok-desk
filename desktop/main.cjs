@@ -3,7 +3,7 @@
  * Open app → start daemon → show window
  * Close app → stop daemon + agent
  */
-const { app, BrowserWindow, ipcMain, shell, dialog, Menu } = require("electron");
+const { app, BrowserWindow, ipcMain, shell, dialog, Menu, session } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
@@ -245,6 +245,13 @@ function createWindow() {
   });
 
   mainWindow.once("ready-to-show", () => mainWindow.show());
+  try {
+    session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+      callback(permission === "media" || permission === "audioCapture" || permission === "microphone");
+    });
+  } catch {
+    /* */
+  }
   mainWindow.loadURL(DESK_URL);
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

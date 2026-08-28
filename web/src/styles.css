@@ -2811,6 +2811,23 @@ body.desk-app .topbar {
   color: var(--blue);
 }
 
+.dictate-btn.listening {
+  color: var(--blue);
+  background: var(--blue-bg);
+}
+.dictate-btn.listening svg {
+  animation: dictate-pulse 1s ease-in-out infinite;
+}
+@keyframes dictate-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
 .msg-actions {
   display: flex;
   flex-wrap: wrap;

@@ -7,10 +7,9 @@ import {
   type ChatMessage,
   type TurnSnapshot,
 } from "./lib/acpClient";
-import { GrokVoiceSession, type VoiceStatus } from "./lib/voiceRealtime";
 import { Sidebar, SettingsModal, type SessionMeta } from "./components/Sidebar";
 import { AuthGate } from "./components/AuthGate";
-import { VoiceWaveButton } from "./components/VoiceWaveButton";
+import { DictateButton } from "./components/DictateButton";
 import { LiveTurn, WorkingStrip } from "./components/LiveTurn";
 import { MediaLightbox, guessMediaKind, type MediaItem } from "./components/MediaLightbox";
 import { extractAutomationFence } from "./lib/automations";
@@ -27,12 +26,6 @@ import {
   shouldAutoOpenArtifacts,
   type Artifact,
 } from "./lib/artifacts";
-import {
-  playVoiceCue,
-  preloadVoiceCues,
-  startThinkingChime,
-  stopThinkingChime,
-} from "./lib/voiceCues";
 import { copyTextToClipboard } from "./lib/clipboard";
 import { SpeakBar } from "./components/SpeakBar";
 import {
@@ -105,14 +98,6 @@ declare global {
 
 function uid() {
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function recentContext(messages: ChatMessage[], max = 12): string {
-  return messages
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .slice(-max)
-    .map((m) => `${m.role === "user" ? "User" : "Grok"}: ${m.content.slice(0, 800)}`)
-    .join("\n");
 }
 
 /**
@@ -277,13 +262,8 @@ function DeskApp() {
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [agent, setAgent] = useState<AgentStatus | null>(null);
-  const [voiceConfigured, setVoiceConfigured] = useState(false);
   const [speakReady, setSpeakReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [voiceActive, setVoiceActive] = useState(false);
-  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("idle");
-  const [voiceLevel, setVoiceLevel] = useState(0);
-  const [outLevel, setOutLevel] = useState(0);
   const [restarting, setRestarting] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(loadSidebarOpenDefault);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -352,7 +332,6 @@ function DeskApp() {
   const isMailSession = Boolean(agent?.sessionId?.startsWith("mail:"));
 
   const clientRef = useRef<DeskClient | null>(null);
-  const voiceRef = useRef<GrokVoiceSession | null>(null);
   const draftRef = useRef<TurnDraft | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -830,7 +809,6 @@ function DeskApp() {
       },
       onStatus: (info) => {
         if (info.agent) setAgent(info.agent);
-        if (typeof info.voiceConfigured === "boolean") setVoiceConfigured(info.voiceConfigured);
         if (typeof (info as { speakReady?: boolean }).speakReady === "boolean") {
           setSpeakReady(Boolean((info as { speakReady?: boolean }).speakReady));
         }
@@ -893,13 +871,11 @@ function DeskApp() {
       },
       onHello: (info) => {
         setAgent(info.agent);
-        setVoiceConfigured(info.voiceConfigured);
         if (typeof (info as { speakReady?: boolean }).speakReady === "boolean") {
           setSpeakReady(Boolean((info as { speakReady?: boolean }).speakReady));
         }
         const hello = info as {
           agent: AgentStatus;
-          voiceConfigured: boolean;
           speakReady?: boolean;
           turnActive?: boolean;
           activeSessionId?: string;
@@ -1889,7 +1865,6 @@ function DeskApp() {
     });
     return () => {
       client.disconnect();
-      voiceRef.current?.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- connect once per mount
   }, [scrollToBottom, pickMessages, mergeArtifacts, focusComposer, setSessionListStatus]);
@@ -2943,101 +2918,6 @@ function DeskApp() {
     }
   }, []);
 
-  const stopVoice = useCallback(() => {
-    stopThinkingChime();
-    voiceRef.current?.stop();
-    voiceRef.current = null;
-    setVoiceActive(false);
-    setVoiceStatus("idle");
-    setVoiceLevel(0);
-    setOutLevel(0);
-    playVoiceCue("stop");
-  }, []);
-
-  const startVoice = useCallback(async () => {
-    if (voiceActive) {
-      stopVoice();
-      return;
-    }
-    setError(null);
-    preloadVoiceCues();
-    let readyCuePlayed = false;
-    let endCuePlayed = false;
-    const session = new GrokVoiceSession({
-      onStatus: (s) => {
-        setVoiceStatus(s);
-        if (s === "listening" && !readyCuePlayed) {
-          readyCuePlayed = true;
-          playVoiceCue("start");
-        }
-        if (s === "thinking") startThinkingChime();
-        else stopThinkingChime();
-        if ((s === "ended" || s === "error") && !endCuePlayed) {
-          endCuePlayed = true;
-          stopThinkingChime();
-          setVoiceActive(false);
-        }
-      },
-      onLevel: setVoiceLevel,
-      onOutputLevel: setOutLevel,
-      onUserTranscript: (text, final) => {
-        if (!final || !text.trim()) return;
-        setMessages((prev) => [...prev, { id: uid(), role: "user", content: text.trim() }]);
-      },
-      onAssistantTranscript: (text, final) => {
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return prev.map((m, i) =>
-              i === prev.length - 1 ? { ...m, content: text, streaming: !final } : m,
-            );
-          }
-          return [
-            ...prev,
-            { id: uid(), role: "assistant", content: text, streaming: !final },
-          ];
-        });
-      },
-      onAssistantTurnStart: () => {
-        setMessages((prev) => [
-          ...prev,
-          { id: uid(), role: "assistant", content: "", streaming: true },
-        ]);
-      },
-      onError: (msg) => setError(msg),
-      onToolCall: async () => ({ ok: true }),
-      isExternalAudioActive: () => false,
-    });
-    voiceRef.current = session;
-    setVoiceActive(true);
-
-    await session.start({
-      getAuthHeaders: async () => ({}),
-      greet: messages.length === 0,
-      contextText: messages.length ? recentContext(messages) : null,
-      fetchConfig: async () => {
-        const resp = await fetch("/api/voice-token", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contextText: messages.length ? recentContext(messages) : null,
-          }),
-        });
-        const body = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          setVoiceActive(false);
-          return {
-            ok: false,
-            error: body.error || "Couldn't start voice",
-            errorCode: body.no_xai_key ? "no_xai_key" : undefined,
-            cfg: {},
-          };
-        }
-        return { ok: true, cfg: body };
-      },
-    });
-  }, [voiceActive, stopVoice, messages]);
-
   const statusPill = useMemo(() => {
     if (!connected) return { cls: "err", label: "Daemon offline" };
     if (busy) return { cls: "warn", label: "Working…" };
@@ -3059,12 +2939,11 @@ function DeskApp() {
 
   const composerPlaceholder = useMemo(() => {
     if (isMailSession) return "Reply by email to continue";
-    if (voiceActive) return "Listening… type to inject a note";
     if (busy) return "Queue a follow-up…";
     if (historyOnly) return "Continue this chat…";
     if (projectName && messages.length === 0) return `Ask anything about ${projectName}…`;
     return "Message Grok…";
-  }, [isMailSession, voiceActive, busy, historyOnly, projectName, messages.length]);
+  }, [isMailSession, busy, historyOnly, projectName, messages.length]);
 
   const liveArtifacts = useMemo(() => {
     const fromLive = artifactsFromDraft(liveDraft);
@@ -4173,7 +4052,7 @@ function DeskApp() {
           {sessionPhase === "creating" ? " · starting chat" : ""}
           {sessionPhase === "loading" ? " · opening" : ""}
           {historyOnly ? " · history only" : ""}
-          {voiceActive ? ` · voice ${voiceStatus}` : ""}
+
           {contextChip ? (
             <button
               type="button"
@@ -4251,28 +4130,22 @@ function DeskApp() {
             className={`composer pill shell${busy ? " is-busy" : ""}${isMailSession ? " mail-locked" : ""}`}
           >
           <div className="composer-row">
-          <VoiceWaveButton
-            active={voiceActive}
-            status={voiceStatus}
-            micLevel={voiceLevel}
-            outLevel={outLevel}
-            size="sm"
+          <DictateButton
             disabled={loadingSession || isMailSession}
-            onStart={() => {
-              if (!voiceConfigured) {
-                setError("Enter an xAI API key in Settings to use voice mode.");
-                setSettingsOpen(true);
-                return;
-              }
-              void startVoice();
+            onText={(text) => {
+              setInput((prev) => {
+                const next = prev.trim() ? `${prev.replace(/\s+$/, "")} ${text}` : text;
+                return next;
+              });
+              requestAnimationFrame(() => taRef.current?.focus());
             }}
-            onStop={stopVoice}
+            onError={(msg) => setError(msg)}
           />
           <button
             type="button"
             className="icon-btn sm"
             title="Attach files"
-            disabled={voiceActive || isMailSession}
+            disabled={isMailSession}
             onClick={() => fileInputRef.current?.click()}
           >
             <Paperclip size={18} strokeWidth={2} />
@@ -4320,15 +4193,6 @@ function DeskApp() {
             onKeyDown={(e) => {
               if ((e.key === "Enter" && !e.shiftKey) || ((e.metaKey || e.ctrlKey) && e.key === "Enter")) {
                 e.preventDefault();
-                if (voiceActive && input.trim()) {
-                  voiceRef.current?.sendUserText(input.trim());
-                  setMessages((prev) => [
-                    ...prev,
-                    { id: uid(), role: "user", content: input.trim() },
-                  ]);
-                  setInput("");
-                  return;
-                }
                 send();
               }
             }}
@@ -4351,7 +4215,6 @@ function DeskApp() {
             aria-label={busy ? "Queue follow-up" : "Send"}
             disabled={
               (!input.trim() && attachments.length === 0) ||
-              voiceActive ||
               isMailSession
             }
           >
@@ -4388,9 +4251,8 @@ function DeskApp() {
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
-        onSaved={(vc) => {
+        onSaved={() => {
           setSidebarTick((n) => n + 1);
-          if (typeof vc === "boolean") setVoiceConfigured(vc);
           void fetch("/api/speak/settings")
             .then((r) => r.json())
             .then((d) => {

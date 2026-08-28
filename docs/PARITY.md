@@ -53,6 +53,7 @@ Legend: ✅ native · 🟡 partial · ❌ missing · N/A not applicable
 | `/settings` | 🟡 | Desk settings modal |
 | `/timestamps` | ✅ | Toggle + settings |
 | `/speak` family | ✅ | Per-reply Concise/Casual/Full + player; Settings voice via `speak.toml` (subscription TTS, no API key) |
+| `/voice` dictation | ✅ | Composer mic = TUI /voice (Grok STT + login). Ctrl+Space / F8. No API key. |
 | `ask_user_question` | ✅ | QuestionCard via x.ai/ask_user_question |
 | Multi-agent pool | ✅ | ACP pool |
 | Permissions cards | ✅ | |

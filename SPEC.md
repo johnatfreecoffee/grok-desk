@@ -4,7 +4,7 @@
 - Opening a Grok CLI/TUI chat in Desk (Mac or phone) is **that same session**. Send stays on the same `sessionId`. Never `session/new` because ACP resume was slow or `history_only`.
 - Each finished assistant reply has **Concise / Casual / Full** plus a mini player (play/pause, ±15s, scrub, speed).
 - Speak uses **subscription OAuth** (`grok-speak` → `POST /v1/tts` via `~/.grok/auth.json`). No console API key required.
-- Settings: pick TTS voice (writes `~/.grok/speak.toml`). Live-mic API key stays optional and separate.
+- Composer **dictation** is TUI `/voice` (Grok STT + login). No API-key realtime mic. No API key in Settings.
 
 ## Not doing
 - Porting Grok Speak.app (Swift) into Electron.
