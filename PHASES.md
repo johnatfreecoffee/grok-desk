@@ -19,7 +19,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Proof: click a tool mid-turn → socket stays up, stream continues. Reopen the PWA during
     a live turn → back on the chat you were reading.
 
-- [ ] **P1 Feed projector** — `daemon/session-feed.js`
+- [x] **P1 Feed projector** — `daemon/session-feed.js`
   - Cursor `{updatesBytes, eventsBytes, seq}`; `seq` from `_meta.eventId` suffix
   - Incremental tail from byte offset; hold a trailing partial line (torn CLI appends)
   - Normalize `updates.jsonl` + `events.jsonl` → one ordered `FeedEvent[]`
@@ -38,8 +38,13 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
     `globalBusy || parallelTurns.size > 0` but `activeSessionId` falls back to
     `bridge.sessionId`, so a parallel-only turn reports a session that is not live and the
     client marks the wrong chat "working"
+  - Coalesce `phase_changed` before it reaches the wire — it is 88% of all events
+    (163,785 of 186,302 swept; one session had 2,527)
+  - Gate the UI's live/"working" state on **`live && owner`**, not `live` alone: 56 of 958
+    sessions carry a `turn_started` with no `turn_ended` from a CLI that died mid-turn
   - Proof: CLI-side turn visible in the feed < 1 s; no frame without `sessionId`; `stop`
-    from the phone leaves the Mac's other turn running
+    from the phone leaves the Mac's other turn running; a crashed-mid-turn session does not
+    show as working
 
 - [ ] **P3 Client projection** — `web/src/lib/sessionFeed.ts`
   - App renders from the feed; cursor in `localStorage`; resubscribe on visibility + reconnect
@@ -62,7 +67,10 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 - [ ] **P6 Terminal fidelity**
   - Subagent strip at the top of the chat: type, description, status, duration, tools;
-    opens the child session; shows `output.json`
+    opens the child session; shows `output.json`. Source is `subagent_spawned` /
+    `subagent_finished` + `subagents/*/meta.json` — **not** `task_backgrounded` /
+    `task_completed`, which are background *shell* tasks (they belong in the background-task
+    surface instead)
   - Real tool status from `events.jsonl`; context meter from `signals.json`
   - Background task output from `background_tasks_manifest.json` + `terminal/*.log`
   - Surface `session_kind: headless`; real toggle for `showSubagentSessions`
