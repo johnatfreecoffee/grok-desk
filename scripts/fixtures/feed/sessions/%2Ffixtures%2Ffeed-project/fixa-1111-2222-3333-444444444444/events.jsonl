@@ -1,0 +1,9 @@
+{"ts":"2026-08-17T20:53:20.500Z","type":"turn_started","session_id":"fixa-1111-2222-3333-444444444444","turn_number":1,"model_id":"grok-4.6","yolo_mode":false,"conversation_message_count":0,"session_relationship":"root","schema_version":1}
+{"ts":"2026-08-17T20:53:21.500Z","type":"phase_changed","phase":"waiting_for_model"}
+{"ts":"2026-08-17T20:53:22.500Z","type":"phase_changed","phase":"streaming_reasoning"}
+{"ts":"2026-08-17T20:53:23.500Z","type":"first_token"}
+{"ts":"2026-08-17T20:53:24.100Z","type":"tool_started","tool_name":"read_file"}
+{"ts":"2026-08-17T20:53:24.200Z","type":"permission_requested","tool_name":"read_file"}
+{"ts":"2026-08-17T20:53:24.300Z","type":"permission_resolved","tool_name":"read_file","decision":"allow","wait_ms":12}
+{"ts":"2026-08-17T20:53:25.100Z","type":"tool_completed","tool_name":"read_file","duration_ms":90,"outcome":"success","tool_call_id":"call-fix-0"}
+{"ts":"2026-08-17T20:53:31.500Z","type":"turn_ended","outcome":"success"}

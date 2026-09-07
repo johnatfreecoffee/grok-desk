@@ -43,6 +43,7 @@ import {
   sessionsRoot,
   pruneSubagentsFromDeskIndex,
 } from "./session-store.js";
+import { read as readSessionFeed } from "./session-feed.js";
 import { hasXaiApiKey, maskXaiKey, saveSecrets } from "./secrets.js";
 import { saveUpload, isImageMime } from "./uploads.js";
 import { ensureUserDataMigrated, userDataDir } from "./user-data.js";
@@ -554,6 +555,29 @@ async function handleApi(req, res) {
       sendJson(res, 200, loadTranscript(sessionId, cwd));
     } catch (e) {
       sendJson(res, 500, { ok: false, error: e.message || String(e), messages: [] });
+    }
+    return true;
+  }
+
+  // GET /api/sessions/:id/feed?from=<seq>&limit=<n>&cwd=
+  const feedMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/feed$/);
+  if (feedMatch && req.method === "GET") {
+    const sessionId = decodeURIComponent(feedMatch[1]);
+    const cwd = url.searchParams.get("cwd") || undefined;
+    const fromRaw = Number(url.searchParams.get("from"));
+    const limitRaw = Number(url.searchParams.get("limit"));
+    try {
+      sendJson(
+        res,
+        200,
+        readSessionFeed(sessionId, {
+          from: Number.isFinite(fromRaw) ? fromRaw : 0,
+          limit: Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined,
+          cwd,
+        }),
+      );
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message || String(e), events: [] });
     }
     return true;
   }

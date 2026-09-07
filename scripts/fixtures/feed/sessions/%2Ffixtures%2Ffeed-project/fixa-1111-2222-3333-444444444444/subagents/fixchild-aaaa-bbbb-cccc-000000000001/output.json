@@ -1,0 +1,4 @@
+{
+  "schema_version": 1,
+  "output": "The failing test is tests/build.test.sh"
+}
