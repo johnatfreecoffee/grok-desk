@@ -1,45 +1,66 @@
-# Spec: One product — Grok Desk
+# Spec: Session truth — Desk mirrors the terminal exactly
 
-Grok Folders, grok-speak, and grok-phone-mcp collapse into **Grok Desk**. One install, one repo, one Settings pane. Sellable as a single local Mac product.
+Grok Desk stops keeping its own copy of the truth. `~/.grok/sessions/<urlenc-cwd>/<id>/`
+becomes the single source of truth and Desk becomes a **cursor-based projection** of it.
+
+Shipped-and-locked scope from v0.2.0 (one product: Speak, Folders, Phone connector) is in
+`docs/SPEC-one-product-v0.2.0.md`. It stays working; it is not re-opened here.
 
 ## Done
 
-- Installing / running Grok Desk is enough. No sibling `~/Documents/grok-speak`, `grok-folders`, or `grok-phone-mcp` required for Speak, the menu-bar folder launcher, or the grok.com phone connector.
-- **Speak** engine lives in this repo (`tools/speak/`). Desk synthesizes via the bundled `grok-speak` binary. TUI `/speak` can be installed from Settings. Existing per-reply Concise / Casual / Full + player still works. Prefs stay `~/.grok/speak.toml`.
-- **Folders** is a native macOS menu-bar extra bundled here (`native/folders/`). Same NSMenu behavior as today’s Grok Folders (comet, Terminal icon, hover-dwell, recents, never above `$HOME`). Desk Settings turns it on/off and sets hover / default open / root. Existing `~/Library/Application Support/GrokFolders/state.json` is reused.
-- **Phone connector** (grok.com MCP) is vendored here (`tools/phone-mcp/`). Local Streamable HTTP MCP on port 3311, token in `~/.grok/phone-mcp/token`. Desk Settings: enable/disable, health, copy URL, copy/rotate token. John’s existing Cloudflare tunnel (`https://grok-mcp.freecoffee.dev`) keeps working if already installed; public URL is a setting, not hardcoded as the only path.
-- Settings modal has three first-class sections, same chrome as Speak / Phone push today: **Speak**, **Folders**, **Phone connector**.
-- README / package.json present one product. Old Documents folders become stubs that point here.
+- Every chat in Desk is a projection of `~/.grok/sessions/<cwd>/<id>/` and shows the same
+  content as the terminal: user turns, reply text, thinking, tool calls with status, plan,
+  subagents, context usage.
+- Leaving a chat and returning — desktop or phone, mid-turn or idle — resumes exactly where
+  it left off, nothing missing, nothing duplicated. Same for closing/reopening the PWA and
+  for a full page reload.
+- A session running in the **terminal** appears live in Desk and streams as it happens.
+  Read-only while a live pid owns it, and the UI says so. Sendable once that process exits.
+- Two or more chats stream at once; acting on one never disturbs another. `stop` only stops
+  the session it names.
+- A subagent strip at the top of a chat shows every subagent for that session — type,
+  description, status, duration, tool count — and opens the child session.
+- Full history is reachable: no silent 4000 / 8000 / 200-row cut, no duplicate-content drops.
+- No turn is ever killed by a Desk timer.
+- Desk never causes the CLI to lose turns (no `chat_history.jsonl` clobber).
 
 ## Not doing
 
-- Porting Folders to an Electron Tray / HTML popover. Native `NSMenu` stays.
-- Rewriting Speak from Python to Node.
-- Merging the MCP HTTP server onto Desk’s `:8787` (grok.com needs a dedicated MCP URL; keep `:3311`).
-- Building a multi-tenant cloud MCP / SaaS.
-- Auto-speaking every reply.
-- Changing TUI `/speak` semantics.
-- App Store / payment listing (human gate after this factory).
-- Deleting GitHub history of grok-speak. Stub + redirect only.
-- Purple / violet / indigo / fuchsia.
+- Leader mode / a shared `grok agent` backend between TUI and Desk (`~/.grok/leader.sock`).
+- Writing into `~/.grok/sessions` beyond what the spawned `grok agent` already writes.
+  Delete stays the only Desk-initiated write, and it gains an ownership guard.
+- A UI redesign. Existing Desk chrome, dark / blue.
+- **Purple / violet / indigo / fuchsia.** Grok marks stay blue.
+- New PARITY rows: `/compact`, `/rewind` file restore, `/memory`, `/hooks` stay 🟡.
+- Rewriting the ACP bridge's *send* path. It stays how prompts go out.
+- Cloud, Supabase, Cloudflare. Local only.
+- App Store / payment listing (human gate).
 
 ## Accept
 
-- `speakBin()` resolves `tools/speak/bin/grok-speak` (repo-relative) before `~/.grok/bin/grok-speak` and before `~/Documents/grok-speak`.
-- `npm run test:speak` green. `npm run build` green.
-- Folders: Settings enable → comet in the menu bar; disable → quit + unload launch agent. Hover and “open with Grok vs Terminal” persist in existing state.json.
-- Phone connector: Settings enable → `http://127.0.0.1:3311/health` ok; disable → stop launch agent. Token never shown in full in the UI after first copy (masked; copy/rotate only).
-- Settings at desktop + ~390 phone. Existing `settings-section` / `field` / `modal-hint` chrome. No new layout language.
-- Old repos: `~/Documents/grok-speak`, `grok-folders`, `grok-phone-mcp` README-only stubs pointing at grok-desk. Do not delete git remotes.
-- Ship `main` on github.com/johnatfreecoffee/grok-desk.
+- `npm run test:feed` — projector unit tests over real fixture session dirs: cursor resume,
+  monotonic seq, no dupes, no drops, torn-line tolerance, ownership detection.
+- `npm run smoke:switch` — leave A mid-turn, open B, prompt B, return to A mid-turn. A's
+  stream is complete and still running; B unaffected.
+- `npm run smoke:reload` — drop the WS mid-turn, reconnect at cursor. Content, thinking and
+  tools all survive and the turn completes.
+- `npm run smoke:cli` — start a session in a real terminal `grok`, prompt it. Desk's feed
+  matches that session's `updates.jsonl` in content, live within 1 s, and Desk refuses to
+  `session/load` it while its pid is alive.
+- Existing `smoke`, `smoke:turns`, `smoke:isolation`, `smoke:resume`, `test:speak`,
+  `test:auto` green. `test:store` rewritten against the code that actually ships, and wired
+  into CI alongside `test:feed`.
+- No WS frame reaches the client without a `sessionId`.
+- Sending the same short message twice keeps both.
+- Sidebar poll plus a live turn stay under 5% CPU with ~950 sessions on disk.
+- Hunt at desktop ~1280 · tablet ~768 portrait + ~1024 landscape · phone ~390, plus a
+  two-client lane (Mac + phone on the same chat) and a CLI-concurrency lane. One full run,
+  zero findings.
 
 ## Keep
 
-- Local lock (AuthGate). Electron + PWA + ACP pool.
-- Desk dark / blue. No purple.
-- Existing Speak player on replies (subscription OAuth, no API key).
-- Tailscale phone PWA path.
-- Desk launchd `dev.freecoffee.grok-desk`.
-- Folders bundle id `dev.freecoffee.GrokFolders` so an already-installed extra keeps working.
-- Phone MCP tools: `grok_sessions_list` `grok_sessions_search` `grok_session_get` `grok_run` `grok_reply` `grok_job_status` `grok_inspect`. cwd rooted in `~/Documents`.
-- Optional xAI API-key realtime mic if a key is already set (do not resurrect it as required).
+- Local lock (AuthGate), Electron shell, Tailscale phone PWA path.
+- launchd `dev.freecoffee.grok-desk`.
+- ACP pool for sending prompts.
+- Speak, Folders, Phone connector exactly as shipped in v0.2.0.
+- Desk dark / blue. Blue Grok pill + `GrokMark` / `GrokChip`.

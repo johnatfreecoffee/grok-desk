@@ -1,53 +1,87 @@
-# Grok Desk — one product (Folders + Speak + Phone MCP)
+# Grok Desk — session truth (Desk mirrors the terminal exactly)
 
-Order: **Build P1–P4 → UI match → Hunt → Clean run**.
+Order: **Build P0–P7 → UI match → Hunt → Clean run**.
 
-Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the spec it does not exist.
+Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the spec it does
+not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-product-v0.2.0.md`.
 
 ## Build
 
-- [x] **P1 Speak vendor** — engine in-repo, Settings TUI install
-  - Copy grok-speak into `tools/speak/` (bin, commands, skills, hooks, install.sh, speak.toml.example)
-  - `daemon/speak.js` `speakBin()` prefers repo `tools/speak/bin/grok-speak`
-  - Settings Speak: ready status + “Install TUI /speak” (runs tools/speak/scripts/install.sh)
-  - Proof: `npm run test:speak` · `speakBin()` does not need `~/Documents/grok-speak`
+- [ ] **P0 Stop the bleeding** — four surgical client fixes, no architecture change
+  - `web/src/App.tsx:1870` — take `mergeArtifacts` out of the connect-effect deps so
+    toggling Artifacts / clicking a tool row mid-turn no longer tears down the WebSocket
+  - `web/src/App.tsx:914-919` — restore `LAST_SESSION_KEY` on `hello` even when a turn is
+    active (today reopening the PWA during any live turn lands you on the bridge session)
+  - `web/src/App.tsx:2813-2819` — drop the `|| Boolean(liveSid)` tautology in `openSession`
+    that forces `viewOnly` and permanently skips `resetTurnUi()`
+  - `web/src/App.tsx:1474-1478` — remove the `?? draft` fallback in `onUpdate` that lets a
+    foreign session's chunks mutate the viewed session's draft in place
+  - Proof: click a tool mid-turn → socket stays up, stream continues. Reopen the PWA during
+    a live turn → back on the chat you were reading.
 
-- [x] **P2 Folders into Desk** — native extra + Settings
-  - Copy grok-folders into `native/folders/` (Sources, Resources, scripts)
-  - `daemon/folders.js` + `/api/folders` GET/POST (enabled, hover, defaultOpen, lastPath, install/uninstall)
-  - `web/src/components/settings/FoldersSettings.tsx` — Settings section after Speak
-  - Reuse `~/Library/Application Support/GrokFolders/state.json` and launchd `dev.freecoffee.GrokFolders`
-  - Proof: enable via API → comet in menu bar; disable → gone; existing state preserved
+- [ ] **P1 Feed projector** — `daemon/session-feed.js`
+  - Cursor `{updatesBytes, eventsBytes, seq}`; `seq` from `_meta.eventId` suffix
+  - Incremental tail from byte offset; hold a trailing partial line (torn CLI appends)
+  - Normalize `updates.jsonl` + `events.jsonl` → one ordered `FeedEvent[]`
+  - Derived, no timers: `live`, `phase`, `owner` (`~/.grok/active_sessions.json` + pid probe),
+    `context` (`signals.json`), `subagents`
+  - `GET /api/sessions/:id/feed?from=` · `scripts/feed-unit.mjs`
+  - Proof: `npm run test:feed`; feed of a real 4 MB `updates.jsonl` equals a full parse and
+    resumes from an arbitrary seq
 
-- [x] **P3 Phone connector into Desk** — MCP + Settings
-  - Copy grok-phone-mcp into `tools/phone-mcp/` (server.mjs, package.json, start/install scripts)
-  - `daemon/phone-mcp.js` + `/api/phone-mcp` GET/POST (enabled, health, publicUrl, token masked, rotate)
-  - `web/src/components/settings/PhoneConnectorSettings.tsx` — Settings section
-  - Keep port 3311, token file, tools list, cwd allowlist. Do not move MCP onto :8787
-  - Public URL is a setting (default John’s tunnel if present)
-  - Proof: enable → `/health` 200; disable → stopped; rotate token writes new file
+- [ ] **P2 Per-session live tail + protocol**
+  - Per-session watchers + one cheap root watcher; retire the recursive tree watch
+  - WS `subscribe` / `unsubscribe` / `feed`
+  - Stamp `sessionId` on every daemon→client frame; scope `stop`, `queue_update`, `error`
+    and the `*_resolved` frames
+  - Proof: CLI-side turn visible in the feed < 1 s; no frame without `sessionId`; `stop`
+    from the phone leaves the Mac's other turn running
 
-- [x] **P4 One-product wrap**
-  - README + package.json description = one product
-  - moduleHelp Settings copy includes Folders + Phone connector
-  - `make-app` / `always-on` install Speak bin + Folders extra when enabled in settings
-  - Version `0.2.0`
-  - Stub old Documents repos (README only, point here)
-  - Proof: README lists Speak / Folders / Phone connector; old repos have no source left
+- [ ] **P3 Client projection** — `web/src/lib/sessionFeed.ts`
+  - App renders from the feed; cursor in `localStorage`; resubscribe on visibility + reconnect
+  - Delete the dead `lib/sessionStore.ts` layer and the four divergent finalize paths
+  - Rewrite `scripts/session-store-unit.mjs` against the code that ships
+  - Proof: `npm run smoke:switch` · `npm run smoke:reload`; sending "ok" twice keeps both
+
+- [ ] **P4 Ownership + no clobber**
+  - Read `active_sessions.json`; refuse `session/load` while a live pid owns the session
+  - "Running in Terminal" state, read-only composer, auto-takeover when the pid exits
+  - Ownership guard on `deleteSession`
+  - Proof: `npm run smoke:cli`; a terminal turn during a Desk view loses nothing either side
+
+- [ ] **P5 Retire the shadow stores**
+  - Delete the 18 m wall / 6 m stall auto-abandon; stalled turn = badge + manual Stop
+  - Stop writing `desk-messages.json` (read-only legacy fallback)
+  - Fix the dead `desk-index` prune (`idx.sessions` vs `idx.sessionIds`); atomic writes
+  - Replace the 4000 / 8000 / 200-row truncation with a tail window + "load earlier"
+  - Proof: a > 18 min turn completes untouched; full history reachable
+
+- [ ] **P6 Terminal fidelity**
+  - Subagent strip at the top of the chat: type, description, status, duration, tools;
+    opens the child session; shows `output.json`
+  - Real tool status from `events.jsonl`; context meter from `signals.json`
+  - Background task output from `background_tasks_manifest.json` + `terminal/*.log`
+  - Surface `session_kind: headless`; real toggle for `showSubagentSessions`
+  - Proof: side by side with a live terminal session — same content, order, subagents
+
+- [ ] **P7 Scale + PWA**
+  - Kill the O(n²) `pruneSubagentsFromDeskIndex` / `isSubagentSession` per poll
+  - Real `manifest.json`; Tailscale HTTPS so the service worker + Web Push register on phone
+  - Reconnect / resubscribe on iOS PWA resume
+  - Proof: CPU under load; PWA installs and push arrives on the phone
 
 ## UI match
 
-- [x] Settings Speak / Folders / Phone connector match existing `settings-section` chrome
-- [x] Desktop ~1280 + tablet ~768/1024 + phone ~390. Tap ≥ 40px. No purple.
+- [ ] Existing Desk chrome; no new layout language; no purple
+- [ ] Desktop ~1280 · tablet ~768 portrait + ~1024 landscape · phone ~390. Tap ≥ 40px
 
 ## Hunt
 
-- [x] Console / network / frontend / backend / broken-path
-- [x] Speak synthesize still works without sibling repo
-- [x] Folders enable/disable
-- [x] Phone MCP health + token mask
+- [ ] Console · Network · Frontend (all viewports) · Backend · Broken-path
+- [ ] **Two-client** — Mac + phone on the same chat at once
+- [ ] **CLI-concurrency** — terminal `grok` and Desk on the same session
 
 ## Clean run
 
-- [x] One hunt with zero findings
-- [x] Ship `main`, rebuild UI, kick launchd
+- [ ] One full hunt with zero findings
+- [ ] Ship `main`, rebuild UI, kick launchd
