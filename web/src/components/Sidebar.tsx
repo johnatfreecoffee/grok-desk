@@ -852,6 +852,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
           </p>
         </div>
 
+        {/* DESK-MERGE: FoldersSettings then PhoneConnectorSettings go here */}
+
         <div className="settings-section">
           <div className="settings-section-title">Phone push</div>
           {!pushSupported() ? (

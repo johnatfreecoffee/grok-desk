@@ -1,33 +1,53 @@
-# Grok Desk — Speak + session identity
+# Grok Desk — one product (Folders + Speak + Phone MCP)
 
-Order: **Build P1–P2 → UI match → Hunt → Clean run**.
+Order: **Build P1–P4 → UI match → Hunt → Clean run**.
 
-Machine: this Mac (Desk is local Electron/PWA).
+Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the spec it does not exist.
 
 ## Build
 
-- [x] **P1 Session identity** — CLI chat stays the same chat
-  - Prompt with a real sessionId never `session/new`
-  - Load even when the ACP worker has no bound id
-  - Longer resume timeout; client does not fork on `history_only`
-- [x] **P2 Speak** — subscription TTS on each reply
-  - Daemon `/api/speak*` via `grok-speak --synthesize`
-  - Per-reply Concise / Casual / Full + mini player
-  - Settings voice → `speak.toml`
+- [ ] **P1 Speak vendor** — engine in-repo, Settings TUI install
+  - Copy grok-speak into `tools/speak/` (bin, commands, skills, hooks, install.sh, speak.toml.example)
+  - `daemon/speak.js` `speakBin()` prefers repo `tools/speak/bin/grok-speak`
+  - Settings Speak: ready status + “Install TUI /speak” (runs tools/speak/scripts/install.sh)
+  - Proof: `npm run test:speak` · `speakBin()` does not need `~/Documents/grok-speak`
+
+- [ ] **P2 Folders into Desk** — native extra + Settings
+  - Copy grok-folders into `native/folders/` (Sources, Resources, scripts)
+  - `daemon/folders.js` + `/api/folders` GET/POST (enabled, hover, defaultOpen, lastPath, install/uninstall)
+  - `web/src/components/settings/FoldersSettings.tsx` — Settings section after Speak
+  - Reuse `~/Library/Application Support/GrokFolders/state.json` and launchd `dev.freecoffee.GrokFolders`
+  - Proof: enable via API → comet in menu bar; disable → gone; existing state preserved
+
+- [ ] **P3 Phone connector into Desk** — MCP + Settings
+  - Copy grok-phone-mcp into `tools/phone-mcp/` (server.mjs, package.json, start/install scripts)
+  - `daemon/phone-mcp.js` + `/api/phone-mcp` GET/POST (enabled, health, publicUrl, token masked, rotate)
+  - `web/src/components/settings/PhoneConnectorSettings.tsx` — Settings section
+  - Keep port 3311, token file, tools list, cwd allowlist. Do not move MCP onto :8787
+  - Public URL is a setting (default John’s tunnel if present)
+  - Proof: enable → `/health` 200; disable → stopped; rotate token writes new file
+
+- [ ] **P4 One-product wrap**
+  - README + package.json description = one product
+  - moduleHelp Settings copy includes Folders + Phone connector
+  - `make-app` / `always-on` install Speak bin + Folders extra when enabled in settings
+  - Version `0.2.0`
+  - Stub old Documents repos (README only, point here)
+  - Proof: README lists Speak / Folders / Phone connector; old repos have no source left
 
 ## UI match
 
-- [x] Speak chips match existing `mode-chip` / `copy-reply-btn` chrome
-- [x] Settings Voice section: TTS first, API key optional underneath
-- [x] Desktop + ~390 mobile. No purple.
+- [ ] Settings Speak / Folders / Phone connector match existing `settings-section` chrome
+- [ ] Desktop ~1280 + tablet ~768/1024 + phone ~390. Tap ≥ 40px. No purple.
 
 ## Hunt
 
-- [x] Console / network / frontend / backend / broken-path
-- [x] Resume smoke: unbind → prompt same id → no new session
-- [x] Speak settings GET without API key
+- [ ] Console / network / frontend / backend / broken-path
+- [ ] Speak synthesize still works without sibling repo
+- [ ] Folders enable/disable
+- [ ] Phone MCP health + token mask
 
 ## Clean run
 
-- [x] One hunt with zero findings
-- [x] Ship `main`, rebuild UI, kick launchd
+- [ ] One hunt with zero findings
+- [ ] Ship `main`, rebuild UI, kick launchd
