@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""Speak the last Grok TUI reply with official xAI TTS (subscription OAuth)."""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+GROK_HOME = Path(os.environ.get("GROK_HOME", Path.home() / ".grok"))
+AUTH = GROK_HOME / "auth.json"
+LAST_REPLY = GROK_HOME / "last-reply.txt"
+LAST_COPY = Path(os.environ.get("GROK_COPY_FILE", GROK_HOME / "last-copy.txt"))
+SETTINGS_PATH = GROK_HOME / "speak.toml"
+PID_FILE = GROK_HOME / "speak.pid"
+FETCH_PID = GROK_HOME / "speak-fetch.pid"
+MP3_FILE = GROK_HOME / "speak-last.mp3"
+SESSIONS = GROK_HOME / "sessions"
+TTS_URL = "https://api.x.ai/v1/tts"
+CHAT_URL = "https://api.x.ai/v1/chat/completions"
+MAX_CHARS = 15000
+MODES = ("verbatim", "concise", "casual", "full")
+DEFAULTS = {"mode": "concise", "voice": "rex"}
+SUMMARY_MODELS = (
+    os.environ.get("GROK_SPEAK_SUMMARY_MODEL") or "grok-4-fast",
+    "grok-4.6",
+)
+
+REWRITE = {
+    "concise": (
+        "Rewrite this Grok assistant reply as a short spoken brief. "
+        "2 to 6 sentences. Plain English. No markdown, no code, no file paths "
+        "unless someone must hear them. Just what was done, decided, or answered."
+    ),
+    "casual": (
+        "Rewrite this Grok assistant reply as something you'd say out loud to a "
+        "friend. Casual, contractions, still accurate. No markdown or code. "
+        "A spoken recap, not a transcript."
+    ),
+    "full": (
+        "Rewrite this entire Grok assistant reply as a spoken explanation in "
+        "plain English. Keep every decision and result. No markdown, no lists of "
+        "ticks, no code fences, no reading file paths unless required. "
+        "Talk it through like you're walking someone through it."
+    ),
+}
+
+
+def notify(msg: str) -> None:
+    if sys.stderr.isatty() or sys.stdout.isatty():
+        print(msg, file=sys.stderr)
+        return
+    subprocess.run(
+        ["osascript", "-e", f'display notification {json.dumps(msg)} with title "Grok Speak"'],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def die(msg: str, code: int = 1) -> None:
+    notify(msg)
+    raise SystemExit(code)
+
+
+def take_opt(args: list[str], flag: str) -> str | None:
+    if flag not in args:
+        return None
+    i = args.index(flag)
+    if i + 1 >= len(args):
+        die(f"{flag} needs a value")
+    return args[i + 1]
+
+
+def _time_pair(value) -> tuple[float, float]:
+    if isinstance(value, dict):
+        start = value.get("start", value.get("begin", 0))
+        end = value.get("end", start)
+        return float(start or 0), float(end or start or 0)
+    if isinstance(value, (list, tuple)) and value:
+        start = float(value[0] or 0)
+        end = float(value[1] if len(value) > 1 else start)
+        return start, end
+    if isinstance(value, (int, float)):
+        return float(value), float(value)
+    return 0.0, 0.0
+
+
+def estimate_words(text: str, duration: float | None) -> list[dict]:
+    matches = list(re.finditer(r"\S+", text))
+    if not matches:
+        return []
+    dur = float(duration or 0)
+    if dur <= 0:
+        dur = max(len(matches) * 0.35, 1.0)
+    slice_t = dur / len(matches)
+    words = []
+    t = 0.0
+    for match in matches:
+        words.append(
+            {
+                "text": match.group(),
+                "start": round(t, 4),
+                "end": round(t + slice_t, 4),
+                "from": match.start(),
+                "to": match.end(),
+            }
+        )
+        t += slice_t
+    return words
+
+
+def words_from_chars(chars: list[str], times: list, fallback: str) -> tuple[str, list[dict]]:
+    if not chars:
+        spoken = fallback
+        return spoken, estimate_words(spoken, None)
+    spoken = "".join(chars)
+    n = min(len(chars), len(times)) if times else 0
+    if n == 0:
+        return spoken, estimate_words(spoken, None)
+    words: list[dict] = []
+    i = 0
+    while i < n:
+        if chars[i].isspace():
+            i += 1
+            continue
+        start_i = i
+        start_t, _ = _time_pair(times[i])
+        i += 1
+        while i < n and not chars[i].isspace():
+            i += 1
+        _, end_t = _time_pair(times[i - 1])
+        if end_t < start_t:
+            end_t = start_t
+        words.append(
+            {
+                "text": "".join(chars[start_i:i]),
+                "start": round(float(start_t), 4),
+                "end": round(float(end_t), 4),
+                "from": start_i,
+                "to": i,
+            }
+        )
+    return spoken, words
+
+
+def write_timestamp_sidecar(
+    response_bytes: bytes,
+    dest: Path,
+    timestamps_out: Path,
+    spoken_out: Path | None,
+    fallback: str,
+) -> str:
+    try:
+        obj = json.loads(response_bytes)
+    except json.JSONDecodeError:
+        die(f"TTS timestamps: not JSON ({response_bytes[:200]!r})")
+        return fallback
+    if not isinstance(obj, dict):
+        die("TTS timestamps: unexpected JSON")
+        return fallback
+    audio_b64 = obj.get("audio")
+    if not audio_b64 or not isinstance(audio_b64, str):
+        err = json.dumps(obj)[:400]
+        die(f"TTS timestamps missing audio: {err}")
+        return fallback
+    dest.write_bytes(base64.b64decode(audio_b64))
+    ts = obj.get("audio_timestamps") or {}
+    chars = ts.get("graph_chars") or []
+    if isinstance(chars, str):
+        chars = list(chars)
+    elif isinstance(chars, list):
+        chars = [str(c) for c in chars]
+    else:
+        chars = []
+    times = ts.get("graph_times") or []
+    if not isinstance(times, list):
+        times = []
+    spoken, words = words_from_chars(chars, times, fallback)
+    duration = obj.get("duration")
+    if not words:
+        words = estimate_words(spoken, float(duration) if duration else None)
+    if spoken_out is not None:
+        spoken_out.parent.mkdir(parents=True, exist_ok=True)
+        spoken_out.write_text(spoken)
+    timestamps_out.parent.mkdir(parents=True, exist_ok=True)
+    timestamps_out.write_text(
+        json.dumps({"text": spoken, "duration": duration, "words": words}, ensure_ascii=False)
+    )
+    return spoken
+
+
+def load_settings() -> dict[str, str]:
+    out = dict(DEFAULTS)
+    if SETTINGS_PATH.exists():
+        try:
+            import tomllib
+
+            data = tomllib.loads(SETTINGS_PATH.read_text())
+            for key in DEFAULTS:
+                if key in data and data[key]:
+                    out[key] = str(data[key]).strip().lower() if key == "mode" else str(data[key]).strip()
+        except Exception:
+            pass
+    if out["mode"] not in MODES:
+        out["mode"] = DEFAULTS["mode"]
+    out["voice"] = os.environ.get("GROK_SPEAK_VOICE", out["voice"])
+    return out
+
+
+def save_settings(settings: dict[str, str]) -> None:
+    SETTINGS_PATH.write_text(
+        f'mode = "{settings["mode"]}"\nvoice = "{settings["voice"]}"\n'
+    )
+
+
+def load_token() -> str:
+    if not AUTH.exists():
+        die("No ~/.grok/auth.json — run grok login.")
+    data = json.loads(AUTH.read_text())
+    if not isinstance(data, dict) or not data:
+        die("auth.json is empty.")
+    best = None
+    for entry in data.values():
+        if not isinstance(entry, dict) or not entry.get("key"):
+            continue
+        if best is None or str(entry.get("expires_at") or "") > str(best.get("expires_at") or ""):
+            best = entry
+    if not best:
+        die("No OAuth token in auth.json.")
+    return best["key"]
+
+
+def speakable(text: str) -> str:
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
+    text = re.sub(r"(\*|_)(.+?)\1", r"\2", text)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.M)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def newest_session_dir() -> Path | None:
+    if not SESSIONS.exists():
+        return None
+    best = None
+    best_mtime = 0.0
+    for updates in SESSIONS.glob("*/*/updates.jsonl"):
+        m = updates.stat().st_mtime
+        if m >= best_mtime:
+            best_mtime = m
+            best = updates.parent
+    return best
+
+
+def last_reply_from_updates(session_dir: Path) -> str:
+    path = session_dir / "updates.jsonl"
+    if not path.exists():
+        return ""
+    agent: list[str] = []
+    last_complete: list[str] = []
+    skip = False
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        update = (obj.get("params") or {}).get("update") or {}
+        kind = update.get("sessionUpdate")
+        content = update.get("content") or {}
+        text = content.get("text") if isinstance(content, dict) else ""
+        if not isinstance(text, str):
+            text = ""
+        if kind == "user_message_chunk":
+            if agent and not skip:
+                last_complete = agent
+            agent = []
+            stripped = text.strip()
+            skip = stripped.startswith("/speak") or stripped.split()[:1] == ["speak"]
+        elif kind == "agent_message_chunk":
+            if text:
+                agent.append(text)
+        elif kind == "turn_completed":
+            if agent and not skip:
+                last_complete = agent
+            agent = []
+            skip = False
+    if agent and not skip:
+        return "".join(agent)
+    return "".join(last_complete)
+
+
+def resolve_text(args: list[str]) -> str:
+    if "--stdin" in args:
+        return sys.stdin.read()
+    if "--file" in args:
+        i = args.index("--file")
+        if i + 1 >= len(args):
+            die("--file needs a path")
+        return Path(args[i + 1]).read_text()
+    if LAST_REPLY.exists() and LAST_REPLY.stat().st_size:
+        return LAST_REPLY.read_text()
+    session_dir = newest_session_dir()
+    if session_dir:
+        from_session = last_reply_from_updates(session_dir)
+        if from_session.strip():
+            return from_session
+    if LAST_COPY.exists() and LAST_COPY.stat().st_size:
+        return LAST_COPY.read_text()
+    die("No last reply cached. Finish a turn, then try again.")
+    return ""
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _pids_from_file(path: Path) -> list[int]:
+    if not path.exists():
+        return []
+    try:
+        pid = int(path.read_text().strip())
+    except ValueError:
+        path.unlink(missing_ok=True)
+        return []
+    return [pid]
+
+
+def afplay_pids() -> list[int]:
+    try:
+        out = subprocess.check_output(["pgrep", "-lf", "afplay"], text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return []
+    pids = []
+    for line in out.splitlines():
+        if "speak-last.mp3" not in line:
+            continue
+        try:
+            pids.append(int(line.split()[0]))
+        except ValueError:
+            continue
+    return pids
+
+
+def is_playing() -> bool:
+    return bool(afplay_pids() or _pids_from_file(FETCH_PID) or _pids_from_file(PID_FILE))
+
+
+def stop_playback() -> bool:
+    stopped = False
+    for pid in _pids_from_file(PID_FILE) + _pids_from_file(FETCH_PID) + afplay_pids():
+        _kill_pid(pid)
+        stopped = True
+    subprocess.run(
+        ["pkill", "-f", f"afplay {MP3_FILE}"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    PID_FILE.unlink(missing_ok=True)
+    FETCH_PID.unlink(missing_ok=True)
+    return stopped
+
+
+def cache_from_hook() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        raise SystemExit(0)
+    if payload.get("subagentType"):
+        raise SystemExit(0)
+    if payload.get("reason") not in (None, "end_turn"):
+        raise SystemExit(0)
+    text = payload.get("lastAssistantMessage") or ""
+    if not isinstance(text, str) or not text.strip():
+        raise SystemExit(0)
+    stripped = text.strip()
+    if stripped.startswith("/speak"):
+        raise SystemExit(0)
+    if re.match(r"(?i)^(speaking|stopped|ok|done)\b", stripped) and len(stripped) < 80:
+        raise SystemExit(0)
+    LAST_REPLY.write_text(text)
+    raise SystemExit(0)
+
+
+def curl_json(url: str, token: str, payload: dict, dest: Path | None = None) -> tuple[int, str, bytes]:
+    body = json.dumps(payload).encode()
+    with tempfile.NamedTemporaryFile(prefix="grok-speak-", suffix=".json", delete=False) as req:
+        req.write(body)
+        req_path = req.name
+    out_path = dest if dest is not None else Path(
+        tempfile.NamedTemporaryFile(prefix="grok-speak-out-", delete=False).name
+    )
+    cmd = [
+        "curl",
+        "-sS",
+        "-o",
+        str(out_path),
+        "-w",
+        "%{http_code} %{content_type}",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        f"Authorization: Bearer {token}",
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        f"@{req_path}",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        FETCH_PID.write_text(str(proc.pid))
+        stdout, stderr = proc.communicate()
+    finally:
+        Path(req_path).unlink(missing_ok=True)
+        FETCH_PID.unlink(missing_ok=True)
+    if proc.returncode and proc.returncode < 0:
+        raise SystemExit(0)
+    meta = (stdout or "").strip().split()
+    status = int(meta[0]) if meta and meta[0].isdigit() else 0
+    ctype = meta[1] if len(meta) > 1 else ""
+    data = out_path.read_bytes() if out_path.exists() else b""
+    if dest is None:
+        out_path.unlink(missing_ok=True)
+    if proc.returncode not in (0, None) and status == 0:
+        raise RuntimeError(stderr.strip() or stdout.strip() or "curl failed")
+    return status, ctype, data
+
+
+def rewrite_for_speech(text: str, mode: str, token: str) -> str:
+    prompt = REWRITE[mode]
+    last_err = ""
+    for model in SUMMARY_MODELS:
+        if not model:
+            continue
+        status, _ctype, data = curl_json(
+            CHAT_URL,
+            token,
+            {
+                "model": model,
+                "temperature": 0.4,
+                "messages": [
+                    {"role": "system", "content": prompt + " Reply with only the spoken words."},
+                    {"role": "user", "content": text[:20000]},
+                ],
+            },
+        )
+        if status == 401:
+            die("Login expired. Send any TUI message so Grok refreshes, then /speak again.")
+        if status != 200:
+            last_err = data.decode("utf-8", "replace")[:300]
+            continue
+        try:
+            obj = json.loads(data)
+            spoken = obj["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+        if spoken:
+            return spoken
+    die(f"Could not rewrite for {mode} mode: {last_err or 'unknown error'}")
+    return text
+
+
+def tts(
+    text: str,
+    voice: str,
+    mode: str,
+    *,
+    play: bool = True,
+    dest: Path | None = None,
+    spoken_out: Path | None = None,
+    timestamps_out: Path | None = None,
+) -> Path:
+    def _handle_stop(_signum, _frame) -> None:
+        stop_playback()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    dest = dest or MP3_FILE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    token = load_token()
+    clean = speakable(text)
+    if not clean:
+        die("Last reply was mostly code. Nothing to read.")
+    if mode != "verbatim":
+        print(f"Writing a {mode} spoken recap…")
+        clean = rewrite_for_speech(clean, mode, token)
+        clean = speakable(clean)
+    if len(clean) > MAX_CHARS:
+        clean = clean[: MAX_CHARS - 1].rsplit(" ", 1)[0] + "…"
+    if spoken_out is not None:
+        spoken_out.parent.mkdir(parents=True, exist_ok=True)
+        spoken_out.write_text(clean)
+    payload = {
+        "text": clean,
+        "voice_id": voice,
+        "language": "en",
+        "text_normalization": True,
+    }
+    if timestamps_out is not None:
+        payload["with_timestamps"] = True
+        print("Fetching Grok voice with word timings…")
+    status, ctype, data = curl_json(
+        TTS_URL,
+        token,
+        payload,
+        dest=dest,
+    )
+    if status == 401:
+        die("Login expired. Send any TUI message so Grok refreshes, then /speak again.")
+    if timestamps_out is not None:
+        if status != 200:
+            err = dest.read_text(errors="replace")[:400] if dest.exists() else ""
+            die(f"TTS {status}: {err or 'unexpected response'}")
+        write_timestamp_sidecar(data if data else dest.read_bytes(), dest, timestamps_out, spoken_out, clean)
+    elif status != 200 or not ctype.startswith("audio/"):
+        err = dest.read_text(errors="replace")[:400] if dest.exists() else ""
+        die(f"TTS {status}: {err or 'unexpected response'}")
+    if not play:
+        print(f"Wrote {dest} ({mode}, {voice}, {len(clean)} chars)")
+        return dest
+    stop_playback()
+    print(f"Speaking ({mode}, {voice})…  /speak or /speak stop to cut off")
+    proc = subprocess.Popen(
+        ["afplay", str(dest)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    PID_FILE.write_text(str(proc.pid))
+    rc = proc.wait()
+    PID_FILE.unlink(missing_ok=True)
+    if rc not in (0, -signal.SIGTERM, -signal.SIGKILL):
+        raise SystemExit(rc or 0)
+    return dest
+
+
+def print_settings(settings: dict[str, str]) -> None:
+    print(f"mode  {settings['mode']}   (verbatim | concise | casual | full)")
+    print(f"voice {settings['voice']}")
+    print(f"file  {SETTINGS_PATH}")
+    print("verbatim = read the reply. Other modes = plain-English spoken recap.")
+
+
+def parse_mode(args: list[str], settings: dict[str, str]) -> tuple[str, bool]:
+    save = "--save" in args
+    mode = settings["mode"]
+    if "--mode" in args:
+        i = args.index("--mode")
+        if i + 1 >= len(args):
+            die("--mode needs verbatim|concise|casual|full")
+        mode = args[i + 1].lower()
+        save = True
+    else:
+        for a in args:
+            if a.lower() in MODES:
+                mode = a.lower()
+                break
+    if mode not in MODES:
+        die(f"Unknown mode {mode}. Use: {' | '.join(MODES)}")
+    return mode, save
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:] if a]
+    if args and args[0] in ("-h", "--help"):
+        print(
+            "Usage: grok-speak [stop|settings|verbatim|concise|casual|full]\n"
+            "       grok-speak [--stop] [--settings] [--mode MODE] [--save]\n"
+            "                  [--voice NAME] [--stdin] [--file PATH]\n"
+            "                  [--synthesize] [--out MP3] [--spoken-out TXT]\n"
+            "                  [--timestamps-out JSON]\n"
+            "Default: speak last Grok TUI reply with official xAI TTS.\n"
+            "--synthesize writes the MP3 and exits (desktop player uses this)."
+        )
+        return
+    if "--cache" in args:
+        cache_from_hook()
+        return
+    if "--stop" in args or args[:1] == ["stop"]:
+        print("Stopped." if stop_playback() else "Nothing playing.")
+        return
+    settings = load_settings()
+    if "--settings" in args or args[:1] == ["settings"]:
+        print_settings(settings)
+        return
+    if args[:1] == ["mode"] and len(args) >= 2:
+        mode = args[1].lower()
+        if mode not in MODES:
+            die(f"Unknown mode {mode}. Use: {' | '.join(MODES)}")
+        settings["mode"] = mode
+        save_settings(settings)
+        print(f"Saved mode = {mode}")
+        return
+    positional_modes = [a.lower() for a in args if a.lower() in MODES]
+    synthesize = "--synthesize" in args or "--no-play" in args
+    out_path = take_opt(args, "--out")
+    spoken_path = take_opt(args, "--spoken-out")
+    timestamps_path = take_opt(args, "--timestamps-out")
+    explicit = bool(
+        positional_modes
+        or "--mode" in args
+        or "--stdin" in args
+        or "--file" in args
+        or synthesize
+        or out_path
+    )
+    if is_playing() and not explicit:
+        print("Stopped." if stop_playback() else "Nothing playing.")
+        return
+    if is_playing():
+        stop_playback()
+    mode, save = parse_mode(args, settings)
+    voice = take_opt(args, "--voice")
+    if voice:
+        settings["voice"] = voice
+    if save:
+        settings["mode"] = mode
+        save_settings(settings)
+    tts(
+        resolve_text(args),
+        settings["voice"],
+        mode,
+        play=not synthesize,
+        dest=Path(out_path).expanduser() if out_path else None,
+        spoken_out=Path(spoken_path).expanduser() if spoken_path else None,
+        timestamps_out=Path(timestamps_path).expanduser() if timestamps_path else None,
+    )
+
+
+if __name__ == "__main__":
+    main()
