@@ -78,8 +78,9 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 - [ ] **P7 Scale + PWA**
   - Kill the O(n²) `pruneSubagentsFromDeskIndex` / `isSubagentSession` per poll
-  - Tailscale HTTPS so the service worker + Web Push actually register on the phone
-    (`http://...ts.net` is not a secure context; the vite-plugin-pwa manifest is already fine)
+  - Everything on the phone must work over plain HTTP: reconnect, resubscribe, cursor
+    resume, add-to-home-screen. That is the phase's real deliverable.
+  - **Web Push is human-gated (see below).** Do not work around it.
   - Reconnect / resubscribe on iOS PWA resume
   - Proof: CPU under load; PWA installs and push arrives on the phone
 
@@ -98,3 +99,21 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 - [ ] One full hunt with zero findings
 - [ ] Ship `main`, rebuild UI, kick launchd
+
+## Human gate — Tailscale HTTPS (Web Push only)
+
+`tailscale cert` returns *"your Tailscale account does not support getting TLS certs"* and
+`CertDomains` is empty, so the tailnet has HTTPS certificates switched off. Desk is therefore
+served as `http://johns-macbook-pro.tail106bb5.ts.net`, which is **not a secure context** — so
+the service worker never registers and Web Push cannot work on the phone.
+
+Enabling it is one toggle in the Tailscale admin console (DNS → HTTPS Certificates). It needs
+John's Tailscale login: there is no API key or OAuth client on this machine, and minting one
+also requires that console. Routing Desk through the existing Cloudflare tunnel *would* give a
+real cert, but the spec says local only, no Cloudflare — so that is not an option.
+
+**Nothing else is blocked.** The PWA, the WebSocket, cursor resume and add-to-home-screen all
+work over HTTP. Only Web Push waits on this.
+
+After John enables it: `tailscale serve --bg --https=443 http://127.0.0.1:8787`, then confirm
+the service worker registers and a push arrives.
