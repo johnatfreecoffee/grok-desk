@@ -473,6 +473,12 @@ function DeskApp() {
     }
   }, [agent?.sessionId, agent?.cwd]);
 
+  // Read inside the connect effect, which is created once per mount.
+  const artifactsPinnedRef = useRef(false);
+  useEffect(() => {
+    artifactsPinnedRef.current = artifactsPinned;
+  }, [artifactsPinned]);
+
   const mergeArtifacts = useCallback((fromDraft: Artifact[]) => {
     if (!fromDraft.length) return;
     setSessionArtifacts((prev) => {
@@ -489,6 +495,14 @@ function DeskApp() {
       setArtifactsOpen(true);
     }
   }, [artifactsPinned]);
+
+  // mergeArtifacts changes identity on every artifactsPinned flip. The socket
+  // handlers go through this ref so toggling Artifacts never re-runs the connect
+  // effect (that tore down the WebSocket and dropped every event in the gap).
+  const mergeArtifactsRef = useRef(mergeArtifacts);
+  useEffect(() => {
+    mergeArtifactsRef.current = mergeArtifacts;
+  }, [mergeArtifacts]);
 
   const stashSession = useCallback(() => {
     const id = agentRef.current?.sessionId;
@@ -910,13 +924,13 @@ function DeskApp() {
           return next;
         });
         applyTurnTruth(hello as TurnSnapshot, "hello");
-        // PWA cold start only — never load_session mid-turn (that abandons ACP work)
+        // PWA cold start only (restoredSessionRef is the one-shot guard). turnActive is
+        // daemon-global, so it must NOT skip the restore — that lands the user on the bridge
+        // session instead of the chat they were reading. Safe mid-turn: when the restored id
+        // is the live one the daemon attaches (sameLive) and when another session owns the
+        // turn it falls back to view-only. It only abandons when nothing is busy.
         if (!restoredSessionRef.current) {
           restoredSessionRef.current = true;
-          if (hello.turnActive) {
-            // Mid-turn reconnect: keep current session, do not load_session
-            return;
-          }
           const last = loadLastSession();
           const curId = info.agent?.sessionId;
           const liveSid = turnSessionRef.current;
@@ -1076,7 +1090,7 @@ function DeskApp() {
           setHistoryOnly(false);
           setSessionArtifacts([]);
           setArtifactFocus(null);
-          if (!artifactsPinned) setArtifactsOpen(false);
+          if (!artifactsPinnedRef.current) setArtifactsOpen(false);
           setSidebarTick((n) => n + 1);
           if (focusComposerRef.current) {
             focusComposerRef.current = false;
@@ -1141,7 +1155,7 @@ function DeskApp() {
         setHistoryOnly(false);
         setSessionArtifacts([]);
         setArtifactFocus(null);
-        if (!artifactsPinned) setArtifactsOpen(false);
+        if (!artifactsPinnedRef.current) setArtifactsOpen(false);
         setSidebarTick((n) => n + 1);
         if (focusComposerRef.current) {
           focusComposerRef.current = false;
@@ -1315,7 +1329,7 @@ function DeskApp() {
         setLoadingSession(false);
         setSessionArtifacts([]);
         setArtifactFocus(null);
-        if (!artifactsPinned) setArtifactsOpen(false);
+        if (!artifactsPinnedRef.current) setArtifactsOpen(false);
         if (info.loadError && !String(info.sessionId || "").startsWith("mail:")) {
           setError(`Opened this chat. Send stays here — attaching agent (${info.loadError})`);
         }
@@ -1470,11 +1484,14 @@ function DeskApp() {
         if (!updateSid) return;
         const viewing = shouldPaint(agentRef.current?.sessionId, updateSid);
         let draft = draftRef.current;
-        // If this update belongs to a different turn owner than current draft, use cache
+        // Off-view / foreign updates key strictly off liveDraftBySessionRef. Never fall
+        // back to draftRef (the VIEWED session's draft) — applyTurnUpdate mutates in place,
+        // so that leaked another session's text into the chat on screen. When there is no
+        // draft for updateSid the guard below gets-or-creates one under that id.
         if (updateSid && turnSessionRef.current && updateSid !== turnSessionRef.current) {
-          draft = liveDraftBySessionRef.current.get(updateSid) || draft;
+          draft = liveDraftBySessionRef.current.get(updateSid) || null;
         } else if (updateSid && !viewing) {
-          draft = liveDraftBySessionRef.current.get(updateSid) || draft;
+          draft = liveDraftBySessionRef.current.get(updateSid) || null;
         }
         // Reconnect mid-stream: only recreate draft if we already know a live turn owner
         // (never invent Working… from a lone late update after finalize)
@@ -1539,7 +1556,7 @@ function DeskApp() {
           else if (snap.phase === "writing") setSessionListStatus(turnSid, "working");
         }
         if (viewing) setLiveDraft(snap);
-        if (viewing) mergeArtifacts(artifactsFromDraft(snap));
+        if (viewing) mergeArtifactsRef.current(artifactsFromDraft(snap));
         // Match by draft id OR any streaming assistant (id can lag after reconnect)
         const patch = (m: ChatMessage): ChatMessage => {
           const isTarget =
@@ -1771,7 +1788,7 @@ function DeskApp() {
           if (m.streaming) return { ...m, streaming: false, phase: "idle" };
           return m;
         };
-        if (draft) mergeArtifacts(artifactsFromDraft(draft));
+        if (draft) mergeArtifactsRef.current(artifactsFromDraft(draft));
         const stillViewing = shouldPaint(agentRef.current?.sessionId, turnSid);
         if (stillViewing) {
           setMessages((prev) => {
@@ -1867,7 +1884,7 @@ function DeskApp() {
       client.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- connect once per mount
-  }, [scrollToBottom, pickMessages, mergeArtifacts, focusComposer, setSessionListStatus]);
+  }, [scrollToBottom, pickMessages, focusComposer, setSessionListStatus]);
 
   // While Working…: dual-channel truth (WS status + HTTP /api/turn)
   useEffect(() => {
@@ -2813,10 +2830,7 @@ function DeskApp() {
       const liveSid = turnSessionRef.current;
       const isLive =
         Boolean(liveSid) &&
-        (busyRef.current ||
-          busy ||
-          liveDraftBySessionRef.current.has(liveSid!) ||
-          Boolean(liveSid));
+        (busyRef.current || busy || liveDraftBySessionRef.current.has(liveSid!));
       const isBackgroundLive = Boolean(liveSid && liveSid === s.id && isLive);
       if (!isBackgroundLive) setSessionListStatus(s.id, null);
       stashSession();
