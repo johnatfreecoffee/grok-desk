@@ -34,6 +34,10 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - WS `subscribe` / `unsubscribe` / `feed`
   - Stamp `sessionId` on every daemon→client frame; scope `stop`, `queue_update`, `error`
     and the `*_resolved` frames
+  - Fix `turnSnapshot()` (`daemon/index.js:933-936`): `turnActive` is
+    `globalBusy || parallelTurns.size > 0` but `activeSessionId` falls back to
+    `bridge.sessionId`, so a parallel-only turn reports a session that is not live and the
+    client marks the wrong chat "working"
   - Proof: CLI-side turn visible in the feed < 1 s; no frame without `sessionId`; `stop`
     from the phone leaves the Mac's other turn running
 
