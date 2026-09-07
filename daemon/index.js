@@ -43,7 +43,14 @@ import {
   sessionsRoot,
   pruneSubagentsFromDeskIndex,
 } from "./session-store.js";
-import { read as readSessionFeed } from "./session-feed.js";
+import {
+  read as readSessionFeed,
+  subscribe as feedSubscribe,
+  unsubscribe as feedUnsubscribe,
+  poll as feedPoll,
+  subscribedSessions,
+} from "./session-feed.js";
+import { SessionWatchers, startRootWatcher } from "./session-watch.js";
 import { hasXaiApiKey, maskXaiKey, saveSecrets } from "./secrets.js";
 import { saveUpload, isImageMime } from "./uploads.js";
 import { ensureUserDataMigrated, userDataDir } from "./user-data.js";
@@ -122,26 +129,34 @@ function syncDefaultBridge() {
 
 // Forward permission cards to all WS clients
 pool.on("permission_request", (req) => {
-  broadcastJson({ type: "permission_request", ...req });
+  broadcastJson({ type: "permission_request", ...req, sessionId: req?.sessionId ?? null });
 });
+
+/** The session a pool worker is bound to right now, or null. */
+function workerSessionId(worker) {
+  if (!worker) return null;
+  return worker.sessionId || worker.bridge?.sessionId || null;
+}
 
 // Forward interactive question / plan-approval cards (x.ai/* ext methods)
 function wireWorkerExt(worker) {
   if (!worker?.bridge || worker._extWired) return;
   worker._extWired = true;
   const b = worker.bridge;
-  b.on("question_request", (req) => {
-    broadcastJson({ type: "question_request", workerId: worker.id, ...req });
-  });
-  b.on("plan_approval_request", (req) => {
-    broadcastJson({ type: "plan_approval_request", workerId: worker.id, ...req });
-  });
-  b.on("ext_request_cancelled", (req) => {
-    broadcastJson({ type: "ext_request_cancelled", workerId: worker.id, ...req });
-  });
-  b.on("ext_request_resolved", (req) => {
-    broadcastJson({ type: "ext_request_resolved", workerId: worker.id, ...req });
-  });
+  // P2: ext_request_cancelled / ext_request_resolved carried no sessionId, so
+  // a client with two live chats could not route them. The bridge stays
+  // untouched; the sessionId is stamped here from the worker binding.
+  const stamp = (type) => (req) =>
+    broadcastJson({
+      type,
+      workerId: worker.id,
+      ...req,
+      sessionId: req?.sessionId ?? workerSessionId(worker),
+    });
+  b.on("question_request", stamp("question_request"));
+  b.on("plan_approval_request", stamp("plan_approval_request"));
+  b.on("ext_request_cancelled", stamp("ext_request_cancelled"));
+  b.on("ext_request_resolved", stamp("ext_request_resolved"));
 }
 for (const w of pool.workers.values()) wireWorkerExt(w);
 pool.on("worker_spawned", ({ workerId }) => {
@@ -165,10 +180,20 @@ function wireWorkerTerminal(worker) {
   if (!worker?.bridge || worker._termWired) return;
   worker._termWired = true;
   worker.bridge.on("terminal_output", (ev) => {
-    broadcastJson({ type: "terminal_output", workerId: worker.id, ...ev });
+    broadcastJson({
+      type: "terminal_output",
+      workerId: worker.id,
+      ...ev,
+      sessionId: ev?.sessionId ?? workerSessionId(worker),
+    });
   });
   worker.bridge.on("terminal_exit", (ev) => {
-    broadcastJson({ type: "terminal_exit", workerId: worker.id, ...ev });
+    broadcastJson({
+      type: "terminal_exit",
+      workerId: worker.id,
+      ...ev,
+      sessionId: ev?.sessionId ?? workerSessionId(worker),
+    });
   });
 }
 for (const w of pool.workers.values()) wireWorkerTerminal(w);
@@ -351,7 +376,7 @@ async function handleApi(req, res) {
           ok: false,
           error: "Turn in progress — stop it or wait before starting a new session",
           turnActive: true,
-          activeSessionId: activeTurn?.sessionId || bridge.sessionId || null,
+          activeSessionId: primaryTurnSessionId(),
         });
         return true;
       }
@@ -622,7 +647,7 @@ async function handleApi(req, res) {
           truncated: transcript.truncated || false,
           agentResumed: false,
           viewOnly: true,
-          activeSessionId: activeTurn?.sessionId || bridge.sessionId,
+          activeSessionId: primaryTurnSessionId(),
         });
         return true;
       }
@@ -780,12 +805,84 @@ function broadcastJson(obj) {
   }
 }
 
+/* ------------------------------------------------------------- feed wire */
+
+/** Hard cap on one `feed` frame — a client that has been away paginates. */
+const FEED_MAX_EVENTS = Number(process.env.DESK_FEED_MAX_EVENTS || 500);
+/** Minimum gap between two phase markers on the wire. */
+const FEED_PHASE_MIN_MS = Number(process.env.DESK_FEED_PHASE_MS || 250);
+
+/**
+ * Collapse consecutive identical `phase` events and rate-limit what is left.
+ *
+ * `phase_changed` is 88% of everything the CLI writes (163,785 of 186,302
+ * events swept; one session alone had 2,527). Left alone it drowns real
+ * content. Nothing is lost: the `feed` frame's own top-level `phase` always
+ * carries the latest value, and a superseded marker is only ever replaced by a
+ * NEWER one at the same position, so seq stays monotonic and no non-phase event
+ * is ever reordered.
+ *
+ * @param {object[]} events
+ * @param {{ lastPhase: string|null, lastPhaseAt: number, dropped: number }} st
+ */
+function coalescePhaseEvents(events, st) {
+  const out = [];
+  for (const ev of events) {
+    if (ev.kind !== "phase") {
+      out.push(ev);
+      continue;
+    }
+    if (ev.phase === st.lastPhase) {
+      st.dropped += 1; // consecutive identical phase — pure noise
+      continue;
+    }
+    st.lastPhase = ev.phase;
+    const at = Number(ev.at) || Date.now();
+    const prev = out[out.length - 1];
+    if (prev && prev.kind === "phase" && at - st.lastPhaseAt < FEED_PHASE_MIN_MS) {
+      out[out.length - 1] = ev; // supersede in place — never reorder
+      st.dropped += 1;
+      continue;
+    }
+    st.lastPhaseAt = at;
+    out.push(ev);
+  }
+  return out;
+}
+
 /** Push sidebar refresh to every open Desk client (CLI/fs changes too). */
 function broadcastProjectsTick(reason = "change") {
   broadcastJson({ type: "projects_tick", reason, at: Date.now() });
 }
 
-/** Watch ~/.grok/sessions so CLI activity shows up in Desk live. */
+/**
+ * P2: fs watchers for the sessions that at least one socket is tailing.
+ * Membership comes from session-feed's own subscriber map — nothing else
+ * decides what is watched, so a watcher dies with the last subscriber.
+ */
+const sessionWatchers = new SessionWatchers({
+  onFire: (sessionId) => feedPoll(sessionId),
+});
+
+/** Reconcile watchers after any subscribe / unsubscribe / socket close. */
+function syncSessionWatchers() {
+  try {
+    return sessionWatchers.sync(subscribedSessions());
+  } catch (e) {
+    console.warn("[watch] sync failed:", e.message);
+    return sessionWatchers.stats();
+  }
+}
+
+/**
+ * Watch ~/.grok/sessions so CLI activity shows up in Desk live.
+ *
+ * P2 retired the recursive tree watch over ~950 session dirs. This is now ONE
+ * non-recursive watcher: it notices project groups appearing / disappearing and
+ * keeps feeding the sidebar's `projects_tick`. Live conversation tail is a
+ * per-session watcher instead (see sessionWatchers above), so a busy turn no
+ * longer makes every client re-scan the whole sidebar.
+ */
 function startSessionWatcher() {
   const root = sessionsRoot();
   try {
@@ -793,26 +890,17 @@ function startSessionWatcher() {
   } catch {
     /* */
   }
-  let timer = null;
-  const fire = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => broadcastProjectsTick("fs"), 500);
-  };
-  try {
-    fs.watch(root, { recursive: true }, (_ev, filename) => {
-      // Ignore lock files noise
-      if (filename && String(filename).endsWith(".lock")) return;
-      fire();
-    });
-    console.log(`[desk] watching sessions: ${root}`);
-  } catch (e) {
-    console.warn("[desk] session watch failed:", e.message);
-    try {
-      fs.watch(root, fire);
-    } catch {
-      /* */
-    }
-  }
+  const w = startRootWatcher({
+    root,
+    onChange: () => {
+      broadcastProjectsTick("fs");
+      // A session dir a client is already subscribed to may have just appeared.
+      syncSessionWatchers();
+    },
+  });
+  console.log(
+    `[desk] watching sessions root${w.ok ? "" : " (FAILED — sidebar falls back to client poll)"}: ${root}`,
+  );
 }
 
 /**
@@ -824,6 +912,12 @@ function startSessionWatcher() {
  */
 let globalTurnGen = 0;
 let globalBusy = false;
+/**
+ * The session a primary claim is FOR, from claimBusy() until activeTurn exists.
+ * loadSession() in that window can take seconds; without this the snapshot has
+ * to guess (it used to guess `bridge.sessionId` — the previous chat).
+ */
+let claimSessionId = null;
 /** sessionId → array of {text, attachments, clientMsgId, sessionId} */
 const sessionQueues = new Map();
 /** Live turn snapshot for late joiners / PWA reload */
@@ -861,15 +955,26 @@ function queueSessionIds() {
   return ids;
 }
 
-/** Full queue snapshot for UI */
-function queueSnapshot() {
+/**
+ * Queue snapshot for UI.
+ *
+ * P2: pass a `sessionId` and the snapshot is scoped to that chat — `remaining`
+ * and `items` describe THAT session, not an aggregate across every session.
+ * `sessionIds` / `totalRemaining` still carry the global picture for the
+ * sidebar. Passing null keeps the old aggregate shape (hello / status / a
+ * legacy `queue_list`).
+ */
+function queueSnapshot(sessionId = null) {
+  const want = sessionId == null ? null : String(sessionId);
   const items = [];
   for (const [sid, q] of sessionQueues) {
     if (!q?.length) continue;
+    const rowSid = sid === "_pending" ? null : sid;
+    if (want != null && String(rowSid) !== want) continue;
     q.forEach((job, i) => {
       items.push({
         index: i,
-        sessionId: sid === "_pending" ? null : sid,
+        sessionId: rowSid,
         text: String(job.text || "").slice(0, 500),
         preview: String(job.text || "")
           .replace(/\s+/g, " ")
@@ -880,7 +985,21 @@ function queueSnapshot() {
       });
     });
   }
-  return { remaining: queueTotal(), items, sessionIds: queueSessionIds() };
+  const total = queueTotal();
+  return {
+    sessionId: want,
+    remaining: want == null ? total : items.length,
+    totalRemaining: total,
+    items,
+    sessionIds: queueSessionIds(),
+  };
+}
+
+/** Broadcast one session's queue state. P2: never an aggregate across sessions. */
+function emitQueueUpdate(sessionId, extra = {}) {
+  const snap = queueSnapshot(sessionId ?? null);
+  emitTurn({ type: "queue_update", ...snap, ...extra });
+  return snap;
 }
 
 function clearQueue(sessionId = null) {
@@ -890,24 +1009,22 @@ function clearQueue(sessionId = null) {
   } else {
     sessionQueues.clear();
   }
-  const snap = queueSnapshot();
-  emitTurn({ type: "queue_update", remaining: snap.remaining, items: snap.items, cleared: true });
-  return snap;
+  return emitQueueUpdate(sessionId ?? null, { cleared: true });
 }
 
 function cancelQueueItem(clientMsgId) {
-  if (!clientMsgId) return queueSnapshot();
+  if (!clientMsgId) return queueSnapshot(null);
+  let hitSid = null;
   for (const [sid, q] of sessionQueues) {
     const idx = q.findIndex((j) => j.clientMsgId && j.clientMsgId === clientMsgId);
     if (idx >= 0) {
       q.splice(idx, 1);
+      hitSid = sid === "_pending" ? null : sid;
       if (!q.length) sessionQueues.delete(sid);
       break;
     }
   }
-  const snap = queueSnapshot();
-  emitTurn({ type: "queue_update", remaining: snap.remaining, items: snap.items });
-  return snap;
+  return emitQueueUpdate(hitSid);
 }
 
 function partialDraftFromActive() {
@@ -950,29 +1067,57 @@ function isSessionLive(sessionId) {
   return Boolean(w?.busy);
 }
 
+/**
+ * The session the PRIMARY turn is for, or null when the primary is idle.
+ *
+ * P2: this used to fall back to `bridge.sessionId`, so a parallel-only turn —
+ * or the claim window between claimBusy() and activeTurn existing — named a
+ * session that was not live and the client marked the wrong chat "working".
+ * `claimSessionId` covers the load window honestly instead of guessing.
+ */
+function primaryTurnSessionId() {
+  if (!globalBusy) return null;
+  return activeTurn?.sessionId || claimSessionId || null;
+}
+
+/** The sessions that really have a turn in flight right now. */
+function liveSessionIdSet() {
+  const primary = primaryTurnSessionId();
+  const defaultSid =
+    pool.defaultWorker?.sessionId || pool.defaultWorker?.bridge?.sessionId || null;
+  const ids = new Set();
+  if (primary) ids.add(String(primary));
+  for (const sid of parallelTurns.keys()) if (sid) ids.add(String(sid));
+  for (const sid of pool.busySessionIds()) {
+    if (!sid) continue;
+    // The primary worker keeps its last binding while idle-but-claimed; only
+    // trust it when the primary turn actually names that session.
+    if (defaultSid && String(sid) === String(defaultSid)) {
+      if (primary && String(primary) === String(sid)) ids.add(String(sid));
+      continue;
+    }
+    ids.add(String(sid));
+  }
+  return [...ids];
+}
+
 /** Single source of truth for hello / status / GET /api/turn */
 function turnSnapshot() {
   const agents = pool.list();
   return {
     turnActive: Boolean(globalBusy) || parallelTurns.size > 0,
     turnEpoch: globalTurnGen,
-    activeSessionId: activeTurn?.sessionId || (globalBusy ? bridge.sessionId || null : null),
+    activeSessionId: primaryTurnSessionId(),
     bridgeSessionId: bridge.sessionId || null,
     phase: activeTurn?.phase || null,
     turnStartedAt: activeTurn?.startedAt || null,
     lastActivityAt: activeTurn?.lastActivityAt || null,
     partialDraft: partialDraftFromActive(),
     parallelDrafts: parallelDrafts(),
-    liveSessionIds: [
-      ...new Set([
-        ...(activeTurn?.sessionId ? [activeTurn.sessionId] : []),
-        ...parallelTurns.keys(),
-        ...pool.busySessionIds(),
-      ]),
-    ],
+    liveSessionIds: liveSessionIdSet(),
     queueRemaining: queueTotal(),
     queueSessionIds: queueSessionIds(),
-    queueItems: queueSnapshot().items,
+    queueItems: queueSnapshot(null).items,
     agentAlive: Boolean(bridge.status().agentAlive),
     pool: pool.status(),
     agents,
@@ -1039,8 +1184,9 @@ function armTurnWatchdogs(epoch) {
  * Claim busy slot for a new turn. Does NOT bump gen (abandon does).
  * Returns claimEpoch (= current globalTurnGen) for ownership checks after await.
  */
-function claimBusy(label = "claim") {
+function claimBusy(label = "claim", sessionId = null) {
   globalBusy = true;
+  claimSessionId = sessionId ? String(sessionId) : null;
   pool.setBusy(pool.defaultWorker, true);
   const epoch = globalTurnGen;
   console.log("[desk] claimBusy", label, "epoch", epoch);
@@ -1058,6 +1204,7 @@ function releaseBusy(epoch, reason = "release") {
   }
   globalBusy = false;
   activeTurn = null;
+  claimSessionId = null;
   pool.setBusy(pool.defaultWorker, false);
   clearTurnWatchdogs();
   console.log("[desk] releaseBusy", reason, "epoch", epoch);
@@ -1080,6 +1227,7 @@ function endTurnTerminal(opts = {}) {
     clearTurnWatchdogs();
     globalBusy = false;
     activeTurn = null;
+    claimSessionId = null;
     pool.setBusy(pool.defaultWorker, false);
   }
   const payload = {
@@ -1113,6 +1261,7 @@ function abandonTurn(opts = {}) {
   if (hard) sessionQueues.clear();
   globalBusy = false;
   activeTurn = null;
+  claimSessionId = null;
   pool.setBusy(pool.defaultWorker, false);
   try {
     bridge.flushPermissions?.(reason);
@@ -1121,7 +1270,7 @@ function abandonTurn(opts = {}) {
   }
   bridge.loadToken = (bridge.loadToken || 0) + 1; // invalidate in-flight loads
   if (wasBusy) {
-    emitTurn({ type: "queue_update", remaining: 0 });
+    emitQueueUpdate(endedSid, { cleared: hard });
     emitTurn({
       type: "turn_end",
       abandoned: true,
@@ -1154,6 +1303,65 @@ function abandonTurn(opts = {}) {
   }
 }
 
+/**
+ * Stop exactly ONE session.
+ *
+ * P2: `stop` used to be global and untargeted — a phone pressing Stop killed
+ * the Mac's turn and cleared every queue. Now it drops only that session's
+ * queued work and cancels only the process actually running it:
+ *   - parallel turn  → cancel that worker's session (its own agent process)
+ *   - primary turn   → abandon the primary turn, soft, so other queues survive
+ *   - neither        → just drop that session's queue
+ *
+ * @returns {{ sessionId: string, stopped: boolean, scope: string, queued: number }}
+ */
+function stopSession(sessionId) {
+  const sid = String(sessionId);
+  const queued = sessionQueues.get(sid)?.length || 0;
+  const out = { sessionId: sid, stopped: false, scope: "none", queued };
+  if (queued) {
+    sessionQueues.delete(sid);
+    out.stopped = true;
+    out.scope = "queue";
+  }
+
+  const parallel = parallelTurns.get(sid);
+  if (parallel) {
+    const worker = pool.workers.get(parallel.workerId) || pool.findBySession(sid);
+    if (worker) {
+      try {
+        worker.bridge.flushPermissions?.("stop");
+      } catch {
+        /* */
+      }
+      // runParallelPrompt's catch/finally emits turn_end for THIS session only.
+      void worker.bridge.cancelSession().catch(() => {});
+    }
+    out.stopped = true;
+    out.scope = "parallel";
+    console.log("[desk] stop → parallel", sid.slice(0, 8), parallel.workerId);
+    emitQueueUpdate(sid, { cleared: Boolean(queued) });
+    return out;
+  }
+
+  const primaryLive =
+    (activeTurn?.sessionId && String(activeTurn.sessionId) === sid) ||
+    (globalBusy && claimSessionId && String(claimSessionId) === sid) ||
+    (globalBusy && bridge.sessionId && String(bridge.sessionId) === sid);
+  if (primaryLive) {
+    console.log("[desk] stop → primary", sid.slice(0, 8));
+    // hard:false — never clear another session's queue.
+    abandonTurn({ restart: true, reason: "stop", hard: false });
+    out.stopped = true;
+    out.scope = "primary";
+    return out;
+  }
+
+  console.log("[desk] stop → nothing live for", sid.slice(0, 8), `(queued ${queued})`);
+  emitQueueUpdate(sid, { cleared: Boolean(queued) });
+  return out;
+}
+
 function enqueuePrompt(job) {
   const sid = job.sessionId || "_pending";
   if (!sessionQueues.has(sid)) sessionQueues.set(sid, []);
@@ -1162,18 +1370,19 @@ function enqueuePrompt(job) {
     job.clientMsgId = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
   }
   sessionQueues.get(sid).push(job);
-  const remaining = queueTotal();
-  const snap = queueSnapshot();
+  const snap = queueSnapshot(job.sessionId || null);
   emitTurn({
     type: "queued",
     position: sessionQueues.get(sid).length,
-    remaining,
+    remaining: snap.remaining,
+    totalRemaining: snap.totalRemaining,
     text: job.text,
     sessionId: job.sessionId || null,
     clientMsgId: job.clientMsgId || null,
     items: snap.items,
+    sessionIds: snap.sessionIds,
   });
-  return remaining;
+  return snap.totalRemaining;
 }
 
 function takeNextJob(preferSessionId) {
@@ -1216,6 +1425,7 @@ async function runPromptJob(text, attachments, opts = {}) {
         const next = takeNextJob(sid);
         if (next) {
           globalBusy = true; // keep claimed for drain
+          claimSessionId = next.sessionId ? String(next.sessionId) : null;
           queueMicrotask(() => void startQueuedJob(next));
         }
       }
@@ -1231,7 +1441,7 @@ async function runPromptJob(text, attachments, opts = {}) {
     }
   }
 
-  if (!opts.claimed) claimBusy("runPromptJob");
+  if (!opts.claimed) claimBusy("runPromptJob", opts.sessionId || null);
   let jobSessionId = opts.sessionId || bridge.sessionId || null;
   const nowIso = new Date().toISOString();
   const draftId = clientMsgId ? `desk_a_${clientMsgId}` : `desk_a_${Date.now()}`;
@@ -1247,6 +1457,7 @@ async function runPromptJob(text, attachments, opts = {}) {
     lastActivityAt: nowIso,
     draftId,
   };
+  claimSessionId = null; // activeTurn now names the session honestly
   armTurnWatchdogs(gen);
   console.log(
     "[desk] turn start",
@@ -1617,10 +1828,11 @@ async function runPromptJob(text, attachments, opts = {}) {
       if (next) {
         // KEEP busy claimed across handoff — no 40ms race window
         globalBusy = true;
+        claimSessionId = next.sessionId ? String(next.sessionId) : null;
         pool.setBusy(pool.defaultWorker, true);
         activeTurn = null;
         clearTurnWatchdogs();
-        emitTurn({ type: "queue_update", remaining: queueTotal(), starting: true });
+        emitQueueUpdate(next.sessionId || null, { starting: true });
         clearQueueDrainTimer();
         queueDrainTimer = setTimeout(() => {
           queueDrainTimer = null;
@@ -1628,10 +1840,11 @@ async function runPromptJob(text, attachments, opts = {}) {
         }, 10);
       } else {
         globalBusy = false;
+        claimSessionId = null;
         pool.setBusy(pool.defaultWorker, false);
         activeTurn = null;
         clearTurnWatchdogs();
-        emitTurn({ type: "queue_update", remaining: 0 });
+        emitQueueUpdate(jobSessionId || null);
         broadcastAgents();
       }
     }
@@ -1648,7 +1861,7 @@ async function startQueuedJob(next) {
     sessionQueues.get(sid).unshift(next);
     return;
   }
-  const epoch = claimBusy("queue-drain");
+  const epoch = claimBusy("queue-drain", next.sessionId || null);
   try {
     if (next.sessionId && bridge.sessionId !== next.sessionId) {
       console.log("[desk] queue drain → load session", next.sessionId?.slice(0, 8));
@@ -1662,6 +1875,7 @@ async function startQueuedJob(next) {
     }
     // Re-assert busy after await
     globalBusy = true;
+    claimSessionId = next.sessionId ? String(next.sessionId) : claimSessionId;
     await runPromptJob(next.text, next.attachments, {
       sessionId: next.sessionId || bridge.sessionId,
       clientMsgId: next.clientMsgId,
@@ -1679,6 +1893,7 @@ async function startQueuedJob(next) {
       const more = takeNextJob(next.sessionId);
       if (more) {
         globalBusy = true;
+        claimSessionId = more.sessionId ? String(more.sessionId) : null;
         queueMicrotask(() => void startQueuedJob(more));
       }
     }
@@ -2011,7 +2226,7 @@ pool.on("agent_exit", (info) => {
     });
   }
   syncDefaultBridge();
-  broadcastJson({ type: "agent_exit", ...info });
+  broadcastJson({ type: "agent_exit", ...info, sessionId: info?.sessionId ?? null });
   broadcastAgents();
 });
 
@@ -2028,6 +2243,130 @@ wss.on("connection", (ws, req) => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
   };
 
+  /**
+   * Every WS-level error names the session it is about. `sessionId: null` means
+   * genuinely unknowable (a frame we could not even parse), never "didn't try".
+   */
+  const sendError = (error, opts = {}) => {
+    const frame = {
+      type: "error",
+      sessionId: opts.sessionId ? String(opts.sessionId) : null,
+      error: error instanceof Error ? error.message || String(error) : String(error),
+    };
+    if (opts.code) frame.code = opts.code;
+    send(frame);
+  };
+
+  /* ------------------------------------------------- P2 feed subscriptions */
+
+  /**
+   * Subscriptions are PER SOCKET. Mac and phone can tail the same session at
+   * different cursors; each keeps its own handle and its own phase state.
+   * @type {Map<string, {id:number,sessionId:string,lastSeq:number}>}
+   */
+  const feedSubs = new Map();
+  /** sessionId → phase coalescing state for THIS socket. */
+  const feedPhase = new Map();
+
+  /**
+   * Send one `feed` frame and advance this socket's cursor.
+   *
+   * Cursor arithmetic uses the RAW event list so phase coalescing can never
+   * make the client skip an event: we advance to the last raw seq we saw and
+   * only then drop the phase noise from what goes on the wire.
+   */
+  const deliverFeed = (sessionId, handle, payload, extra = {}) => {
+    if (ws.readyState !== ws.OPEN) return;
+    const fromSeq = handle.lastSeq;
+    if (!payload || payload.ok === false) {
+      send({
+        type: "feed",
+        sessionId,
+        fromSeq,
+        seq: fromSeq,
+        events: [],
+        live: false,
+        phase: null,
+        owner: payload?.owner ?? null,
+        context: null,
+        subagents: [],
+        turn: null,
+        truncated: false,
+        hasMore: false,
+        working: false,
+        error: payload?.error || "session not found",
+        ...extra,
+      });
+      return;
+    }
+    // Cap the frame BEFORE coalescing so the cursor is exact: we advance to the
+    // last RAW seq we are shipping, then drop phase noise from that window.
+    // A client that has been away pages forward instead of taking a 50 MB frame.
+    let raw = Array.isArray(payload.events) ? payload.events : [];
+    let capped = false;
+    if (raw.length > FEED_MAX_EVENTS) {
+      raw = raw.slice(0, FEED_MAX_EVENTS);
+      capped = true;
+    }
+    const cursorSeq = raw.length ? raw[raw.length - 1].seq : payload.seq;
+    let st = feedPhase.get(sessionId);
+    if (!st) {
+      st = { lastPhase: null, lastPhaseAt: 0, dropped: 0 };
+      feedPhase.set(sessionId, st);
+    }
+    const before = st.dropped;
+    const events = coalescePhaseEvents(raw, st);
+    handle.lastSeq = cursorSeq;
+    const live = Boolean(payload.live);
+    const owner = payload.owner ?? null;
+    const hasMore = Boolean(payload.hasMore) || capped;
+    send({
+      type: "feed",
+      sessionId,
+      fromSeq,
+      seq: cursorSeq,
+      events,
+      live,
+      phase: payload.phase ?? null,
+      owner,
+      context: payload.context ?? null,
+      subagents: payload.subagents || [],
+      turn: payload.turn ?? null,
+      truncated: Boolean(payload.truncated),
+      hasMore,
+      // 56 of 958 sessions carry a turn_started with no turn_ended (the CLI
+      // died mid-turn). `live` alone over-reports, so gate on live && owner.
+      working: live && Boolean(owner),
+      ...extra,
+    });
+    if (st.dropped > before) {
+      console.log(
+        `[feed] ${sessionId.slice(0, 8)} coalesced ${st.dropped - before} phase events (${events.length}/${raw.length} on wire)`,
+      );
+    }
+    // Paged: drain the rest without waiting for another fs event.
+    if (hasMore) {
+      setTimeout(() => {
+        if (ws.readyState !== ws.OPEN) return;
+        if (feedSubs.get(sessionId) !== handle) return;
+        try {
+          feedPoll(sessionId);
+        } catch {
+          /* */
+        }
+      }, 10);
+    }
+  };
+
+  const dropFeedSub = (sessionId) => {
+    const handle = feedSubs.get(sessionId);
+    if (!handle) return false;
+    feedUnsubscribe(handle);
+    feedSubs.delete(sessionId);
+    feedPhase.delete(sessionId);
+    return true;
+  };
+
   const queueSessionIds = [];
   for (const [sid, q] of sessionQueues) {
     if (sid && sid !== "_pending" && q?.length) queueSessionIds.push(sid);
@@ -2042,24 +2381,30 @@ wss.on("connection", (ws, req) => {
   if (globalBusy) {
     send({
       type: "turn_start",
-      sessionId: activeTurn?.sessionId || bridge.sessionId || null,
+      sessionId: primaryTurnSessionId(),
       resume: true,
       turnEpoch: globalTurnGen,
     });
   }
 
   // Per-socket agent_exit notify (pool handler also ends busy turns)
-  const onExit = (info) => send({ type: "agent_exit", ...info });
+  const onExit = (info) =>
+    send({ type: "agent_exit", ...info, sessionId: info?.sessionId ?? null });
   pool.on("agent_exit", onExit);
 
   ws.on("close", () => {
     pool.off("agent_exit", onExit);
+    // Tear down every feed subscription this socket owned, then let the watcher
+    // pool drop any session nobody is tailing any more.
+    for (const sid of [...feedSubs.keys()]) dropFeedSub(sid);
+    syncSessionWatchers();
     // Do NOT abandon ACP turn — phone WS flaps constantly.
     console.log("[ws] client disconnected (turn continues if active)", {
       globalBusy,
       parallel: parallelTurns.size,
       queue: queueTotal(),
-      activeSessionId: activeTurn?.sessionId || null,
+      activeSessionId: primaryTurnSessionId(),
+      watchers: sessionWatchers.stats(),
     });
   });
 
@@ -2068,13 +2413,79 @@ wss.on("connection", (ws, req) => {
     try {
       msg = JSON.parse(String(raw));
     } catch {
-      send({ type: "error", error: "bad json" });
+      // Nothing was parsed, so there is genuinely no session to name.
+      sendError("bad json");
       return;
     }
 
     if (msg.type === "ping") {
       lastClientPongAt = Date.now(); // client is alive (they ping us; we pong)
       send({ type: "pong", t: Date.now() });
+      return;
+    }
+
+    /**
+     * P2 — tail one session's on-disk truth.
+     *   client → daemon: subscribe   {sessionId, fromSeq}
+     *   client → daemon: unsubscribe {sessionId}
+     *   daemon → client: feed {sessionId, fromSeq, seq, events[], live, phase,
+     *                          owner, context, subagents, turn, truncated,
+     *                          hasMore, working}
+     * fromSeq 0 = tail window (newest events, `truncated` if older exist).
+     * fromSeq > 0 = resume: page forward from that cursor, `hasMore` when the
+     * batch was capped at FEED_MAX_EVENTS.
+     */
+    if (msg.type === "subscribe") {
+      const sessionId = msg.sessionId ? String(msg.sessionId) : "";
+      if (!sessionId) {
+        sendError("sessionId required");
+        return;
+      }
+      const rawFrom = Number(msg.fromSeq);
+      const fromSeq = Number.isFinite(rawFrom) && rawFrom > 0 ? Math.floor(rawFrom) : 0;
+      dropFeedSub(sessionId); // re-subscribe at a new cursor replaces the old one
+
+      // session-feed's subscribe() fires an uncapped catch-up of its own; we
+      // swallow that one and send a capped catch-up right after instead.
+      let primed = false;
+      const handle = feedSubscribe(sessionId, fromSeq, (payload) => {
+        if (!primed) {
+          primed = true;
+          return;
+        }
+        deliverFeed(sessionId, handle, payload);
+      });
+      feedSubs.set(sessionId, handle);
+      handle.lastSeq = fromSeq;
+      const stats = syncSessionWatchers();
+      console.log(
+        `[feed] subscribe ${sessionId.slice(0, 8)} from ${fromSeq} — watching ${stats.sessions} session(s)`,
+      );
+      deliverFeed(
+        sessionId,
+        handle,
+        readSessionFeed(sessionId, {
+          from: fromSeq,
+          limit: FEED_MAX_EVENTS,
+          cwd: msg.cwd ? String(msg.cwd) : undefined,
+        }),
+        { catchUp: true },
+      );
+      return;
+    }
+
+    if (msg.type === "unsubscribe") {
+      const sessionId = msg.sessionId ? String(msg.sessionId) : "";
+      if (!sessionId) {
+        sendError("sessionId required");
+        return;
+      }
+      const ok = dropFeedSub(sessionId);
+      const stats = syncSessionWatchers();
+      console.log(
+        `[feed] unsubscribe ${sessionId.slice(0, 8)} — watching ${stats.sessions} session(s)`,
+      );
+      send({ type: "unsubscribed", sessionId, ok });
       return;
     }
 
@@ -2093,43 +2504,62 @@ wss.on("connection", (ws, req) => {
         await bridge.ensure();
         send({
           type: "ready",
+          sessionId: bridge.sessionId || null,
           agent: bridge.status(),
           ...turnSnapshot(),
         });
       } catch (e) {
-        send({ type: "error", error: e.message || String(e) });
+        sendError(e, { sessionId: msg.sessionId || bridge.sessionId || null });
       }
       return;
     }
 
+    /**
+     * P2 — `stop` stops ONE session. It used to be global: a phone pressing
+     * Stop killed the Mac's live turn and cleared every queue.
+     */
     if (msg.type === "stop") {
-      console.log("[desk] stop requested");
-      abandonTurn({ restart: true, reason: "stop" });
-      send({ type: "queue_update", remaining: 0, items: [] });
+      const sessionId = msg.sessionId ? String(msg.sessionId) : null;
+      if (!sessionId) {
+        // Legacy client (pre-P3) — keep the old global behaviour, but say so.
+        console.warn(
+          "[desk] stop without sessionId — legacy GLOBAL stop; client should send {sessionId}",
+        );
+        abandonTurn({ restart: true, reason: "stop" });
+        send({ type: "queue_update", ...queueSnapshot(null), cleared: true, legacy: true });
+        return;
+      }
+      const res = stopSession(sessionId);
+      send({ type: "queue_update", ...queueSnapshot(sessionId), cleared: true });
+      send({ type: "stopped", ...res });
       return;
     }
 
     if (msg.type === "queue_clear") {
-      const snap = clearQueue(msg.sessionId || null);
-      send({ type: "queue_update", remaining: snap.remaining, items: snap.items, cleared: true });
+      const sid = msg.sessionId ? String(msg.sessionId) : null;
+      clearQueue(sid);
+      send({ type: "queue_update", ...queueSnapshot(sid), cleared: true });
       return;
     }
 
     if (msg.type === "queue_cancel") {
       const snap = cancelQueueItem(msg.clientMsgId || msg.id);
-      send({ type: "queue_update", remaining: snap.remaining, items: snap.items });
+      send({ type: "queue_update", ...snap });
       return;
     }
 
     if (msg.type === "queue_list") {
-      send({ type: "queue_update", ...queueSnapshot() });
+      send({
+        type: "queue_update",
+        ...queueSnapshot(msg.sessionId ? String(msg.sessionId) : null),
+      });
       return;
     }
 
     if (msg.type === "permission_response") {
       const requestId = msg.requestId ? String(msg.requestId) : "";
       if (!requestId) {
-        send({ type: "error", error: "requestId required" });
+        sendError("requestId required", { sessionId: msg.sessionId || null });
         return;
       }
       const choice = {
@@ -2153,14 +2583,22 @@ wss.on("connection", (ws, req) => {
         }
       }
       let ok = false;
+      let owner = null;
       // Try every worker (requestId is unique)
       for (const w of pool.workers.values()) {
         if (w.bridge.resolvePermission(requestId, choice)) {
           ok = true;
+          owner = w;
           break;
         }
       }
-      send({ type: "permission_resolved", requestId, ok, ...choice });
+      send({
+        type: "permission_resolved",
+        sessionId: workerSessionId(owner) || msg.sessionId || null,
+        requestId,
+        ok,
+        ...choice,
+      });
       return;
     }
 
@@ -2168,7 +2606,7 @@ wss.on("connection", (ws, req) => {
     if (msg.type === "question_response") {
       const requestId = msg.requestId ? String(msg.requestId) : "";
       if (!requestId) {
-        send({ type: "error", error: "requestId required" });
+        sendError("requestId required", { sessionId: msg.sessionId || null });
         return;
       }
       let result;
@@ -2187,13 +2625,21 @@ wss.on("connection", (ws, req) => {
         };
       }
       let ok = false;
+      let owner = null;
       for (const w of pool.workers.values()) {
         if (w.bridge.resolveExtRequest(requestId, result)) {
           ok = true;
+          owner = w;
           break;
         }
       }
-      send({ type: "question_resolved", requestId, ok, result });
+      send({
+        type: "question_resolved",
+        sessionId: workerSessionId(owner) || msg.sessionId || null,
+        requestId,
+        ok,
+        result,
+      });
       return;
     }
 
@@ -2201,7 +2647,7 @@ wss.on("connection", (ws, req) => {
     if (msg.type === "plan_approval_response") {
       const requestId = msg.requestId ? String(msg.requestId) : "";
       if (!requestId) {
-        send({ type: "error", error: "requestId required" });
+        sendError("requestId required", { sessionId: msg.sessionId || null });
         return;
       }
       const action = String(msg.action || "approve").toLowerCase();
@@ -2218,13 +2664,21 @@ wss.on("connection", (ws, req) => {
         };
       }
       let ok = false;
+      let owner = null;
       for (const w of pool.workers.values()) {
         if (w.bridge.resolveExtRequest(requestId, result)) {
           ok = true;
+          owner = w;
           break;
         }
       }
-      send({ type: "plan_approval_resolved", requestId, ok, result });
+      send({
+        type: "plan_approval_resolved",
+        sessionId: workerSessionId(owner) || msg.sessionId || null,
+        requestId,
+        ok,
+        result,
+      });
       return;
     }
 
@@ -2241,6 +2695,7 @@ wss.on("connection", (ws, req) => {
           }
           send({
             type: "permission_mode",
+            sessionId: msg.sessionId || null,
             mode: "always-approve",
             alwaysApprove: true,
             note: "Phone default: always-approve (settings.phoneAlwaysApprove)",
@@ -2249,14 +2704,16 @@ wss.on("connection", (ws, req) => {
           pool.setPermissionMode(st.permissionMode);
           send({
             type: "permission_mode",
+            sessionId: msg.sessionId || null,
             mode: pool.permissionMode,
             alwaysApprove: pool.alwaysApprove,
           });
         } else {
+          // Announcing a client is not about any session — no sessionId to give.
           send({ type: "client_info_ack", isMobile });
         }
       } catch (e) {
-        send({ type: "error", error: e.message || String(e) });
+        sendError(e, { sessionId: msg.sessionId || null });
       }
       return;
     }
@@ -2273,19 +2730,23 @@ wss.on("connection", (ws, req) => {
         }
         send({
           type: "permission_mode",
+          sessionId: msg.sessionId || null,
           mode: pool.permissionMode,
           alwaysApprove: pool.alwaysApprove,
           note: globalBusy
             ? "Mode saved; applies fully after restart / next worker"
             : "Mode applied",
         });
+        // Permission mode is process-wide, not per chat: sessionId is null on
+        // the broadcast because there genuinely is not one.
         broadcastJson({
           type: "permission_mode",
+          sessionId: null,
           mode: pool.permissionMode,
           alwaysApprove: pool.alwaysApprove,
         });
       } catch (e) {
-        send({ type: "error", error: e.message || String(e) });
+        sendError(e, { sessionId: msg.sessionId || null });
       }
       return;
     }
@@ -2302,14 +2763,23 @@ wss.on("connection", (ws, req) => {
           } catch (e) {
             send({
               type: "session_status",
+              // no session exists yet — null, not a guess
+              sessionId: null,
               state: "error",
               error: e.message || String(e),
               code: e.code || "POOL_FULL",
             });
-            send({ type: "error", error: e.message || String(e), code: e.code || "POOL_FULL" });
+            sendError(e, { sessionId: null, code: e.code || "POOL_FULL" });
             return;
           }
-          send({ type: "session_status", state: "creating", cwd, parallel: true, workerId: worker.id });
+          send({
+            type: "session_status",
+            sessionId: null,
+            state: "creating",
+            cwd,
+            parallel: true,
+            workerId: worker.id,
+          });
           await worker.bridge.ensure();
           if (cwd) worker.bridge.cwd = cwd;
           const session = await worker.bridge.newSession(cwd);
@@ -2341,7 +2811,7 @@ wss.on("connection", (ws, req) => {
         abandonTurn({ restart: false, hard: true });
         const gen = ++loadGen;
         if (msg.cwd) bridge.cwd = path.resolve(String(msg.cwd));
-        send({ type: "session_status", state: "creating", cwd: bridge.cwd });
+        send({ type: "session_status", sessionId: null, state: "creating", cwd: bridge.cwd });
         await bridge.ensure();
         if (gen !== loadGen) return;
         const session = await bridge.newSession(bridge.cwd);
@@ -2360,8 +2830,13 @@ wss.on("connection", (ws, req) => {
         broadcastProjectsTick("new_session");
         broadcastAgents();
       } catch (e) {
-        send({ type: "session_status", state: "error", error: e.message || String(e) });
-        send({ type: "error", error: e.message || String(e) });
+        send({
+          type: "session_status",
+          sessionId: null,
+          state: "error",
+          error: e.message || String(e),
+        });
+        sendError(e, { sessionId: null });
       }
       return;
     }
@@ -2423,7 +2898,7 @@ wss.on("connection", (ws, req) => {
           });
         }
       } catch (e) {
-        send({ type: "error", error: e.message || String(e), code: e.code || undefined });
+        sendError(e, { sessionId: msg.sessionId || null, code: e.code || undefined });
       }
       return;
     }
@@ -2431,7 +2906,7 @@ wss.on("connection", (ws, req) => {
     if (msg.type === "load_session") {
       const sessionId = msg.sessionId;
       if (!sessionId) {
-        send({ type: "error", error: "sessionId required" });
+        sendError("sessionId required");
         return;
       }
       try {
@@ -2529,8 +3004,8 @@ wss.on("connection", (ws, req) => {
             truncated: transcript.truncated || false,
             agentResumed: false,
             viewOnly: true,
-            backgroundTurnSessionId: activeTurn?.sessionId || bridge.sessionId || null,
-            activeSessionId: activeTurn?.sessionId || null,
+            backgroundTurnSessionId: primaryTurnSessionId(),
+            activeSessionId: primaryTurnSessionId(),
             liveSessionIds: turnSnapshot().liveSessionIds,
             partialDraft: null,
           });
@@ -2564,7 +3039,7 @@ wss.on("connection", (ws, req) => {
               truncated: transcript.truncated || false,
               agentResumed: false,
               viewOnly: true,
-              backgroundTurnSessionId: activeTurn?.sessionId || bridge.sessionId || null,
+              backgroundTurnSessionId: primaryTurnSessionId(),
               partialDraft: null,
             });
             send({ type: "session_status", state: "history_only", sessionId, cwd });
@@ -2625,7 +3100,7 @@ wss.on("connection", (ws, req) => {
         broadcastAgents();
       } catch (e) {
         send({ type: "session_status", state: "error", sessionId, error: e.message || String(e) });
-        send({ type: "error", error: e.message || String(e) });
+        sendError(e, { sessionId });
       }
       return;
     }
@@ -2636,7 +3111,7 @@ wss.on("connection", (ws, req) => {
       const sessionId = msg.sessionId ? String(msg.sessionId) : bridge.sessionId || null;
       const clientMsgId = msg.clientMsgId ? String(msg.clientMsgId) : null;
       if (!text && attachments.length === 0) {
-        send({ type: "error", error: "Empty prompt" });
+        sendError("Empty prompt", { sessionId });
         return;
       }
       const job = { text, attachments, sessionId, clientMsgId };
@@ -2683,7 +3158,7 @@ wss.on("connection", (ws, req) => {
             clientMsgId,
           });
         } catch (e) {
-          send({ type: "error", error: e.message || String(e) });
+          sendError(e, { sessionId });
         }
         return;
       }
@@ -2695,7 +3170,7 @@ wss.on("connection", (ws, req) => {
       }
 
       // Claim slot synchronously so a second prompt on this tick enqueues
-      const claimEpoch = claimBusy("prompt");
+      const claimEpoch = claimBusy("prompt", sessionId || bridge.sessionId || null);
 
       // Idle — load the named session even if the worker has no bound id yet
       if (sessionId && sessionId !== bridge.sessionId) {
@@ -2714,7 +3189,7 @@ wss.on("connection", (ws, req) => {
               epoch: claimEpoch,
             });
           }
-          send({ type: "error", error: e.message || String(e) });
+          sendError(e, { sessionId });
           return;
         }
         // Abandon during load?
@@ -2723,6 +3198,7 @@ wss.on("connection", (ws, req) => {
           return;
         }
         globalBusy = true; // re-assert after await
+        claimSessionId = sessionId ? String(sessionId) : claimSessionId;
       }
 
       void runPromptJob(text, attachments, {
@@ -2733,7 +3209,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    send({ type: "error", error: `unknown message type: ${msg.type}` });
+    sendError(`unknown message type: ${msg.type}`, { sessionId: msg.sessionId || null });
   });
 });
 
