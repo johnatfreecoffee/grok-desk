@@ -716,6 +716,9 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
   const [speakVoices, setSpeakVoices] = useState<Array<{ id: string; name: string; detail: string }>>(
     [],
   );
+  const [tuiBusy, setTuiBusy] = useState(false);
+  const [tuiMsg, setTuiMsg] = useState<string | null>(null);
+  const [tuiErr, setTuiErr] = useState(false);
   const [pushBusy, setPushBusy] = useState(false);
   const [pushMsg, setPushMsg] = useState<string | null>(null);
   const [pushState, setPushState] = useState<{
@@ -729,6 +732,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
   useEffect(() => {
     if (!open) return;
     setPushMsg(null);
+    setTuiMsg(null);
+    setTuiErr(false);
     fetch("/api/settings")
       .then((r) => r.json())
       .then((d) => {
@@ -846,6 +851,35 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
               <option value="verbatim">Verbatim</option>
             </select>
           </label>
+          <div className="settings-app-actions">
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={tuiBusy}
+              onClick={() => {
+                void (async () => {
+                  setTuiBusy(true);
+                  setTuiMsg(null);
+                  setTuiErr(false);
+                  try {
+                    const resp = await fetch("/api/speak/install-tui", { method: "POST" });
+                    const d = await resp.json().catch(() => ({}));
+                    if (!resp.ok || !d.ok) throw new Error(d.error || "Install failed");
+                    if (typeof d.speakReady === "boolean") setSpeakReady(d.speakReady);
+                    setTuiMsg("TUI /speak installed.");
+                  } catch (e) {
+                    setTuiErr(true);
+                    setTuiMsg(e instanceof Error ? e.message : "Install failed");
+                  } finally {
+                    setTuiBusy(false);
+                  }
+                })();
+              }}
+            >
+              {tuiBusy ? "…" : "Install TUI /speak"}
+            </button>
+          </div>
+          {tuiMsg ? <p className={tuiErr ? "settings-callout" : "settings-ok"}>{tuiMsg}</p> : null}
           <p className="modal-hint">
             Per-reply Concise / Casual / Full on a message does not change this default. Shared with
             TUI <code>~/.grok/speak.toml</code>.

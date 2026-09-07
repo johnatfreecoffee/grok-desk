@@ -1,0 +1,11 @@
+# Copied to ~/.grok/speak.toml on install if missing.
+# Change from the TUI: /speak mode concise
+# Or: grok-speak mode casual
+
+mode = "concise"
+voice = "rex"
+
+# verbatim  read the reply (markdown stripped)
+# concise   short plain-English spoken brief
+# casual    spoken recap, like telling a friend
+# full      whole reply as spoken plain English

@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ROOT } from "./load-env.js";
 
 export const SPEAK_MODES = ["verbatim", "concise", "casual", "full"];
 
@@ -51,11 +52,21 @@ const DEFAULTS = { mode: "concise", voice: "rex" };
 export function speakBin() {
   const env = (process.env.GROK_SPEAK || "").trim();
   if (env && fs.existsSync(env)) return env;
+  const vendored = path.join(ROOT, "tools", "speak", "bin", "grok-speak");
+  if (fs.existsSync(vendored)) return vendored;
   const linked = path.join(GROK_HOME, "bin", "grok-speak");
   if (fs.existsSync(linked)) return linked;
-  const repo = path.join(HOME, "Documents", "grok-speak", "bin", "grok-speak");
-  if (fs.existsSync(repo)) return repo;
-  return linked;
+  const sibling = path.join(HOME, "Documents", "grok-speak", "bin", "grok-speak");
+  if (fs.existsSync(sibling)) return sibling;
+  return vendored;
+}
+
+export function tuiInstalled() {
+  try {
+    return fs.existsSync(path.join(GROK_HOME, "bin", "grok-speak"));
+  } catch {
+    return false;
+  }
 }
 
 export function speakReady() {
@@ -105,7 +116,62 @@ export function speakStatusPayload() {
     speakVoice: settings.voice,
     speakVoices: SPEAK_VOICES,
     speakBin: speakBin(),
+    tuiInstalled: tuiInstalled(),
   };
+}
+
+export function installSpeakTui() {
+  const script = path.join(ROOT, "tools", "speak", "scripts", "install.sh");
+  if (!fs.existsSync(script)) {
+    const err = new Error("Speak install script missing");
+    err.status = 500;
+    throw err;
+  }
+  return new Promise((resolve, reject) => {
+    const proc = spawn("/bin/zsh", [script], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => {
+      stdout += String(d);
+    });
+    proc.stderr.on("data", (d) => {
+      stderr += String(d);
+    });
+    const t = setTimeout(() => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* */
+      }
+      reject(new Error("TUI install timed out"));
+    }, 30000);
+    proc.on("error", (e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+    proc.on("close", (code) => {
+      clearTimeout(t);
+      if (code !== 0) {
+        const err = new Error((stderr || stdout || `install.sh exited ${code}`).trim().slice(0, 400));
+        err.status = 500;
+        reject(err);
+        return;
+      }
+      resolve({
+        ok: true,
+        paths: {
+          bin: path.join(GROK_HOME, "bin", "grok-speak"),
+          source: path.join(ROOT, "tools", "speak", "bin", "grok-speak"),
+          skill: path.join(GROK_HOME, "skills", "speak", "SKILL.md"),
+          hooks: path.join(GROK_HOME, "hooks", "speak-cache.json"),
+          commands: path.join(GROK_HOME, "commands"),
+          settings: path.join(GROK_HOME, "speak.toml"),
+        },
+      });
+    });
+  });
 }
 
 export function clipIdFrom(text, mode, voice) {

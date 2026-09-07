@@ -20,6 +20,7 @@ import {
   isClipId,
   loadSpeakSettings,
   saveSpeakSettings,
+  installSpeakTui,
 } from "./speak.js";
 import { transcribeAudio } from "./stt.js";
 import {
@@ -445,6 +446,16 @@ async function handleApi(req, res) {
       sendJson(res, 200, { ok: true, settings, ...speakStatusPayload() });
     } catch (e) {
       sendJson(res, 400, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/speak/install-tui" && req.method === "POST") {
+    try {
+      const result = await installSpeakTui();
+      sendJson(res, 200, { ...result, ...speakStatusPayload() });
+    } catch (e) {
+      sendJson(res, e.status || 500, { ok: false, error: e.message || String(e) });
     }
     return true;
   }
