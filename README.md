@@ -27,20 +27,20 @@ This project was **built with Grok Build** (dogfooded end-to-end) and is open so
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
-│  Mac app    │     │  Phone PWA  │     │ grok.com phone   │
-│  (Electron) │     │  (Safari)   │     │ connector :3311  │
+│  Mac app    │     │  Phone PWA  │     │ grok.com Custom  │
+│  (Electron) │     │  (Safari)   │     │ connector        │
 └──────┬──────┘     └──────┬──────┘     └────────┬─────────┘
        │  localhost        │  Tailscale          │  token
        ▼                   ▼                     ▼
-┌──────────────────────────────────────────────────────────┐
-│  Grok Desk daemon (Node)                                 │  ← http://127.0.0.1:8787
-│  HTTP + WebSocket · Speak TTS · Settings                 │
-└──────────────┬───────────────────────────────────────────┘
-               │ ACP (stdio)
-               ▼
+┌──────────────────────────────┐     ┌─────────────────────┐
+│  Grok Desk daemon (Node)     │     │ Phone MCP :3311     │
+│  http://127.0.0.1:8787       │     │ tools/phone-mcp     │
+│  Speak TTS · Settings        │     │ (not Desk :8787)    │
+└──────────────┬───────────────┘     └──────────┬──────────┘
+               │ ACP (stdio)                    │ grok CLI jobs
+               ▼                                ▼
 ┌──────────────────────────────────────────────────────────┐
 │  grok agent  (Grok CLI)                                  │  ← your CLI login / subscription
-│  sessions, tools, skills, MCP                            │
 └──────────────────────────────────────────────────────────┘
 
 Menu bar: Grok Folders extra (native NSMenu) — comet → open a folder in Grok or Terminal
