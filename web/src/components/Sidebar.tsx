@@ -20,6 +20,7 @@ import {
   isSecureForPush,
 } from "../lib/push";
 import { ModuleInfo } from "./ModuleInfo";
+import { PhoneConnectorSettings } from "./settings/PhoneConnectorSettings";
 
 export type SessionMeta = {
   id: string;
@@ -852,7 +853,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
           </p>
         </div>
 
-        {/* DESK-MERGE: FoldersSettings then PhoneConnectorSettings go here */}
+        {/* DESK-MERGE: FoldersSettings */}
+        <PhoneConnectorSettings />
 
         <div className="settings-section">
           <div className="settings-section-title">Phone push</div>
