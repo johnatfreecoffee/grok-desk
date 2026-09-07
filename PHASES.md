@@ -6,7 +6,7 @@ Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the sp
 
 ## Build
 
-- [ ] **P1 Speak vendor** — engine in-repo, Settings TUI install
+- [x] **P1 Speak vendor** — engine in-repo, Settings TUI install
   - Copy grok-speak into `tools/speak/` (bin, commands, skills, hooks, install.sh, speak.toml.example)
   - `daemon/speak.js` `speakBin()` prefers repo `tools/speak/bin/grok-speak`
   - Settings Speak: ready status + “Install TUI /speak” (runs tools/speak/scripts/install.sh)
