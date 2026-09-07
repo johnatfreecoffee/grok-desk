@@ -60,9 +60,9 @@ cat > "$CONTENTS/Info.plist" <<EOF
   <key>CFBundleIdentifier</key>
   <string>dev.freecoffee.grok-desk</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0</string>
+  <string>0.2.0</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>0.2.0</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleExecutable</key>
@@ -106,3 +106,19 @@ cp -R "$APP_DIR" "$USER_APPS/$APP_NAME.app"
 ln -sfn "$ROOT" "$USER_APPS/$APP_NAME.app/Contents/Resources/app"
 xattr -cr "$USER_APPS/$APP_NAME.app" 2>/dev/null || true
 echo "Also installed: $USER_APPS/$APP_NAME.app"
+
+# Bundled Speak (always). Folders / Phone MCP only if already enabled.
+if [[ -x "$ROOT/tools/speak/scripts/install.sh" ]]; then
+  /bin/zsh "$ROOT/tools/speak/scripts/install.sh"
+fi
+FOLDERS_LABEL="dev.freecoffee.GrokFolders"
+if [[ -f "$HOME/Library/LaunchAgents/${FOLDERS_LABEL}.plist" ]]; then
+  echo "Folders extra already enabled — rebuilding from native/folders"
+  bash "$ROOT/native/folders/scripts/install.sh"
+fi
+PHONE_LABEL="dev.freecoffee.grok-phone-mcp"
+if [[ -f "$HOME/Library/LaunchAgents/${PHONE_LABEL}.plist" && -f "$ROOT/tools/phone-mcp/server.mjs" ]]; then
+  mkdir -p "$HOME/.grok/phone-mcp/app"
+  rsync -a "$ROOT/tools/phone-mcp/server.mjs" "$HOME/.grok/phone-mcp/app/"
+  echo "Synced phone MCP server.mjs (token unchanged, agent not restarted)"
+fi

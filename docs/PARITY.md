@@ -50,7 +50,7 @@ Legend: ✅ native · 🟡 partial · ❌ missing · N/A not applicable
 | `/usage` | ✅ | CLI SuperGrok quota + 16-week local heatmap + session tokens |
 | `/automations` `/schedule` | ✅ | Local scheduled jobs; ACP pool fire |
 | `/privacy` | ✅ | Settings Privacy section |
-| `/settings` | 🟡 | Desk settings modal |
+| `/settings` | ✅ | Speak TTS, Folders extra, Phone connector (grok.com MCP :3311), push, privacy, permission mode |
 | `/timestamps` | ✅ | Toggle + settings |
 | `/speak` family | ✅ | Per-reply Concise/Casual/Full + player; Settings voice via `speak.toml` (subscription TTS, no API key) |
 | `/voice` dictation | ✅ | Composer mic = TUI /voice (Grok STT + login). Ctrl+Space / F8. No API key. |

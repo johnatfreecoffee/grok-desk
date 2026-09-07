@@ -27,7 +27,7 @@ Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the sp
   - Public URL is a setting (default John’s tunnel if present)
   - Proof: enable → `/health` 200; disable → stopped; rotate token writes new file
 
-- [ ] **P4 One-product wrap**
+- [x] **P4 One-product wrap**
   - README + package.json description = one product
   - moduleHelp Settings copy includes Folders + Phone connector
   - `make-app` / `always-on` install Speak bin + Folders extra when enabled in settings
