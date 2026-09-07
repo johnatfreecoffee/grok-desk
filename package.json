@@ -37,6 +37,7 @@
     "smoke:isolation": "node scripts/smoke-thread-isolation.mjs",
     "smoke:resume": "node scripts/smoke-session-resume.mjs",
     "test:speak": "node scripts/speak-unit.mjs",
+    "test:feed": "node scripts/feed-unit.mjs",
     "test:store": "node --experimental-strip-types scripts/session-store-unit.mjs"
   },
   "dependencies": {

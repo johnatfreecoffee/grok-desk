@@ -32,6 +32,9 @@ jobs:
       - name: Speak unit tests
         run: npm run test:speak
 
+      - name: Feed projector unit tests
+        run: npm run test:feed
+
       - name: Syntax-check daemon modules
         run: |
           node --check daemon/index.js
@@ -41,6 +44,7 @@ jobs:
           node --check daemon/cli-ext.js
           node --check daemon/routes/build.js
           node --check daemon/session-store.js
+          node --check daemon/session-feed.js
           node --check daemon/automations.js
           node --check daemon/usage-collect.js
           node --check daemon/speak.js

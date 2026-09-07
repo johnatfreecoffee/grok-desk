@@ -1,0 +1,15 @@
+{
+  "info": {
+    "id": "fixa-1111-2222-3333-444444444444",
+    "cwd": "/fixtures/feed-project"
+  },
+  "generated_title": "Fix the build",
+  "session_summary": "Fix the build",
+  "created_at": "2026-08-17T20:53:20.000Z",
+  "updated_at": "2026-08-17T20:53:31.500Z",
+  "last_active_at": "2026-08-17T20:53:31.500Z",
+  "num_messages": 13,
+  "num_chat_messages": 4,
+  "current_model_id": "grok-4.6",
+  "agent_name": "grok"
+}

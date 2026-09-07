@@ -1,0 +1,1 @@
+{"timestamp":1787000001,"method":"session/update","params":{"sessionId":"fixb-1111-2222-3333-444444444444","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Run the tests"}},"_meta":{"agentTimestampMs":1787000001000,"turnStartMs":1787000000500,"promptId":"prompt-fix-1","eventId":"fixb-1111-2222-3333-444444444444-2000"}}}

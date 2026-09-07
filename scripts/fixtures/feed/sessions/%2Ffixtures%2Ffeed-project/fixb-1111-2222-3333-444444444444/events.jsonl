@@ -1,0 +1,2 @@
+{"ts":"2026-08-17T20:53:20.500Z","type":"turn_started","session_id":"fixb-1111-2222-3333-444444444444","turn_number":1,"model_id":"grok-4.6","yolo_mode":true,"conversation_message_count":0,"session_relationship":"root","schema_version":1}
+{"ts":"2026-08-17T20:53:21.500Z","type":"phase_changed","phase":"streaming_reasoning"}

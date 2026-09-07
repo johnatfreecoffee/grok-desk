@@ -85,7 +85,8 @@ function saveDeskIndex(idx) {
     });
 }
 
-function isSubagentKind(s) {
+/** True when a summary.json describes a subagent session (not a user chat). */
+export function isSubagentKind(s) {
   if (!s || typeof s !== "object") return false;
   if (s.is_subagent === true) return true;
   const k = String(s.session_kind || s.kind || "").toLowerCase();
@@ -273,7 +274,8 @@ function projectName(cwd) {
   return parts[parts.length - 1] || cwd;
 }
 
-function readSummary(sessionDir) {
+/** Parse `<sessionDir>/summary.json`, or null. */
+export function readSummary(sessionDir) {
   const p = path.join(sessionDir, "summary.json");
   if (!fs.existsSync(p)) return null;
   try {

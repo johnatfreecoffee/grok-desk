@@ -1,0 +1,15 @@
+{
+  "subagent_id": "fixchild-aaaa-bbbb-cccc-000000000001",
+  "parent_session_id": "fixa-1111-2222-3333-444444444444",
+  "child_session_id": "fixchild-aaaa-bbbb-cccc-000000000001",
+  "subagent_type": "explore",
+  "description": "Find the failing test",
+  "status": "completed",
+  "started_at": "2026-08-17T20:53:27.000Z",
+  "completed_at": "2026-08-17T20:53:28.000Z",
+  "duration_ms": 12000,
+  "tool_calls": 4,
+  "turns": 1,
+  "child_cwd": "/fixtures/feed-project",
+  "effective_model_id": "grok-4.6"
+}

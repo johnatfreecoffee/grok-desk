@@ -1,0 +1,11 @@
+{
+  "info": {
+    "id": "fixb-1111-2222-3333-444444444444",
+    "cwd": "/fixtures/feed-project"
+  },
+  "generated_title": "Run the tests",
+  "created_at": "2026-08-17T20:53:20.000Z",
+  "updated_at": "2026-08-17T20:53:21.500Z",
+  "num_messages": 1,
+  "current_model_id": "grok-4.6"
+}
