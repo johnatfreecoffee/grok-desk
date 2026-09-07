@@ -12,7 +12,7 @@ Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the sp
   - Settings Speak: ready status + “Install TUI /speak” (runs tools/speak/scripts/install.sh)
   - Proof: `npm run test:speak` · `speakBin()` does not need `~/Documents/grok-speak`
 
-- [ ] **P2 Folders into Desk** — native extra + Settings
+- [x] **P2 Folders into Desk** — native extra + Settings
   - Copy grok-folders into `native/folders/` (Sources, Resources, scripts)
   - `daemon/folders.js` + `/api/folders` GET/POST (enabled, hover, defaultOpen, lastPath, install/uninstall)
   - `web/src/components/settings/FoldersSettings.tsx` — Settings section after Speak
