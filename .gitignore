@@ -25,6 +25,7 @@ Grok Desk.app/
 *.app/
 dist-electron/
 native/folders/.build/
+tools/phone-mcp/node_modules/
 
 # agent / editor junk
 .agent-write-test*

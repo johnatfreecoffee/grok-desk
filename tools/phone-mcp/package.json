@@ -1,0 +1,18 @@
+{
+  "name": "grok-phone-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Streamable HTTP MCP so grok.com (phone/web) can list, resume, and kick Grok Build on this Mac",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.76"
+  }
+}

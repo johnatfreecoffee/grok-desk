@@ -19,7 +19,7 @@ Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the sp
   - Reuse `~/Library/Application Support/GrokFolders/state.json` and launchd `dev.freecoffee.GrokFolders`
   - Proof: enable via API → comet in menu bar; disable → gone; existing state preserved
 
-- [ ] **P3 Phone connector into Desk** — MCP + Settings
+- [x] **P3 Phone connector into Desk** — MCP + Settings
   - Copy grok-phone-mcp into `tools/phone-mcp/` (server.mjs, package.json, start/install scripts)
   - `daemon/phone-mcp.js` + `/api/phone-mcp` GET/POST (enabled, health, publicUrl, token masked, rotate)
   - `web/src/components/settings/PhoneConnectorSettings.tsx` — Settings section

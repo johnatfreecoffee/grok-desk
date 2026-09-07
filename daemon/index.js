@@ -55,6 +55,13 @@ import {
   notifyPush,
   ensureVapidKeys,
 } from "./push.js";
+import {
+  status as phoneMcpStatus,
+  setEnabled as setPhoneMcpEnabled,
+  rotateToken as rotatePhoneMcpToken,
+  savePublicUrl as savePhoneMcpPublicUrl,
+  readToken as readPhoneMcpToken,
+} from "./phone-mcp.js";
 import { handleBuildApi } from "./routes/build.js";
 import {
   runDueAutomations,
@@ -652,6 +659,50 @@ async function handleApi(req, res) {
       }
     } catch (e) {
       sendJson(res, 400, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/phone-mcp" && req.method === "GET") {
+    try {
+      sendJson(res, 200, { ok: true, ...(await phoneMcpStatus()) });
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/phone-mcp" && req.method === "POST") {
+    try {
+      const body = await readBody(req).catch(() => ({}));
+      if (typeof body.publicUrl === "string") savePhoneMcpPublicUrl(body.publicUrl);
+      if (typeof body.enabled === "boolean") await setPhoneMcpEnabled(body.enabled);
+      sendJson(res, 200, { ok: true, ...(await phoneMcpStatus()) });
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/phone-mcp/rotate" && req.method === "POST") {
+    try {
+      sendJson(res, 200, { ok: true, ...(await rotatePhoneMcpToken()) });
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/phone-mcp/token" && req.method === "GET") {
+    try {
+      const token = readPhoneMcpToken();
+      if (!token) {
+        sendJson(res, 404, { ok: false, error: "no token" });
+        return true;
+      }
+      sendJson(res, 200, { token });
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: e.message || String(e) });
     }
     return true;
   }

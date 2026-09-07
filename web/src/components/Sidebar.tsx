@@ -21,6 +21,7 @@ import {
 } from "../lib/push";
 import { ModuleInfo } from "./ModuleInfo";
 import { FoldersSettings } from "./settings/FoldersSettings";
+import { PhoneConnectorSettings } from "./settings/PhoneConnectorSettings";
 
 export type SessionMeta = {
   id: string;
@@ -888,8 +889,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
         </div>
 
         <FoldersSettings />
-
-        {/* DESK-MERGE: PhoneConnectorSettings */}
+        <PhoneConnectorSettings />
 
         <div className="settings-section">
           <div className="settings-section-title">Phone push</div>
