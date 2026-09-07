@@ -1,9 +1,9 @@
 {
   "name": "grok-desk",
   "productName": "Grok Desk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
-  "description": "Local visual desk for Grok Build — CLI agent text + subscription Speak TTS + optional realtime mic",
+  "description": "Local visual desk for Grok Build — Speak TTS, menu-bar Folders, grok.com phone connector",
   "license": "MIT",
   "repository": {
     "type": "git",

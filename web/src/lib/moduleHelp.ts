@@ -225,10 +225,12 @@ export const MODULE_HELP: Record<string, ModuleHelp> = {
   settings: {
     id: "settings",
     title: "Settings",
-    summary: "Desk prefs, push, Speak voice, session limits, permission mode.",
-    what: "Persists to Application Support (not wiped by app rebuild). Includes phone push, session sidebar limits, Speak voice (speak.toml), and permission defaults.",
+    summary: "Desk prefs, Speak TTS, Folders extra, Phone connector, push, session limits, permission mode.",
+    what: "Persists to Application Support (not wiped by app rebuild). Speak voice (speak.toml), native Folders menu extra, grok.com Phone connector (:3311), phone push, session sidebar limits, and permission defaults.",
     how: [
-      "Pick Speak voice — subscription TTS, shared with TUI ~/.grok/speak.toml.",
+      "Speak — bundled subscription TTS. Pick voice; Install TUI /speak. Shared with ~/.grok/speak.toml.",
+      "Folders — enable the native menu-bar extra (comet). Hover and default open stay in existing state.json.",
+      "Phone connector — grok.com MCP on port 3311. Enable, copy URL/token, rotate. Token stays masked after first copy.",
       "Toggle phone push and notify-on-turn-end.",
       "Set max sessions/projects shown in the sidebar.",
       "permissionMode: ask vs always-approve; phoneAlwaysApprove keeps mobile YOLO.",
