@@ -7,7 +7,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 ## Build
 
-- [ ] **P0 Stop the bleeding** — four surgical client fixes, no architecture change
+- [x] **P0 Stop the bleeding** — four surgical client fixes, no architecture change
   - `web/src/App.tsx:1870` — take `mergeArtifacts` out of the connect-effect deps so
     toggling Artifacts / clicking a tool row mid-turn no longer tears down the WebSocket
   - `web/src/App.tsx:914-919` — restore `LAST_SESSION_KEY` on `hello` even when a turn is
@@ -66,7 +66,8 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 - [ ] **P7 Scale + PWA**
   - Kill the O(n²) `pruneSubagentsFromDeskIndex` / `isSubagentSession` per poll
-  - Real `manifest.json`; Tailscale HTTPS so the service worker + Web Push register on phone
+  - Tailscale HTTPS so the service worker + Web Push actually register on the phone
+    (`http://...ts.net` is not a secure context; the vite-plugin-pwa manifest is already fine)
   - Reconnect / resubscribe on iOS PWA resume
   - Proof: CPU under load; PWA installs and push arrives on the phone
 
