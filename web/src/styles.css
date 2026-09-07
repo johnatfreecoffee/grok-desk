@@ -772,6 +772,8 @@ body.desk-app .shell.no-sidebar .topbar {
 
 .modal {
   width: min(420px, 100%);
+  max-height: min(92dvh, 820px);
+  overflow-y: auto;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -869,6 +871,7 @@ body.desk-app .shell.no-sidebar .topbar {
   align-items: center;
   gap: 8px;
   color: var(--text);
+  min-height: 40px;
 }
 
 .modal-hint {
@@ -4652,6 +4655,9 @@ body.desk-app .topbar {
   display: flex;
   gap: 8px;
   margin-bottom: 8px;
+}
+.settings-app-actions .icon-btn {
+  min-height: 40px;
 }
 
 .md-img-btn {

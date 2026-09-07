@@ -144,7 +144,7 @@ export function PhoneConnectorSettings() {
       </label>
       <div className="settings-app-actions">
         <button type="button" className="icon-btn" onClick={() => void copyUrl()} disabled={!publicUrl.trim()}>
-          Copy
+          Copy URL
         </button>
       </div>
       <label className="field">
@@ -153,7 +153,7 @@ export function PhoneConnectorSettings() {
       </label>
       <div className="settings-app-actions">
         <button type="button" className="icon-btn" onClick={() => void copyToken()} disabled={!st?.tokenSet}>
-          Copy
+          Copy token
         </button>
         <button type="button" className="icon-btn" onClick={() => void rotate()} disabled={busy}>
           Rotate

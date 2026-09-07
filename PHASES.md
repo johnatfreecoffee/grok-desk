@@ -37,8 +37,8 @@ Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the sp
 
 ## UI match
 
-- [ ] Settings Speak / Folders / Phone connector match existing `settings-section` chrome
-- [ ] Desktop ~1280 + tablet ~768/1024 + phone ~390. Tap ≥ 40px. No purple.
+- [x] Settings Speak / Folders / Phone connector match existing `settings-section` chrome
+- [x] Desktop ~1280 + tablet ~768/1024 + phone ~390. Tap ≥ 40px. No purple.
 
 ## Hunt
 

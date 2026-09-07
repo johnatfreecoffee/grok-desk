@@ -736,10 +736,10 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
     setPushMsg(null);
     setTuiMsg(null);
     setTuiErr(false);
-    fetch("/api/settings")
+    fetch("/api/settings", { credentials: "include" })
       .then((r) => r.json())
       .then((d) => {
-        setSettings(d.settings);
+        setSettings(d.settings || null);
         if (typeof d.speakReady === "boolean") setSpeakReady(d.speakReady);
         if (d.speakVoice) setSpeakVoice(d.speakVoice);
         if (d.speakMode) setSpeakMode(d.speakMode);
@@ -763,7 +763,19 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
       .catch(() => setPushServerCount(0));
   }, [open]);
 
-  if (!open || !settings) return null;
+  if (!open) return null;
+  if (!settings) {
+    return (
+      <div className="modal-backdrop" onClick={onClose}>
+        <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="settings-title-row">
+            <h2>Settings</h2>
+          </div>
+          <p className="modal-hint">Loading…</p>
+        </div>
+      </div>
+    );
+  }
 
   const togglePhonePush = async (on: boolean) => {
     setPushBusy(true);

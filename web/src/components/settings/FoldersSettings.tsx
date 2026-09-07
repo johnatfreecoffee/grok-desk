@@ -110,7 +110,7 @@ export function FoldersSettings() {
       )}
       {msg && <p className="settings-callout">{msg}</p>}
       <p className="modal-hint">
-        comet in the menu bar opens a folder in Grok Build or Terminal
+        Comet in the menu bar opens a folder in Grok Build or Terminal.
       </p>
     </div>
   );
