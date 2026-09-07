@@ -1,5 +1,6 @@
 # dependencies & build
 node_modules/
+web/node_modules
 web/node_modules/
 web/dist/
 .vite/
@@ -23,6 +24,7 @@ bootstrap-once.json
 Grok Desk.app/
 *.app/
 dist-electron/
+native/folders/.build/
 
 # agent / editor junk
 .agent-write-test*

@@ -21,6 +21,11 @@ import {
   loadSpeakSettings,
   saveSpeakSettings,
 } from "./speak.js";
+import {
+  status as foldersStatus,
+  setEnabled as setFoldersEnabled,
+  saveState as saveFoldersState,
+} from "./folders.js";
 import { transcribeAudio } from "./stt.js";
 import {
   listProjects,
@@ -443,6 +448,27 @@ async function handleApi(req, res) {
       const body = await readBody(req).catch(() => ({}));
       const settings = saveSpeakSettings(body || {});
       sendJson(res, 200, { ok: true, settings, ...speakStatusPayload() });
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e.message || String(e) });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/folders" && req.method === "GET") {
+    sendJson(res, 200, { ok: true, ...foldersStatus() });
+    return true;
+  }
+
+  if (url.pathname === "/api/folders" && req.method === "POST") {
+    try {
+      const body = await readBody(req).catch(() => ({}));
+      const patch = {};
+      if (body.openOnHover != null) patch.openOnHover = body.openOnHover;
+      if (body.defaultOpen != null) patch.defaultOpen = body.defaultOpen;
+      if (body.lastPath != null) patch.lastPath = body.lastPath;
+      if (Object.keys(patch).length) saveFoldersState(patch);
+      if (typeof body.enabled === "boolean") setFoldersEnabled(body.enabled);
+      sendJson(res, 200, { ok: true, ...foldersStatus() });
     } catch (e) {
       sendJson(res, 400, { ok: false, error: e.message || String(e) });
     }
