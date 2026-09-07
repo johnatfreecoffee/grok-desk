@@ -23,7 +23,7 @@ export function FoldersSettings() {
   };
 
   useEffect(() => {
-    fetch("/api/folders")
+    fetch("/api/folders", { credentials: "include" })
       .then((r) => r.json())
       .then((d) => apply(d))
       .catch(() => setSt(null));
@@ -35,6 +35,7 @@ export function FoldersSettings() {
     try {
       const resp = await fetch("/api/folders", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       });

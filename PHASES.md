@@ -42,12 +42,12 @@ Machine: this Mac. Spec: `~/Documents/grok-desk/SPEC.md`. If it is not in the sp
 
 ## Hunt
 
-- [ ] Console / network / frontend / backend / broken-path
-- [ ] Speak synthesize still works without sibling repo
-- [ ] Folders enable/disable
-- [ ] Phone MCP health + token mask
+- [x] Console / network / frontend / backend / broken-path
+- [x] Speak synthesize still works without sibling repo
+- [x] Folders enable/disable
+- [x] Phone MCP health + token mask
 
 ## Clean run
 
-- [ ] One hunt with zero findings
-- [ ] Ship `main`, rebuild UI, kick launchd
+- [x] One hunt with zero findings
+- [x] Ship `main`, rebuild UI, kick launchd

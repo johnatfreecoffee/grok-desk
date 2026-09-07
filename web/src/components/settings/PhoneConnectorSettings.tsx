@@ -20,7 +20,7 @@ export function PhoneConnectorSettings() {
   const [err, setErr] = useState<string | null>(null);
 
   const refresh = async () => {
-    const r = await fetch("/api/phone-mcp");
+    const r = await fetch("/api/phone-mcp", { credentials: "include" });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || "Could not load phone connector");
     setSt(d);
@@ -39,6 +39,7 @@ export function PhoneConnectorSettings() {
     try {
       const r = await fetch("/api/phone-mcp", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: on }),
       });
@@ -62,6 +63,7 @@ export function PhoneConnectorSettings() {
     try {
       const r = await fetch("/api/phone-mcp", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ publicUrl: next }),
       });
@@ -84,7 +86,7 @@ export function PhoneConnectorSettings() {
   const copyToken = async () => {
     setErr(null);
     try {
-      const r = await fetch("/api/phone-mcp/token");
+      const r = await fetch("/api/phone-mcp/token", { credentials: "include" });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || !d.token) throw new Error(d.error || "No token");
       const ok = await copyTextToClipboard(String(d.token));
@@ -99,7 +101,7 @@ export function PhoneConnectorSettings() {
     setMsg(null);
     setErr(null);
     try {
-      const r = await fetch("/api/phone-mcp/rotate", { method: "POST" });
+      const r = await fetch("/api/phone-mcp/rotate", { method: "POST", credentials: "include" });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(d.error || "Rotate failed");
       setSt(d);
@@ -117,6 +119,7 @@ export function PhoneConnectorSettings() {
   return (
     <div className="settings-section">
       <div className="settings-section-title">Phone connector</div>
+      {!st && <p className="modal-hint">Loading connector…</p>}
       <label className="field check">
         <input
           type="checkbox"
