@@ -86,7 +86,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
     P3 works around it client-side by judging a gap on evidence; fix the label at the source.
   - Proof: a > 18 min turn completes untouched; full history reachable
 
-- [ ] **P6 Terminal fidelity**
+- [x] **P6 Terminal fidelity**
   - Subagent strip at the top of the chat: type, description, status, duration, tools;
     opens the child session; shows `output.json`. Source is `subagent_spawned` /
     `subagent_finished` + `subagents/*/meta.json` — **not** `task_backgrounded` /
@@ -107,6 +107,9 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 ## UI match
 
+- [ ] **Known, pre-existing: the topbar action row overflows at ~768 with the sidebar open** —
+      872px of content in 293px, `overflow:hidden` clips "New" and the mode chips. Found during
+      P6 and confirmed present without P6's changes.
 - [ ] Existing Desk chrome; no new layout language; no purple
 - [ ] Desktop ~1280 · tablet ~768 portrait + ~1024 landscape · phone ~390. Tap ≥ 40px
 
