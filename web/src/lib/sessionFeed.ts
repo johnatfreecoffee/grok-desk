@@ -29,6 +29,11 @@ export type FeedOwner = {
   pid: number;
   cwd: string | null;
   openedAt: string | null;
+  /** How the CLI is running: an interactive TUI, or a headless `grok … -p`. */
+  kind?: "tui" | "headless";
+  /** Where the daemon found it: active_sessions.json, or the process table. */
+  source?: "registry" | "process";
+  command?: string | null;
 };
 
 export type FeedContext = {

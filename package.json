@@ -41,7 +41,8 @@
     "test:feed": "node scripts/feed-unit.mjs",
     "test:store": "node --experimental-strip-types scripts/session-store-unit.mjs",
     "smoke:switch": "node --experimental-strip-types scripts/smoke-switch.mjs",
-    "smoke:reload": "node --experimental-strip-types scripts/smoke-reload.mjs"
+    "smoke:reload": "node --experimental-strip-types scripts/smoke-reload.mjs",
+    "smoke:cli": "node --experimental-strip-types scripts/smoke-cli.mjs"
   },
   "dependencies": {
     "web-push": "^3.6.7",

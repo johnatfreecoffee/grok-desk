@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -22,7 +23,20 @@ process.env.GROK_HOME = HOME;
 const feed = await import(
   new URL("../daemon/session-feed.js", import.meta.url).href
 );
-const { read, subscribe, unsubscribe, poll, forget, sessionOwner, cursorOf } = feed;
+const {
+  read,
+  subscribe,
+  unsubscribe,
+  poll,
+  forget,
+  sessionOwner,
+  cursorOf,
+  resetOwnerCache,
+  ownerCoverage,
+} = feed;
+const { cwdKeyCandidates, findSessionDir } = await import(
+  new URL("../daemon/session-store.js", import.meta.url).href
+);
 
 const PROJECT = "%2Ffixtures%2Ffeed-project";
 const A = "fixa-1111-2222-3333-444444444444";
@@ -47,6 +61,58 @@ function writeActive(rows) {
     JSON.stringify(rows, null, 2),
   );
 }
+
+/* --------------------------------------------------- ownership fixtures */
+/*
+ * P4 verifies that a registry pid really is a `grok` CLI, so the tests need a
+ * live process whose executable is named `grok` and one that is not. A SYMLINK
+ * to /bin/sleep named `grok` gives `ps -o comm=` the right answer without
+ * running the real CLI, spending a token, or touching ~/.grok. (A copy will not
+ * do: macOS code-signing enforcement SIGKILLs an unsigned copy of a platform
+ * binary a moment after it starts.)
+ */
+const binDir = path.join(HOME, "bin");
+fs.mkdirSync(binDir, { recursive: true });
+const fakeGrokBin = path.join(binDir, "grok");
+fs.symlinkSync("/bin/sleep", fakeGrokBin);
+const fakeGrok = spawn(fakeGrokBin, ["600"], { stdio: "ignore" });
+fakeGrok.unref();
+const killFakeGrok = () => {
+  try {
+    process.kill(fakeGrok.pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+};
+process.on("exit", killFakeGrok);
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(1));
+// ps must actually see it before any probe runs.
+for (let i = 0; i < 100; i += 1) {
+  const out = execFileSync("ps", ["-p", String(fakeGrok.pid), "-o", "comm="], {
+    encoding: "utf8",
+  }).trim();
+  if (out) break;
+  await new Promise((r) => setTimeout(r, 20));
+}
+
+/**
+ * A symlinked project cwd, so the `/tmp` ↔ `/private/tmp` skew is a real
+ * condition in the test rather than a hypothetical. The session directory is
+ * keyed by the REAL path; lookups arrive with the symlinked spelling.
+ */
+const symlinkSession = "sym0-1111-2222-3333-444444444444";
+const realProj = path.join(HOME, "real-proj");
+const symlinkCwd = path.join(HOME, "link-proj");
+fs.mkdirSync(realProj, { recursive: true });
+fs.symlinkSync(realProj, symlinkCwd);
+const symlinkDir = path.join(
+  HOME,
+  "sessions",
+  encodeURIComponent(fs.realpathSync(realProj)),
+  symlinkSession,
+);
+fs.mkdirSync(symlinkDir, { recursive: true });
+fs.writeFileSync(path.join(symlinkDir, "updates.jsonl"), "");
 
 /** Snapshot every file under a dir so we can prove the projector never writes. */
 function snapshotTree(dir) {
@@ -275,17 +341,143 @@ test("owner is null for a pid that does not exist", () => {
   assert.equal(sessionOwner(A), null);
 });
 
-test("owner is set for a live pid (this process)", () => {
+test("a live pid that is NOT a grok CLI does not own anything", () => {
+  // P4. `process.kill(pid, 0)` succeeds for ANY live pid, so a stale registry
+  // row plus a recycled pid used to invent an owner out of thin air. This
+  // process is alive and is node, not grok — it must not own A.
   writeActive([
-    { session_id: B, pid: 2147483646, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:00Z" },
-    { session_id: A, pid: process.pid, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:01Z" },
+    {
+      session_id: A,
+      pid: process.pid,
+      cwd: "/fixtures/feed-project",
+      opened_at: "2026-09-01T00:00:01Z",
+    },
   ]);
   forget(A);
+  resetOwnerCache();
+  assert.equal(sessionOwner(A), null, "a live node pid must never register as an owner");
+  assert.equal(read(A).owner, null);
+});
+
+test("owner is set for a live pid that really is a grok CLI", () => {
+  writeActive([
+    { session_id: B, pid: 2147483646, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:00Z" },
+    { session_id: A, pid: fakeGrok.pid, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:01Z" },
+  ]);
+  forget(A);
+  resetOwnerCache();
   const owned = read(A);
   assert.ok(owned.owner, "owner should be detected");
-  assert.equal(owned.owner.pid, process.pid);
+  assert.equal(owned.owner.pid, fakeGrok.pid);
   assert.equal(owned.owner.cwd, "/fixtures/feed-project");
+  assert.equal(owned.owner.kind, "tui");
+  assert.equal(owned.owner.source, "registry");
   assert.equal(read(B).owner, null, "dead pid must not own B");
+});
+
+test("owner is NEVER reported when the projection failed (ok:false)", () => {
+  // The P2 trap: `owner` was filled in even for a session directory that does
+  // not exist, so anything gating a read-only composer on `owner` alone locked
+  // a chat that was not even there.
+  const ghost = "ghost-1111-2222-3333-444444444444";
+  writeActive([
+    { session_id: ghost, pid: fakeGrok.pid, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:01Z" },
+  ]);
+  forget(ghost);
+  resetOwnerCache();
+  const r = read(ghost);
+  assert.equal(r.ok, false, "no session dir → ok:false");
+  assert.equal(r.owner, null, "ok:false must never carry an owner");
+  assert.equal(r.working, false);
+  // The probe itself still knows — the load guard uses it directly.
+  assert.ok(sessionOwner(ghost), "sessionOwner() still reports the live grok");
+});
+
+test("owner cwd is realpath'd, and findSessionDir tolerates the /private skew", () => {
+  // macOS: the registry has recorded /private/tmp/... for a process whose argv
+  // said /tmp/..., and the session dir key is encodeURIComponent(cwd).
+  writeActive([
+    { session_id: A, pid: fakeGrok.pid, cwd: symlinkCwd, opened_at: "2026-09-01T00:00:01Z" },
+  ]);
+  forget(A);
+  resetOwnerCache();
+  const o = sessionOwner(A);
+  assert.ok(o, "owner detected through the symlinked cwd");
+  assert.equal(o.cwd, fs.realpathSync(symlinkCwd), "cwd comes back realpath'd");
+  assert.notEqual(
+    o.cwd,
+    symlinkCwd,
+    "the fixture must actually be a symlink for this to mean anything",
+  );
+  // The keyed lookup — not the fallback scan — has to work from either spelling.
+  const keys = cwdKeyCandidates(symlinkCwd);
+  assert.ok(keys.includes(symlinkCwd), "the literal spelling is still tried first");
+  assert.ok(keys.includes(fs.realpathSync(symlinkCwd)), "realpath is tried too");
+  assert.ok(
+    cwdKeyCandidates("/tmp/x").includes("/private/tmp/x"),
+    "/tmp → /private/tmp is covered",
+  );
+  assert.ok(
+    cwdKeyCandidates("/private/tmp/x").includes("/tmp/x"),
+    "/private/tmp → /tmp is covered (the direction realpath cannot fix)",
+  );
+  assert.equal(
+    findSessionDir(symlinkSession, symlinkCwd),
+    symlinkDir,
+    "the symlinked spelling finds the dir keyed by the real path",
+  );
+});
+
+test("Desk's own ACP worker is never treated as a rival owner", () => {
+  const { isAcpWorker } = feed.__internals;
+  assert.equal(isAcpWorker("/Users/x/.grok/bin/grok agent --always-approve stdio"), true);
+  assert.equal(isAcpWorker("grok agent stdio"), true);
+  // A terminal grok, and a headless run, are never launched that way.
+  assert.equal(isAcpWorker("grok --cwd /Users/x/project"), false);
+  assert.equal(isAcpWorker("grok -p hi --resume abc --cwd /x"), false);
+  assert.equal(isAcpWorker(null), false);
+});
+
+test("ownership coverage is declared honestly", () => {
+  const cov = ownerCoverage();
+  assert.equal(cov.registry, true);
+  assert.equal(cov.resumedHeadless, true);
+  // A headless `grok -p` that opened a brand-new session id is NOT attributable
+  // to that id by the registry or by argv. Desk says so rather than implying it.
+  assert.equal(cov.newHeadless, false);
+});
+
+test("working is live && owner, and rides in read() so HTTP and WS agree", () => {
+  writeActive([
+    { session_id: A, pid: fakeGrok.pid, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:01Z" },
+  ]);
+  forget(A);
+  resetOwnerCache();
+  const r = read(A);
+  assert.equal(typeof r.working, "boolean", "read() must carry `working`");
+  assert.equal(r.working, r.live && Boolean(r.owner));
+  writeActive([]);
+  forget(A);
+  resetOwnerCache();
+  assert.equal(read(A).working, false, "no owner → never working");
+});
+
+test("poll({force}) pushes an ownership change with no new events", () => {
+  writeActive([
+    { session_id: A, pid: fakeGrok.pid, cwd: "/fixtures/feed-project", opened_at: "2026-09-01T00:00:01Z" },
+  ]);
+  forget(A);
+  resetOwnerCache();
+  const seen = [];
+  const handle = subscribe(A, 0, (p) => seen.push(p));
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].owner, "subscriber sees the owner");
+  assert.equal(poll(A), 0, "no new bytes → no push");
+  writeActive([]); // the owner exits
+  resetOwnerCache();
+  assert.equal(poll(A, { force: true }), 1, "forced push delivers the takeover");
+  assert.equal(seen[1].owner, null, "the takeover frame clears the owner");
+  unsubscribe(handle);
 });
 
 /* ------------------------------------------------- 4. cursor / resume */
@@ -466,5 +658,6 @@ test("the projector never writes into the session store", () => {
   assert.deepEqual(snapshotTree(dirA), beforeTree, "session dir was modified");
 });
 
+killFakeGrok();
 fs.rmSync(HOME, { recursive: true, force: true });
 console.log(`\nFEED UNIT PASS — ${passed} tests`);

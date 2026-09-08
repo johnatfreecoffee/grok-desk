@@ -7,6 +7,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureUserDataMigrated, userDataPath, deskSourceDir } from "./user-data.js";
+// Cycle by design: session-feed reads THIS module's paths, and deleteSession
+// needs its ownership probe. Both sides only ever call each other lazily (never
+// at module-eval time) and both exports are hoisted function declarations, so
+// the ESM cycle resolves cleanly whichever module is entered first.
+import { sessionOwner } from "./session-feed.js";
 
 const DEFAULT_SETTINGS = {
   maxSessionsPerProject: 40,
@@ -900,11 +905,35 @@ export function listProjects(opts = {}) {
   };
 }
 
+/**
+ * Every spelling of `cwd` that could have produced this session's directory key.
+ *
+ * P4. The directory key is `encodeURIComponent(cwd)` and the two sides do not
+ * always agree on which cwd that was: ~/.grok/active_sessions.json has been seen
+ * recording `/private/tmp/...` for a process whose argv said `/tmp/...`. On
+ * macOS `/tmp`, `/var` and `/etc` are symlinks into `/private`, so the exact
+ * string decides whether the lookup hits or misses — hence realpath, plus the
+ * `/private` prefix in both directions.
+ */
+export function cwdKeyCandidates(cwd) {
+  if (!cwd) return [];
+  const raw = String(cwd);
+  const out = [raw];
+  try {
+    out.push(fs.realpathSync(raw));
+  } catch {
+    /* path may be gone — the literal spelling is still worth trying */
+  }
+  if (raw.startsWith("/private/")) out.push(raw.slice("/private".length));
+  else if (raw.startsWith("/")) out.push(path.join("/private", raw));
+  return [...new Set(out.filter(Boolean))];
+}
+
 export function findSessionDir(sessionId, cwd) {
   const root = sessionsRoot();
   if (!sessionId || !fs.existsSync(root)) return null;
-  if (cwd) {
-    const candidate = path.join(root, encodeURIComponent(cwd), sessionId);
+  for (const key of cwdKeyCandidates(cwd)) {
+    const candidate = path.join(root, encodeURIComponent(key), sessionId);
     if (fs.existsSync(candidate)) return candidate;
   }
   for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
@@ -1005,6 +1034,20 @@ export function deleteSession(sessionId, cwd) {
   // Safety: must be under sessions root
   const root = sessionsRoot();
   if (!dir.startsWith(root)) return { ok: false, error: "refusing delete outside sessions" };
+  // P4 ownership guard: rm -rf on a directory a live `grok` is appending to
+  // yanks the store out from under it mid-turn. Refuse and name the pid.
+  const owner = sessionOwner(sessionId);
+  if (owner) {
+    return {
+      ok: false,
+      error:
+        `Session is open in a live grok (pid ${owner.pid}` +
+        `${owner.cwd ? ` · ${owner.cwd}` : ""}). Quit that ${
+          owner.kind === "headless" ? "run" : "terminal"
+        } first, then delete.`,
+      owner,
+    };
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   try {
     clearDeskMessages(sessionId);
