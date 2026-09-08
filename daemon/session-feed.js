@@ -27,6 +27,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import {
   sessionsRoot,
   findSessionDir,
@@ -646,6 +647,156 @@ function pidAlive(pid) {
   }
 }
 
+/* --------------------------------------------------------- process probe */
+/*
+ * P4. "Is that pid alive" is not ownership. `process.kill(pid, 0)` succeeds for
+ * ANY live pid, so after a reboot or a pid wrap the registry's stale row would
+ * point at whatever unrelated process now holds that number — and Desk would
+ * lock a perfectly free session read-only forever. Every candidate owner is
+ * therefore checked against the process table: the executable behind the pid
+ * must actually be a `grok` CLI.
+ *
+ * Results are cached per pid for PROC_TTL_MS so a poll loop does not fork `ps`
+ * on every read.
+ */
+
+/** How long a pid's `ps` verdict is trusted. */
+const PROC_TTL_MS = Number(process.env.DESK_OWNER_PROC_TTL_MS || 3000);
+/** How long the full process sweep is trusted — it is the expensive one. */
+const SCAN_TTL_MS = Number(process.env.DESK_OWNER_SCAN_TTL_MS || 5000);
+/** pid → { at, grok, command } */
+const procCache = new Map();
+/** ps scan of `--resume`-style headless runs → { at, byId: Map }. */
+let resumeScan = { at: 0, byId: new Map() };
+let psWarned = false;
+
+function ps(args) {
+  try {
+    return String(execFileSync("ps", args, { encoding: "utf8", timeout: 4000 })).trim();
+  } catch (e) {
+    // A pid that has gone away makes ps exit 1 with no output — not a failure.
+    if (e?.stdout != null && String(e.stdout).trim()) return String(e.stdout).trim();
+    if (e?.status === 1) return "";
+    if (!psWarned) {
+      psWarned = true;
+      console.warn("[feed] ps unavailable — ownership falls back to a liveness check:", e?.message);
+    }
+    return null; // null = could not ask, distinct from "" = asked, nothing there
+  }
+}
+
+/** argv[0]'s (or comm's) basename, minus a platform suffix. */
+function execName(s) {
+  const first = String(s || "").trim();
+  if (!first) return "";
+  return path.basename(first).replace(/\.(exe|bat|cmd)$/i, "");
+}
+
+/**
+ * Is `pid` a live `grok` CLI?
+ *
+ * Fails OPEN (`grok: true`) when `ps` itself cannot be run: the whole point of
+ * this phase is that Desk must never attach to a session another `grok` holds,
+ * so an unknown process is treated as an owner rather than risking the clobber.
+ *
+ * @returns {{grok:boolean, command:string|null}}
+ */
+function grokProcess(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return { grok: false, command: null };
+  const now = Date.now();
+  const hit = procCache.get(n);
+  if (hit && now - hit.at < PROC_TTL_MS) return { grok: hit.grok, command: hit.command };
+
+  const comm = ps(["-p", String(n), "-o", "comm="]);
+  let out;
+  if (comm === null) {
+    out = { grok: true, command: null, unverified: true }; // no ps → fail open
+  } else if (!comm) {
+    out = { grok: false, command: null }; // pid gone between kill(0) and ps
+  } else {
+    const isGrok = execName(comm.split("\n")[0]) === "grok";
+    const command = isGrok ? ps(["-p", String(n), "-o", "command="]) || comm : comm;
+    out = { grok: isGrok, command: String(command).split("\n")[0] };
+  }
+  procCache.set(n, { at: now, grok: out.grok, command: out.command });
+  if (procCache.size > 256) {
+    for (const [k, v] of procCache) if (now - v.at > PROC_TTL_MS) procCache.delete(k);
+  }
+  return { grok: out.grok, command: out.command };
+}
+
+/**
+ * Headless runs (`grok -p …`) never write ~/.grok/active_sessions.json — that
+ * registry is maintained by the interactive TUI only. A headless run that
+ * RESUMES an existing session does name it on its own command line
+ * (`--resume <id>`), so one cached `ps` sweep attributes those.
+ *
+ * What this cannot see: a headless run that created its own brand-new session
+ * id, because nothing on disk or in argv ties that pid to the id. Desk says so
+ * out loud rather than implying full coverage — see `ownerCoverage()`.
+ *
+ * @returns {Map<string, {pid:number, command:string}>}
+ */
+function scanResumeOwners() {
+  const now = Date.now();
+  if (now - resumeScan.at < SCAN_TTL_MS) return resumeScan.byId;
+  const byId = new Map();
+  const out = ps(["-eo", "pid=,command="]);
+  if (out) {
+    for (const line of out.split("\n")) {
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (!m) continue;
+      const argv = m[2];
+      if (execName(argv.split(/\s+/)[0]) !== "grok") continue;
+      if (isAcpWorker(argv)) continue; // Desk's own worker
+      const res = /(?:^|\s)--resume[=\s]+(\S+)/.exec(argv);
+      if (!res) continue;
+      const id = res[1].replace(/^["']|["']$/g, "");
+      if (!id || byId.has(id)) continue;
+      byId.set(id, { pid: Number(m[1]), command: argv.trim() });
+    }
+  }
+  resumeScan = { at: now, byId };
+  return byId;
+}
+
+/** What ownership detection can and cannot see — the UI must not overstate it. */
+export function ownerCoverage() {
+  return {
+    registry: true, // interactive TUI sessions (~/.grok/active_sessions.json)
+    resumedHeadless: true, // `grok … --resume <id>` seen in the process table
+    // A headless `grok -p` that opened a NEW session is not attributable to a
+    // session id by any means available here.
+    newHeadless: false,
+  };
+}
+
+/**
+ * Desk's OWN ACP worker (`grok agent … stdio`), which is not a competing owner.
+ *
+ * The registry is written by the interactive TUI and has never been observed to
+ * contain an agent-mode pid — but if that ever changed, Desk would refuse to
+ * load the very session its own worker holds and lock itself out of every chat.
+ * A terminal `grok` is never launched as `agent … stdio`, so excluding it costs
+ * the guard nothing.
+ */
+function isAcpWorker(command) {
+  if (!command) return false;
+  const argv = String(command).split(/\s+/);
+  return argv.includes("agent") && argv.includes("stdio");
+}
+
+/** Resolve a cwd through symlinks; `/tmp` vs `/private/tmp` is the macOS case. */
+function realCwd(cwd) {
+  if (!cwd) return null;
+  try {
+    return fs.realpathSync(String(cwd));
+  } catch {
+    return String(cwd);
+  }
+}
+
 /** Raw ~/.grok/active_sessions.json rows (never throws). */
 export function readActiveSessions() {
   try {
@@ -658,23 +809,68 @@ export function readActiveSessions() {
 }
 
 /**
- * The active_sessions.json entry for this session whose pid is actually alive.
- * @returns {{sessionId:string,pid:number,cwd:string|null,openedAt:string|null}|null}
+ * The live `grok` CLI process that owns this session, or null.
+ *
+ * Three gates, all of which must pass — a row on its own means nothing:
+ *   1. the row names this session id;
+ *   2. its pid is alive;
+ *   3. that pid really is a `grok` CLI (`ps`), so a recycled pid cannot
+ *      impersonate an owner.
+ *
+ * `cwd` comes back realpath'd, because the registry has been seen recording
+ * `/private/tmp/...` for a process whose argv said `/tmp/...` and the session
+ * directory key is `encodeURIComponent(cwd)`.
+ *
+ * @returns {{sessionId:string,pid:number,cwd:string|null,openedAt:string|null,
+ *            kind:"tui"|"headless",source:"registry"|"process",
+ *            command:string|null}|null}
  */
 export function sessionOwner(sessionId) {
+  if (!sessionId) return null;
   const want = String(sessionId);
   for (const row of readActiveSessions()) {
     if (!row || String(row.session_id ?? row.sessionId) !== want) continue;
     const pid = Number(row.pid);
     if (!pidAlive(pid)) continue;
+    const proc = grokProcess(pid);
+    if (!proc.grok) continue; // recycled / unrelated pid — not an owner
+    if (isAcpWorker(proc.command)) continue; // Desk's own worker, not a rival
     return {
       sessionId: want,
       pid,
-      cwd: row.cwd || null,
+      cwd: realCwd(row.cwd) || null,
       openedAt: row.opened_at || row.openedAt || null,
+      kind: "tui",
+      source: "registry",
+      command: proc.command,
+    };
+  }
+  const headless = scanResumeOwners().get(want);
+  if (headless && pidAlive(headless.pid)) {
+    const cwd = /(?:^|\s)--cwd[=\s]+(\S+)/.exec(headless.command)?.[1] || null;
+    return {
+      sessionId: want,
+      pid: headless.pid,
+      cwd: realCwd(cwd),
+      openedAt: null,
+      kind: "headless",
+      source: "process",
+      command: headless.command,
     };
   }
   return null;
+}
+
+/** Cheap change-detector for "who owns this session" (drives auto-takeover). */
+export function ownerSignature(sessionId) {
+  const o = sessionOwner(sessionId);
+  return o ? `${o.pid}:${o.kind}` : "";
+}
+
+/** Test seam — drop the ps caches so a probe re-reads the process table. */
+export function resetOwnerCache() {
+  procCache.clear();
+  resumeScan = { at: 0, byId: new Map() };
 }
 
 /** Context window usage from signals.json. */
@@ -835,7 +1031,12 @@ function emptyPayload(sessionId, from, error) {
     phase: null,
     phaseAt: null,
     turn: null,
-    owner: sessionOwner(sessionId),
+    // P4: `owner` used to be filled in here even though ok:false. A caller that
+    // gated a read-only composer on `owner` alone then locked a session whose
+    // directory does not even exist. Ownership is only ever reported alongside
+    // a real projection, so callers CANNOT get this wrong: no ok, no owner.
+    owner: null,
+    working: false,
     context: null,
     subagents: [],
     summary: null,
@@ -865,7 +1066,7 @@ function emptyPayload(sessionId, from, error) {
  *   ok:boolean, sessionId:string, cwd:string|null, dir:string|null,
  *   from:number, events:object[], seq:number,
  *   live:boolean, phase:string|null, phaseAt:number|null, turn:object|null,
- *   owner:object|null, context:object|null, subagents:object[],
+ *   owner:object|null, working:boolean, context:object|null, subagents:object[],
  *   summary:object|null, truncated:boolean, hasMore:boolean,
  *   cursor:{updatesBytes:number,eventsBytes:number,seq:number}, bytesRead:number
  * }}
@@ -917,6 +1118,7 @@ export function read(sessionId, { from = 0, limit = DEFAULT_LIMIT, cwd } = {}) {
     }
   }
 
+  const owner = sessionOwner(st.sessionId);
   return {
     ok: true,
     sessionId: st.sessionId,
@@ -929,7 +1131,11 @@ export function read(sessionId, { from = 0, limit = DEFAULT_LIMIT, cwd } = {}) {
     phase: st.phase,
     phaseAt: st.phaseAt,
     turn: st.turn,
-    owner: sessionOwner(st.sessionId),
+    owner,
+    // 56 of 958 sessions carry a turn_started with no turn_ended (a CLI that
+    // died mid-turn), so `live` alone over-reports. Computed HERE so the WS
+    // frame and GET /api/sessions/:id/feed cannot drift apart.
+    working: st.live && Boolean(owner),
     context: readContext(st.dir),
     subagents: mergeSubagents(st),
     summary: summaryOf(st.dir),
@@ -987,8 +1193,16 @@ export function unsubscribe(handle) {
   return gone;
 }
 
-/** Advance one session and push deltas to its subscribers. Call from a watcher. */
-export function poll(sessionId) {
+/**
+ * Advance one session and push deltas to its subscribers. Call from a watcher.
+ *
+ * `force` pushes a frame even when no new events landed. Ownership lives in
+ * ~/.grok/active_sessions.json and in the process table — neither of which
+ * touches the session directory — so the owner exiting produces no fs event and
+ * no new seq. Without a forced push the composer would stay locked until the
+ * user reloaded, which is exactly the auto-takeover this phase owes.
+ */
+export function poll(sessionId, { force = false } = {}) {
   const sid = String(sessionId);
   const set = subs.get(sid);
   if (!set || !set.size) return 0;
@@ -996,7 +1210,7 @@ export function poll(sessionId) {
   for (const handle of [...set]) {
     const payload = read(sid, { from: handle.lastSeq });
     if (!payload.ok) continue;
-    if (payload.seq <= handle.lastSeq && !payload.events.length) continue;
+    if (!force && payload.seq <= handle.lastSeq && !payload.events.length) continue;
     handle.lastSeq = payload.seq;
     try {
       handle.cb(payload);
@@ -1028,4 +1242,14 @@ export function cursorOf(sessionId) {
   return st ? { ...st.cursor } : null;
 }
 
-export const __internals = { lineIterator, parseUpdatesLine, parseEventsLine, pidAlive };
+export const __internals = {
+  lineIterator,
+  parseUpdatesLine,
+  parseEventsLine,
+  pidAlive,
+  grokProcess,
+  scanResumeOwners,
+  execName,
+  realCwd,
+  isAcpWorker,
+};

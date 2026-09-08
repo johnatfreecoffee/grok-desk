@@ -49,6 +49,10 @@ import {
   unsubscribe as feedUnsubscribe,
   poll as feedPoll,
   subscribedSessions,
+  sessionOwner,
+  ownerSignature,
+  ownerCoverage,
+  activeSessionsPath,
 } from "./session-feed.js";
 import { SessionWatchers, startRootWatcher } from "./session-watch.js";
 import { hasXaiApiKey, maskXaiKey, saveSecrets } from "./secrets.js";
@@ -212,6 +216,8 @@ pool.on("worker_spawned", ({ workerId }) => {
 
 /** sessionId → live turn on a *parallel* (non-globalBusy) worker */
 const parallelTurns = new Map();
+/** Load generation for POST /api/load-session (the WS handler has its own). */
+let httpLoadGen = 0;
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -636,8 +642,44 @@ async function handleApi(req, res) {
       }
       const cwd = body.cwd || findSessionCwd(sessionId);
       const transcript = loadTranscript(sessionId, cwd);
-      // Match WS rules: never steal ACP mid-turn via HTTP
-      if (globalBusy && bridge.sessionId && String(bridge.sessionId) !== String(sessionId)) {
+
+      // P4 — a live `grok` owns this session: serve the transcript, attach
+      // nothing. Same refusal the WS handler makes; this route used to be the
+      // unguarded way in.
+      const blocked = ownershipBlock(sessionId);
+      if (blocked) {
+        console.log(
+          `[own] refusing POST /api/load-session ${String(sessionId).slice(0, 8)} — ${blocked.message}`,
+        );
+        trackDeskSession(sessionId, cwd || blocked.owner.cwd);
+        sendJson(res, 200, {
+          ok: true,
+          sessionId,
+          cwd: cwd || blocked.owner.cwd || null,
+          messages: transcript.messages || [],
+          summary: transcript.summary || null,
+          truncated: transcript.truncated || false,
+          agentResumed: false,
+          viewOnly: true,
+          readOnly: true,
+          owner: blocked.owner,
+          ownerCoverage: ownerCoverage(),
+          activeSessionId: primaryTurnSessionId(),
+        });
+        return true;
+      }
+
+      // Match the WS rules. This used to look at `globalBusy` alone, so a
+      // parallel-worker turn on another session was invisible here and the HTTP
+      // route would happily steal the primary worker out from under it.
+      const liveWorker = pool.findBySession(sessionId);
+      const sameLive =
+        isSessionLive(sessionId) ||
+        (globalBusy && bridge.sessionId && String(bridge.sessionId) === String(sessionId));
+      const otherBusy =
+        (globalBusy && bridge.sessionId && String(bridge.sessionId) !== String(sessionId)) ||
+        [...parallelTurns.keys()].some((id) => String(id) !== String(sessionId));
+      if (!sameLive && !liveWorker && otherBusy) {
         sendJson(res, 200, {
           ok: true,
           sessionId,
@@ -648,11 +690,33 @@ async function handleApi(req, res) {
           agentResumed: false,
           viewOnly: true,
           activeSessionId: primaryTurnSessionId(),
+          liveSessionIds: turnSnapshot().liveSessionIds,
         });
         return true;
       }
+
+      // Load-generation guard, which this route never had: a second HTTP load
+      // that starts while this ACP resume is in flight wins, and this response
+      // must not then re-bind the worker to a session already left behind.
+      // (The WS handler keeps its own per-socket generation.)
+      const gen = ++httpLoadGen;
       const loaded = await bridge.loadSession(sessionId, cwd);
+      if (gen !== httpLoadGen) {
+        sendJson(res, 200, {
+          ok: true,
+          sessionId,
+          cwd,
+          messages: transcript.messages || [],
+          summary: transcript.summary || null,
+          truncated: transcript.truncated || false,
+          agentResumed: false,
+          superseded: true,
+          activeSessionId: primaryTurnSessionId(),
+        });
+        return true;
+      }
       trackDeskSession(loaded.sessionId, loaded.cwd || cwd);
+      pool.bindSession(pool.defaultWorker, loaded.sessionId, loaded.cwd || cwd);
       sendJson(res, 200, {
         ok: true,
         sessionId: loaded.sessionId,
@@ -872,6 +936,102 @@ function syncSessionWatchers() {
     console.warn("[watch] sync failed:", e.message);
     return sessionWatchers.stats();
   }
+}
+
+/* ------------------------------------------------------- P4 · ownership */
+
+/**
+ * The clobber guard.
+ *
+ * `chat_history.jsonl` is whole-file rewritten by the CLI, not appended: at the
+ * end of a turn each process serialises ITS OWN view of the conversation. If a
+ * terminal `grok` and a Desk ACP worker both hold the same session, the last
+ * writer wins and the other process's turns are gone. Desk therefore never
+ * attaches an ACP worker to a session a live `grok` owns — it projects the
+ * transcript from disk instead and says so.
+ *
+ * @returns {{owner:object, message:string}|null} null = safe to attach
+ */
+function ownershipBlock(sessionId) {
+  if (!sessionId) return null;
+  let owner = null;
+  try {
+    owner = sessionOwner(sessionId);
+  } catch (e) {
+    console.warn("[own] probe failed:", e.message);
+    return null;
+  }
+  if (!owner) return null;
+  const where = owner.kind === "headless" ? "a headless grok run" : "a terminal grok";
+  return {
+    owner,
+    message:
+      `Open in ${where} (pid ${owner.pid}) — read-only here until it exits. ` +
+      `Attaching would let the two processes overwrite each other's turns.`,
+  };
+}
+
+/**
+ * Auto-takeover: push ownership transitions without waiting for a page reload.
+ *
+ * Ownership lives in ~/.grok/active_sessions.json and in the process table.
+ * Neither touches the session directory, so the owner exiting fires no fs event
+ * and produces no new seq — `poll()` would have nothing to send and the
+ * composer would stay locked until the user reloaded.
+ *
+ * A tick, deliberately, not an fs.watch: on macOS Node's fs.watch is
+ * FSEvents-backed and a watch on ~/.grok reports changes from deep inside
+ * ~/.grok/sessions too, so it would wake on every append of every one of ~950
+ * sessions. This costs one small JSON read per SUBSCRIBED session per tick and
+ * nothing at all when nobody is tailing anything. It also catches the case a
+ * file watch cannot see: a headless run whose pid simply vanished, leaving its
+ * row (or no row at all) behind.
+ *
+ * Only sessions whose owner actually changed are pushed.
+ */
+const OWNER_TICK_MS = Number(process.env.DESK_OWNER_TICK_MS || 1000);
+/** sessionId → last seen owner signature ("" = nobody). */
+const ownerSigs = new Map();
+let ownerTimer = null;
+
+function ownershipTick(reason = "tick") {
+  let changed = 0;
+  const seen = new Set();
+  for (const sid of subscribedSessions()) {
+    seen.add(sid);
+    let sig = "";
+    try {
+      sig = ownerSignature(sid);
+    } catch {
+      continue;
+    }
+    if (ownerSigs.get(sid) === sig) continue;
+    const had = ownerSigs.has(sid);
+    ownerSigs.set(sid, sig);
+    if (!had) continue; // first sighting: subscribe() already sent the truth
+    changed += 1;
+    console.log(
+      `[own] ${sid.slice(0, 8)} owner → ${sig || "none"} (${reason}) — pushing takeover`,
+    );
+    try {
+      feedPoll(sid, { force: true });
+    } catch (e) {
+      console.warn("[own] force poll failed:", e.message);
+    }
+  }
+  for (const sid of [...ownerSigs.keys()]) if (!seen.has(sid)) ownerSigs.delete(sid);
+  return changed;
+}
+
+function startOwnershipWatcher() {
+  const cov = ownerCoverage();
+  console.log(
+    `[own] ownership from ${activeSessionsPath()} + the process table — registry:${cov.registry} ` +
+      `resumed-headless:${cov.resumedHeadless} new-headless:${cov.newHeadless} ` +
+      `(a headless run that opened its own session id is not attributable to it)`,
+  );
+  ownerTimer = setInterval(() => ownershipTick("tick"), OWNER_TICK_MS);
+  if (typeof ownerTimer.unref === "function") ownerTimer.unref();
 }
 
 /**
@@ -2334,9 +2494,11 @@ wss.on("connection", (ws, req) => {
       turn: payload.turn ?? null,
       truncated: Boolean(payload.truncated),
       hasMore,
-      // 56 of 958 sessions carry a turn_started with no turn_ended (the CLI
-      // died mid-turn). `live` alone over-reports, so gate on live && owner.
-      working: live && Boolean(owner),
+      // `live && owner` — computed once inside the projector so this frame and
+      // GET /api/sessions/:id/feed carry the same value, not two copies of the
+      // same rule that can drift. (56 of 958 sessions carry a turn_started with
+      // no turn_ended from a CLI that died mid-turn; `live` alone over-reports.)
+      working: payload.working != null ? Boolean(payload.working) : live && Boolean(owner),
       ...extra,
     });
     if (st.dropped > before) {
@@ -2938,6 +3100,42 @@ wss.on("connection", (ws, req) => {
         const cwd = msg.cwd ? path.resolve(String(msg.cwd)) : findSessionCwd(sessionId);
         const transcript = loadTranscript(sessionId, cwd);
 
+        // P4 — CRITICAL: a live `grok` owns this session. Do NOT attach the ACP
+        // worker at all: serve the transcript from disk and mark it read-only.
+        // This is the one thing that stops chat_history.jsonl being clobbered.
+        const blocked = ownershipBlock(sessionId);
+        if (blocked) {
+          console.log(
+            `[own] refusing session/load ${String(sessionId).slice(0, 8)} — ${blocked.message}`,
+          );
+          trackDeskSession(sessionId, cwd || blocked.owner.cwd);
+          send({
+            type: "session_loaded",
+            sessionId,
+            cwd: cwd || blocked.owner.cwd || null,
+            messages: transcript.messages || [],
+            summary: transcript.summary || null,
+            truncated: transcript.truncated || false,
+            agentResumed: false,
+            viewOnly: true,
+            readOnly: true,
+            owner: blocked.owner,
+            ownerCoverage: ownerCoverage(),
+            activeSessionId: primaryTurnSessionId(),
+            liveSessionIds: turnSnapshot().liveSessionIds,
+            partialDraft: null,
+          });
+          send({
+            type: "session_status",
+            state: "history_only",
+            sessionId,
+            cwd: cwd || blocked.owner.cwd || null,
+            owner: blocked.owner,
+            readOnly: true,
+          });
+          return;
+        }
+
         // CRITICAL: never abandon an in-flight turn just to browse another chat.
         // Phase 2: attach if this session is live on any worker.
         const liveWorker = pool.findBySession(sessionId);
@@ -3114,6 +3312,21 @@ wss.on("connection", (ws, req) => {
         sendError("Empty prompt", { sessionId });
         return;
       }
+      // Same guard as load_session: sending would load the session onto an ACP
+      // worker, and two processes rewriting chat_history.jsonl lose each other's
+      // turns. A stale client that missed the read-only frame is refused here.
+      const promptBlocked = ownershipBlock(sessionId);
+      if (promptBlocked) {
+        sendError(promptBlocked.message, { sessionId, code: "session_owned" });
+        send({
+          type: "session_status",
+          state: "history_only",
+          sessionId,
+          readOnly: true,
+          owner: promptBlocked.owner,
+        });
+        return;
+      }
       const job = { text, attachments, sessionId, clientMsgId };
 
       // This session already mid-turn (primary or parallel) → enqueue
@@ -3243,6 +3456,7 @@ server.listen(PORT, "127.0.0.1", async () => {
     /* */
   }
   startSessionWatcher();
+  startOwnershipWatcher();
   try {
     ensureVapidKeys();
   } catch (e) {

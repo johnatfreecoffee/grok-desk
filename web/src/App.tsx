@@ -22,6 +22,7 @@ import {
   loadPersistedFeed,
   persistFeed,
   type FeedFrame,
+  type FeedOwner,
 } from "./lib/sessionFeed";
 import {
   artifactsFromDraft,
@@ -300,6 +301,8 @@ function DeskApp() {
   const [historyOnly, setHistoryOnly] = useState(false);
   /** A terminal `grok` owns this session (feed `owner && ok`) — no sending. */
   const [readOnly, setReadOnly] = useState(false);
+  /** The owning CLI process, so the banner can name it instead of guessing. */
+  const [owner, setOwner] = useState<FeedOwner | null>(null);
   /** UI flag: browsing another chat while a turn runs elsewhere */
   const [viewOnlyBrowse, setViewOnlyBrowse] = useState(false);
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>({});
@@ -615,7 +618,10 @@ function DeskApp() {
     busyRef.current = working;
     setBusy(working);
     // owner && ok — `owner` alone is populated even when the dir is gone (P2 QC).
+    // The daemon now refuses to report an owner without a real projection, and
+    // pushes a frame the moment that owner exits, so this unlocks by itself.
     setReadOnly(Boolean(st?.readOnly));
+    setOwner(st?.readOnly ? st.owner : null);
     setBgWorkingBanner(otherWorkingId(sid) !== null);
   }, [otherWorkingId]);
 
@@ -2178,7 +2184,12 @@ function DeskApp() {
         void buildApi.sessionRename(sessionId, title).then(() => setSidebarTick((n) => n + 1));
       },
       onDeleteSession: (sessionId, cwd) => {
-        void buildApi.sessionDelete(sessionId, cwd).then(() => setSidebarTick((n) => n + 1));
+        void buildApi.sessionDelete(sessionId, cwd).then((res) => {
+          // Delete is refused while a live `grok` holds the session store. Say
+          // so — silently doing nothing is worse than the refusal.
+          if (res && res.ok === false) setError(res.error || "Could not delete this chat.");
+          setSidebarTick((n) => n + 1);
+        });
       },
       liveAgents,
       liveSessionIds,
@@ -2824,8 +2835,10 @@ function DeskApp() {
         )}
         {readOnly && (
           <div className="banner info" role="status">
-            Running in Terminal — this chat is read-only here. It becomes sendable
-            when that <code>grok</code> exits.
+            {owner?.kind === "headless" ? "Running headless" : "Running in Terminal"}
+            {owner?.pid ? ` · pid ${owner.pid}` : ""} — this chat is read-only here so
+            the two processes cannot overwrite each other's turns. It becomes
+            sendable on its own when that <code>grok</code> exits.
           </div>
         )}
         {historyOnly && agent?.sessionId?.startsWith("mail:") && (
@@ -2869,7 +2882,7 @@ function DeskApp() {
             </button>
           </div>
         )}
-        {historyOnly && !viewOnlyBrowse && !agent?.sessionId?.startsWith("mail:") && (
+        {historyOnly && !viewOnlyBrowse && !readOnly && !agent?.sessionId?.startsWith("mail:") && (
           <div className="banner" role="status">
             This is the same chat. Send continues it — attaching the agent if needed.
           </div>
