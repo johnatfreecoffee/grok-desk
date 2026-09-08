@@ -46,7 +46,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
     from the phone leaves the Mac's other turn running; a crashed-mid-turn session does not
     show as working
 
-- [ ] **P3 Client projection** — `web/src/lib/sessionFeed.ts`
+- [x] **P3 Client projection** — `web/src/lib/sessionFeed.ts`
   - App renders from the feed; cursor in `localStorage`; resubscribe on visibility + reconnect
   - Delete the dead `lib/sessionStore.ts` layer and the four divergent finalize paths
   - Rewrite `scripts/session-store-unit.mjs` against the code that ships
@@ -64,6 +64,11 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
     3. Normalize cwd with `realpath` before `encodeURIComponent`. The registry recorded
        `/private/tmp/...` while the process argv said `/tmp/...`; on macOS that symlink
        mismatch makes `findSessionDir` miss.
+  - **Headless `grok -p` never registers in `active_sessions.json`** (found in P3), so
+    read-only never fires for headless CLI runs. Detect those another way or say plainly
+    that only TUI sessions are owned.
+  - `GET /api/sessions/:id/feed` omits `working` (the WS `feed` frame has it). Make the two
+    payloads the same shape.
   - Proof: `npm run smoke:cli`; a terminal turn during a Desk view loses nothing either side
 
 - [ ] **P5 Retire the shadow stores**
@@ -71,6 +76,11 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Stop writing `desk-messages.json` (read-only legacy fallback)
   - Fix the dead `desk-index` prune (`idx.sessions` vs `idx.sessionIds`); atomic writes
   - Replace the 4000 / 8000 / 200-row truncation with a tail window + "load earlier"
+  - **The daemon does not kill its ACP children on SIGTERM** — that is how a worker leaked a
+    `grok` process for 16 hours holding a stale ownership entry. Reap the pool on shutdown.
+  - `deliverFeed` labels each frame's `fromSeq` with `handle.lastSeq` *at send time*, which
+    can run ahead of the events the frame carries when a concurrent poll advances the handle.
+    P3 works around it client-side by judging a gap on evidence; fix the label at the source.
   - Proof: a > 18 min turn completes untouched; full history reachable
 
 - [ ] **P6 Terminal fidelity**
