@@ -402,7 +402,13 @@ async function handleApi(req, res) {
   if (url.pathname === "/api/restart" && req.method === "POST") {
     try {
       abandonTurn({ restart: true, reason: "api_restart" });
-      const status = await bridge.restart();
+      // P5 — Restart means the whole pool, not just the default worker.
+      // `restartAll` existed and was called from nowhere, so every extra worker
+      // (and its `grok agent`) survived the user pressing Restart.
+      await pool.restartAll();
+      syncDefaultBridge();
+      const status = bridge.status();
+      broadcastAgents();
       sendJson(res, 200, { ok: true, agent: status, ...turnSnapshot() });
     } catch (e) {
       sendJson(res, 500, { ok: false, error: e.message || String(e) });
@@ -590,14 +596,31 @@ async function handleApi(req, res) {
     return true;
   }
 
-  // GET /api/sessions/:id/feed?from=<seq>&limit=<n>&cwd=
+  // GET /api/sessions/:id/feed?from=<seq>&to=<seq>&limit=<n>&cwd=
+  //
+  // Without `to` this is the plain projector read (P1).
+  // With `to` it is P5's "load earlier": one bounded WINDOW of older history,
+  // `from` exclusive → `to` inclusive. See `readFeedWindow`.
   const feedMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/feed$/);
   if (feedMatch && req.method === "GET") {
     const sessionId = decodeURIComponent(feedMatch[1]);
     const cwd = url.searchParams.get("cwd") || undefined;
     const fromRaw = Number(url.searchParams.get("from"));
+    const toRaw = Number(url.searchParams.get("to"));
     const limitRaw = Number(url.searchParams.get("limit"));
     try {
+      if (Number.isFinite(toRaw) && toRaw > 0) {
+        sendJson(
+          res,
+          200,
+          readFeedWindow(sessionId, {
+            from: Number.isFinite(fromRaw) ? fromRaw : 0,
+            to: toRaw,
+            cwd,
+          }),
+        );
+        return true;
+      }
       sendJson(
         res,
         200,
@@ -873,8 +896,89 @@ function broadcastJson(obj) {
 
 /** Hard cap on one `feed` frame — a client that has been away paginates. */
 const FEED_MAX_EVENTS = Number(process.env.DESK_FEED_MAX_EVENTS || 500);
+
+/* -------------------------------------------------- P5 "load earlier" */
+
+/**
+ * `read({from: 0})` means "the tail window", so seq 1 is unreachable with any
+ * positive integer cursor. A fractional cursor below 1 asks for everything
+ * from the very first event without tripping the tail-window branch.
+ */
+const FEED_HISTORY_START = 0.5;
+/**
+ * Scan budget for a history window.
+ *
+ * The projector keeps a bounded ring; paging into evicted history makes it
+ * rescan from byte 0 with `maxBuffer = max(limit, 3000)`. With the default
+ * limit that ring evicts the OLDEST matches — exactly the ones "load earlier"
+ * is asking for — so the window has to name a budget big enough to hold the
+ * whole scan. The window itself is then sliced to `to`, so what crosses the
+ * wire stays bounded by the page the client asked for.
+ */
+const FEED_SCAN_LIMIT = Number(process.env.DESK_FEED_SCAN_LIMIT || 500_000);
+
+/** How often idle ACP workers are reaped. */
+const POOL_REAP_TICK_MS = Number(process.env.DESK_POOL_REAP_MS || 60_000);
+/** SIGTERM → SIGKILL grace for the pool's `grok agent` children. */
+const SHUTDOWN_GRACE_MS = Number(process.env.DESK_SHUTDOWN_GRACE_MS || 700);
 /** Minimum gap between two phase markers on the wire. */
 const FEED_PHASE_MIN_MS = Number(process.env.DESK_FEED_PHASE_MS || 250);
+
+/**
+ * One bounded window of older history: events with `from < seq <= to`.
+ *
+ * This is what backs "load earlier". The client folds the window through a
+ * throwaway reducer and prepends the rows it produces; its live cursor and its
+ * live subscription are untouched.
+ *
+ * @param {string} sessionId
+ * @param {{from?:number, to:number, cwd?:string}} opts
+ */
+function readFeedWindow(sessionId, { from = 0, to, cwd } = {}) {
+  const toSeq = Math.floor(Number(to));
+  if (!Number.isFinite(toSeq) || toSeq <= 0) {
+    return { ok: false, error: "to required", sessionId, events: [] };
+  }
+  const wanted = Number(from);
+  const fromSeq =
+    Number.isFinite(wanted) && wanted > FEED_HISTORY_START ? wanted : FEED_HISTORY_START;
+  // Always scan from the very first event. Paging into evicted history rescans
+  // the whole log anyway, and the full scan is the only way to know the
+  // session's oldest seq — which is what tells the client it has reached the
+  // start instead of guessing from an empty page.
+  const payload = readSessionFeed(sessionId, {
+    from: FEED_HISTORY_START,
+    limit: FEED_SCAN_LIMIT,
+    cwd,
+  });
+  if (!payload.ok) {
+    return { ok: false, error: payload.error || "session not found", sessionId, events: [] };
+  }
+  const all = Array.isArray(payload.events) ? payload.events : [];
+  const oldestSeq = all.length ? Number(all[0].seq) : 0;
+  // `phase` is 88% of all events and drives nothing but the live indicator —
+  // history has no live indicator, so it never goes on the wire here.
+  const events = all.filter(
+    (e) => Number(e.seq) > fromSeq && Number(e.seq) <= toSeq && e.kind !== "phase",
+  );
+  return {
+    ok: true,
+    sessionId: payload.sessionId,
+    cwd: payload.cwd,
+    from: fromSeq,
+    to: toSeq,
+    /** Seq of the very first event on disk — the client's stop condition. */
+    oldestSeq,
+    /** This window already reaches the first event of the session. */
+    atStart: fromSeq <= oldestSeq,
+    events,
+    count: events.length,
+    /** Cheap proof the scan itself was not truncated by the projector's ring. */
+    scanned: all.length,
+    firstSeq: events.length ? Number(events[0].seq) : null,
+    lastSeq: events.length ? Number(events[events.length - 1].seq) : null,
+  };
+}
 
 /**
  * Collapse consecutive identical `phase` events and rate-limit what is left.
@@ -1088,14 +1192,24 @@ const recentClientMsgIds = new Map();
 const projectCtxInjected = new Set();
 /** Pending queue-drain timer — cancelled on abandon */
 let queueDrainTimer = null;
-/** Wall / stall watchdog timers */
-let turnWallTimer = null;
-let turnStallTimer = null;
 /** Last time any WS client answered pong (push skip needs liveness, not mere OPEN) */
 let lastClientPongAt = 0;
 
-const TURN_WALL_MS = Number(process.env.DESK_TURN_WALL_MS || 18 * 60 * 1000);
-const TURN_STALL_MS = Number(process.env.DESK_TURN_STALL_MS || 6 * 60 * 1000);
+/**
+ * P5 — NO TIMER MAY EVER END A TURN.
+ *
+ * There used to be two: an 18-minute wall clock and a 6-minute stall watchdog,
+ * both firing `abandonTurn({ restart: true })` — they killed the turn AND
+ * restarted the agent. A factory phase runs far longer than 18 minutes and a
+ * single long tool call is quiet for far longer than 6, so both fired on
+ * healthy turns and destroyed real work.
+ *
+ * `turn_ended` in `events.jsonl` is ground truth now and P4's ownership probe
+ * says whether the process is still alive. A turn that has genuinely gone
+ * quiet surfaces as a badge (`lastActivityAt` in `turnSnapshot()`) next to the
+ * Stop button — a decision the user makes, never a silent kill.
+ */
+const QUIET_BADGE_MS = 6 * 60 * 1000;
 
 function emitTurn(obj) {
   broadcastJson(obj);
@@ -1272,6 +1386,9 @@ function turnSnapshot() {
     phase: activeTurn?.phase || null,
     turnStartedAt: activeTurn?.startedAt || null,
     lastActivityAt: activeTurn?.lastActivityAt || null,
+    // P5 — the badge that replaced the stall watchdog. It reports; it never acts.
+    turnQuiet: turnQuietMs() >= QUIET_BADGE_MS,
+    turnQuietMs: turnQuietMs(),
     partialDraft: partialDraftFromActive(),
     parallelDrafts: parallelDrafts(),
     liveSessionIds: liveSessionIdSet(),
@@ -1288,17 +1405,6 @@ function broadcastAgents() {
   broadcastJson({ type: "agents_roster", agents: pool.list(), ...turnSnapshot() });
 }
 
-function clearTurnWatchdogs() {
-  if (turnWallTimer) {
-    clearTimeout(turnWallTimer);
-    turnWallTimer = null;
-  }
-  if (turnStallTimer) {
-    clearTimeout(turnStallTimer);
-    turnStallTimer = null;
-  }
-}
-
 function clearQueueDrainTimer() {
   if (queueDrainTimer) {
     clearTimeout(queueDrainTimer);
@@ -1306,38 +1412,23 @@ function clearQueueDrainTimer() {
   }
 }
 
+/**
+ * Stamp real stream activity on the live turn.
+ *
+ * This used to also (re)arm the stall watchdog. It no longer arms anything:
+ * the stamp is read by `turnSnapshot()` so the UI can badge a quiet turn.
+ */
 function touchTurnActivity() {
   if (!activeTurn) return;
   activeTurn.lastActivityAt = new Date().toISOString();
-  // Reset stall timer on real stream activity
-  if (turnStallTimer) {
-    clearTimeout(turnStallTimer);
-    turnStallTimer = null;
-  }
-  if (globalBusy && TURN_STALL_MS > 0) {
-    const epoch = activeTurn.gen;
-    turnStallTimer = setTimeout(() => {
-      if (!globalBusy || activeTurn?.gen !== epoch) return;
-      console.warn("[desk] turn stall watchdog — no stream activity", TURN_STALL_MS, "ms");
-      abandonTurn({
-        restart: true,
-        reason: "stall_timeout",
-      });
-    }, TURN_STALL_MS);
-  }
 }
 
-function armTurnWatchdogs(epoch) {
-  clearTurnWatchdogs();
-  if (TURN_WALL_MS > 0) {
-    turnWallTimer = setTimeout(() => {
-      if (!globalBusy) return;
-      // Only fire if still same epoch family (abandon bumps gen)
-      console.warn("[desk] turn wall watchdog", TURN_WALL_MS, "ms epoch", epoch);
-      abandonTurn({ restart: true, reason: "wall_timeout" });
-    }, TURN_WALL_MS);
-  }
-  touchTurnActivity();
+/** How long the live turn has been silent, in ms. 0 when no turn is running. */
+function turnQuietMs() {
+  if (!globalBusy || !activeTurn) return 0;
+  const last = Date.parse(activeTurn.lastActivityAt || activeTurn.startedAt || "");
+  if (!Number.isFinite(last)) return 0;
+  return Math.max(0, Date.now() - last);
 }
 
 /**
@@ -1366,7 +1457,6 @@ function releaseBusy(epoch, reason = "release") {
   activeTurn = null;
   claimSessionId = null;
   pool.setBusy(pool.defaultWorker, false);
-  clearTurnWatchdogs();
   console.log("[desk] releaseBusy", reason, "epoch", epoch);
   return true;
 }
@@ -1384,7 +1474,6 @@ function endTurnTerminal(opts = {}) {
   } = opts;
   // Only emit + clear if we still own the epoch (or abandon already bumped and wasBusy handled)
   if (epoch === globalTurnGen) {
-    clearTurnWatchdogs();
     globalBusy = false;
     activeTurn = null;
     claimSessionId = null;
@@ -1417,7 +1506,6 @@ function abandonTurn(opts = {}) {
   const endedSid = activeTurn?.sessionId || bridge.sessionId || null;
   globalTurnGen += 1;
   clearQueueDrainTimer();
-  clearTurnWatchdogs();
   if (hard) sessionQueues.clear();
   globalBusy = false;
   activeTurn = null;
@@ -1618,7 +1706,6 @@ async function runPromptJob(text, attachments, opts = {}) {
     draftId,
   };
   claimSessionId = null; // activeTurn now names the session honestly
-  armTurnWatchdogs(gen);
   console.log(
     "[desk] turn start",
     jobSessionId ? jobSessionId.slice(0, 8) : "pending",
@@ -1763,31 +1850,13 @@ async function runPromptJob(text, attachments, opts = {}) {
       });
     };
 
-    /** Shadow mid-turn so phone reload / WS flaps still see progress */
-    let lastShadowAt = 0;
-    let lastShadowLen = 0;
-    const shadowPartial = (force = false) => {
-      if (!jobSessionId) return;
-      const len = assistantBuf.length + thoughtBuf.length + toolsBuf.length * 20;
-      const now = Date.now();
-      if (!force && now - lastShadowAt < 1500 && len - lastShadowLen < 80) return;
-      lastShadowAt = now;
-      lastShadowLen = len;
-      if (!assistantBuf.trim() && !thoughtBuf.trim() && !toolsBuf.length) return;
-      try {
-        upsertDeskMessage(jobSessionId, {
-          id: draftId,
-          role: "assistant",
-          content: assistantBuf,
-          thought: thoughtBuf || undefined,
-          tools: toolsBuf.length ? toolsBuf.map((x) => ({ ...x })) : undefined,
-          plan: planBuf.length ? planBuf : undefined,
-          streaming: true,
-        });
-      } catch {
-        /* */
-      }
-    };
+    /*
+     * P5 — the mid-turn shadow write is gone.
+     *
+     * `shadowPartial()` re-serialised the whole `desk-messages.json` on every
+     * chunk so a phone reload could see progress. The feed does that from
+     * `updates.jsonl` now, at the cursor, with no third copy to keep honest.
+     */
 
     // Throttled partial_draft for mobile HTTP poll fallback (WS flaps)
     let lastPartialBroadcast = 0;
@@ -1817,7 +1886,6 @@ async function runPromptJob(text, attachments, opts = {}) {
               activeTurn.phase = "writing";
             }
             touchTurnActivity();
-            shadowPartial();
             broadcastPartial();
           }
         } else if (kind === "agent_thought_chunk") {
@@ -1826,7 +1894,6 @@ async function runPromptJob(text, attachments, opts = {}) {
             thoughtBuf += t;
             if (activeTurn) activeTurn.thought = thoughtBuf;
             touchTurnActivity();
-            shadowPartial();
             broadcastPartial();
           }
         } else if (kind === "tool_call") {
@@ -1841,7 +1908,6 @@ async function runPromptJob(text, attachments, opts = {}) {
           });
           if (activeTurn) activeTurn.tools = toolsBuf.map((x) => ({ ...x }));
           emitPhase();
-          shadowPartial(true);
           broadcastPartial(true);
         } else if (kind === "tool_call_update") {
           const id = String(update.toolCallId || update.tool_call_id || update.id || "");
@@ -1895,7 +1961,6 @@ async function runPromptJob(text, attachments, opts = {}) {
       status: "done",
     });
     // Clear activeTurn before turn_end so snapshot is idle for racing status polls
-    clearTurnWatchdogs();
     activeTurn = null;
     emitTurn({
       type: "turn_end",
@@ -1956,7 +2021,6 @@ async function runPromptJob(text, attachments, opts = {}) {
       sessionId: jobSessionId,
       status: "error",
     });
-    clearTurnWatchdogs();
     activeTurn = null;
     emitTurn({
       type: "turn_end",
@@ -1991,7 +2055,6 @@ async function runPromptJob(text, attachments, opts = {}) {
         claimSessionId = next.sessionId ? String(next.sessionId) : null;
         pool.setBusy(pool.defaultWorker, true);
         activeTurn = null;
-        clearTurnWatchdogs();
         emitQueueUpdate(next.sessionId || null, { starting: true });
         clearQueueDrainTimer();
         queueDrainTimer = setTimeout(() => {
@@ -2003,7 +2066,6 @@ async function runPromptJob(text, attachments, opts = {}) {
         claimSessionId = null;
         pool.setBusy(pool.defaultWorker, false);
         activeTurn = null;
-        clearTurnWatchdogs();
         emitQueueUpdate(jobSessionId || null);
         broadcastAgents();
       }
@@ -2422,7 +2484,10 @@ wss.on("connection", (ws, req) => {
   /**
    * Subscriptions are PER SOCKET. Mac and phone can tail the same session at
    * different cursors; each keeps its own handle and its own phase state.
-   * @type {Map<string, {id:number,sessionId:string,lastSeq:number}>}
+   *
+   * `lastSeq` belongs to the projector (it moves it on every read). `sentSeq`
+   * belongs to us: the last seq this socket actually shipped for this session.
+   * @type {Map<string, {id:number,sessionId:string,lastSeq:number,sentSeq:number}>}
    */
   const feedSubs = new Map();
   /** sessionId → phase coalescing state for THIS socket. */
@@ -2434,11 +2499,22 @@ wss.on("connection", (ws, req) => {
    * Cursor arithmetic uses the RAW event list so phase coalescing can never
    * make the client skip an event: we advance to the last raw seq we saw and
    * only then drop the phase noise from what goes on the wire.
+   *
+   * P5 — `fromSeq` is the label that tells the client what this frame CONTINUES
+   * FROM, so it is computed from the events the frame carries, not from
+   * `handle.lastSeq` at send time. `handle.lastSeq` is owned by the projector:
+   * `subscribe()` and `poll()` both slam it to the file's newest seq BEFORE
+   * calling us, which is routinely ahead of the events in this frame. Labelling
+   * from it manufactured a phantom gap on every catch-up and on every capped
+   * delta. `sentSeq` is ours: the last seq this socket actually put on the wire
+   * for this session, so a label that is ahead of the client's cursor is now
+   * real evidence of loss. (The client keeps its own defensive check.)
    */
   const deliverFeed = (sessionId, handle, payload, extra = {}) => {
     if (ws.readyState !== ws.OPEN) return;
-    const fromSeq = handle.lastSeq;
+    const baseline = Number.isFinite(handle.sentSeq) ? handle.sentSeq : handle.lastSeq;
     if (!payload || payload.ok === false) {
+      const fromSeq = baseline;
       send({
         type: "feed",
         sessionId,
@@ -2470,6 +2546,11 @@ wss.on("connection", (ws, req) => {
       capped = true;
     }
     const cursorSeq = raw.length ? raw[raw.length - 1].seq : payload.seq;
+    // The label the client judges continuity by: never ahead of the first event
+    // this frame actually carries.
+    const fromSeq = raw.length
+      ? Math.min(baseline, Number(raw[0].seq) - 1)
+      : Math.min(baseline, Number(payload.seq) || baseline);
     let st = feedPhase.get(sessionId);
     if (!st) {
       st = { lastPhase: null, lastPhaseAt: 0, dropped: 0 };
@@ -2478,6 +2559,7 @@ wss.on("connection", (ws, req) => {
     const before = st.dropped;
     const events = coalescePhaseEvents(raw, st);
     handle.lastSeq = cursorSeq;
+    handle.sentSeq = cursorSeq;
     const live = Boolean(payload.live);
     const owner = payload.owner ?? null;
     const hasMore = Boolean(payload.hasMore) || capped;
@@ -2624,6 +2706,9 @@ wss.on("connection", (ws, req) => {
       });
       feedSubs.set(sessionId, handle);
       handle.lastSeq = fromSeq;
+      // Our own cursor — the projector's `subscribe()` has already slammed
+      // `lastSeq` to the file's newest seq, which is not what we have sent.
+      handle.sentSeq = fromSeq;
       const stats = syncSessionWatchers();
       console.log(
         `[feed] subscribe ${sessionId.slice(0, 8)} from ${fromSeq} — watching ${stats.sessions} session(s)`,
@@ -3506,15 +3591,67 @@ server.listen(PORT, "127.0.0.1", async () => {
       console.warn("[auto] tick failed:", e.message),
     );
   }, 30_000);
+  /*
+   * P5 — reap idle ACP workers.
+   *
+   * `pool.stopWorker` existed but was called from nowhere, so a parallel
+   * dispatch's worker (and its `grok agent` child) lived until the daemon was
+   * restarted. Three or four survivors after a test run was normal, and each
+   * one pinned a session.
+   */
+  setInterval(() => {
+    void pool
+      .reapIdle()
+      .then((ids) => {
+        if (ids.length) broadcastAgents();
+      })
+      .catch((e) => console.warn("[pool] reap failed:", e.message || e));
+  }, POOL_REAP_TICK_MS);
   // Warm the agent process only — no orphan session/new
   bridge.ensure().catch((e) => console.warn("[acp] warm start failed:", e.message));
 });
 
+/**
+ * P5 — the daemon takes its `grok agent` children with it.
+ *
+ * `bridge.stop()` only ever touched the DEFAULT worker, so every other pool
+ * worker's agent was orphaned on SIGTERM. One of those survivors held a stale
+ * `active_sessions.json` entry for 16 hours and made a dead session look owned.
+ * `pool.stopAll()` SIGTERMs all of them; anything still alive after the grace
+ * window gets SIGKILL before we exit.
+ */
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log("\n[desk] shutting down");
-  bridge.stop();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 1500);
+  let pids = [];
+  try {
+    pids = pool.stopAll();
+  } catch (e) {
+    console.warn("[desk] pool stopAll failed", e.message || e);
+  }
+  try {
+    server.close();
+  } catch {
+    /* */
+  }
+  setTimeout(() => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        continue; // already reaped by SIGTERM
+      }
+      try {
+        console.warn(`[desk] SIGKILL leftover agent pid ${pid}`);
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* */
+      }
+    }
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

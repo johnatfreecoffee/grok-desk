@@ -71,20 +71,28 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
     payloads the same shape.
   - Proof: `npm run smoke:cli`; a terminal turn during a Desk view loses nothing either side
 
-- [ ] **P5 Retire the shadow stores**
-  - Delete the 18 m wall / 6 m stall auto-abandon; stalled turn = badge + manual Stop
-  - Stop writing `desk-messages.json` (read-only legacy fallback)
-  - Fix the dead `desk-index` prune (`idx.sessions` vs `idx.sessionIds`); atomic writes
-  - Replace the 4000 / 8000 / 200-row truncation with a tail window + "load earlier"
-  - **The ACP pool never reaps workers.** `pool.stopWorker` / `restartAll` exist but are called
-    from nowhere, so spawned workers accumulate until a daemon restart (observed: 3 idle
-    workers after test runs). Wire them up.
-  - **The daemon does not kill its ACP children on SIGTERM** — that is how a worker leaked a
-    `grok` process for 16 hours holding a stale ownership entry. Reap the pool on shutdown.
-  - `deliverFeed` labels each frame's `fromSeq` with `handle.lastSeq` *at send time*, which
-    can run ahead of the events the frame carries when a concurrent poll advances the handle.
-    P3 works around it client-side by judging a gap on evidence; fix the label at the source.
-  - Proof: a > 18 min turn completes untouched; full history reachable
+- [x] **P5 Retire the shadow stores**
+  - Deleted the 18 m wall / 6 m stall auto-abandon; a quiet turn is a badge + manual Stop
+    (`turnQuietMs` in `turnSnapshot()` → `WorkingStrip`)
+  - **Also deleted the 10-minute `session/prompt` RPC timeout** in `daemon/acp-bridge.js`,
+    found while proving the above: it ended a real turn *before* the 18 m wall could
+    ("no turn is ever killed by a Desk timer" means this one too)
+  - Stopped writing `desk-messages.json` (read-only legacy fallback; John's file untouched).
+    `appendDeskMessage` / `upsertDeskMessage` survive only as the sidebar sort-key seam
+  - Fixed the dead `desk-index` prune (`idx.sessions` → `idx.sessionIds`); `saveSettings`
+    is now tmp+rename like `saveDeskIndex`
+  - "Load earlier": `GET /api/sessions/:id/feed?from=&to=` serves one bounded window of
+    older history; the client folds it through its own reducer and prepends the rows, so
+    the live tail and its cursor are never disturbed
+  - ACP pool reaping: `reapIdle()` on a 60 s tick, `restartAll()` wired to `/api/restart`,
+    `stopAll()` on SIGTERM/SIGINT with a SIGKILL escalation
+  - Every `grok agent` pid a bridge spawns is tracked (`spawnedPids`). Two overlapping
+    restarts used to leave a child with no handle at all — that is the process that
+    outlived the daemon holding a stale ownership entry
+  - `deliverFeed` labels `fromSeq` from the events the frame carries (`handle.sentSeq`),
+    not from the projector's cursor at send time. The client's defensive check stays
+  - Proof: `npm run smoke:longturn` (19 min turn, untouched, with the old env knobs set to
+    seconds); full history reachable (5 → 159 rows on a 95k-event session)
 
 - [x] **P6 Terminal fidelity**
   - Subagent strip at the top of the chat: type, description, status, duration, tools;

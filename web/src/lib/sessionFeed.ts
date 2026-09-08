@@ -158,6 +158,18 @@ export type SessionFeedState = {
   turn: FeedTurn | null;
   /** Older history exists behind the tail window ("load earlier"). */
   truncated: boolean;
+  /**
+   * P5 — rows loaded by "load earlier", in front of the live projection.
+   *
+   * The reducer only folds FORWARD, so older events cannot be pushed into it.
+   * A history window is folded through its own throwaway reducer and the rows
+   * it produces are kept here; every repaint re-joins them to the live rows.
+   */
+  historyPrefix: ChatMessage[];
+  /** Exclusive lower bound of loaded history. 0 = nothing older loaded yet. */
+  historyFrom: number;
+  /** The oldest event on disk is loaded — there is nothing earlier. */
+  atStart: boolean;
   /** The daemon capped this batch — page forward from `seq`. */
   hasMore: boolean;
   /** seq of the newest `turn_end` / `turn_completed` folded in. */
@@ -586,11 +598,74 @@ function emptyState(id: string): SessionFeedState {
     sessionKind: null,
     turn: null,
     truncated: false,
+    historyPrefix: [],
+    historyFrom: 0,
+    atStart: false,
     hasMore: false,
     turnEndSeq: 0,
     error: null,
     updatedAt: 0,
   };
+}
+
+/**
+ * Fold a window of older events into rows, standalone.
+ *
+ * Its own reducer, so nothing about the live projection is disturbed: the live
+ * cursor, the open assistant row and the live subscription all stay where they
+ * are while history is loaded behind them.
+ */
+export function projectHistory(events: FeedEvent[] | null | undefined): ChatMessage[] {
+  const r = newReducer();
+  for (const ev of events || []) {
+    if (!ev || typeof ev !== "object") continue;
+    reduceEvent(r, ev);
+  }
+  return project(r, false, null);
+}
+
+function joinTools(
+  a: ChatMessage["tools"],
+  b: ChatMessage["tools"],
+): ChatMessage["tools"] | undefined {
+  const out: ToolCallView[] = [];
+  const seen = new Set<string>();
+  for (const t of [...(a || []), ...(b || [])]) {
+    if (!t || seen.has(t.id)) continue;
+    seen.add(t.id);
+    out.push({ ...t });
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * Put loaded history in front of the live rows.
+ *
+ * Rows are identified by the seq they opened at (`u_<seq>` / `a_<seq>`), so an
+ * overlap is dropped by id. The one row that needs care is the boundary: a
+ * reply the window cut in half opens at an earlier seq in the history fold
+ * than it does in the live fold, so it would render as two bubbles. Same role
+ * on both sides of the seam means one reply — join it.
+ */
+function withHistory(prefix: ChatMessage[], rows: ChatMessage[]): ChatMessage[] {
+  if (!prefix.length) return rows;
+  const seen = new Set(rows.map((m) => m.id));
+  const head = prefix.filter((m) => !seen.has(m.id));
+  if (!head.length) return rows;
+  if (!rows.length) return head;
+  const last = head[head.length - 1];
+  const first = rows[0];
+  if (last.role === "assistant" && first.role === "assistant") {
+    const merged: ChatMessage = {
+      ...first,
+      content: `${last.content || ""}${first.content || ""}`,
+      thought: [last.thought || "", first.thought || ""].join("") || undefined,
+      tools: joinTools(last.tools, first.tools),
+      plan: first.plan?.length ? first.plan : last.plan,
+    };
+    return [...head.slice(0, -1), merged, ...rows.slice(1)];
+  }
+  return [...head, ...rows];
 }
 
 /**
@@ -681,9 +756,18 @@ export class SessionFeedStore {
    * Seed a session from persisted state (reload / PWA resume) so the very
    * first `subscribe` can resume at a cursor instead of repainting from 0.
    */
-  hydrate(sessionId: string, seq: number, messages: ChatMessage[]): SessionFeedState {
+  hydrate(
+    sessionId: string,
+    seq: number,
+    messages: ChatMessage[],
+    opts: { truncated?: boolean } = {},
+  ): SessionFeedState {
     const id = String(sessionId);
     const st = this.reset(id);
+    // A resume subscribes at a cursor, so the daemon has no reason to say the
+    // tail window dropped anything — carry "older history exists" across the
+    // reload instead, or "load earlier" would vanish on every refresh.
+    st.truncated = Boolean(opts.truncated);
     const n = Number(seq);
     if (!Number.isFinite(n) || n <= 0 || !messages.length) return st;
     st.seq = Math.floor(n);
@@ -720,6 +804,41 @@ export class SessionFeedStore {
     }
     st.updatedAt = Date.now();
     return st;
+  }
+
+  /** The seq the oldest rendered row was opened at — the "load earlier" anchor. */
+  oldestRowSeq(sessionId: string | null | undefined): number {
+    const st = this.get(sessionId);
+    if (!st?.messages.length) return 0;
+    return feedRowSeq(st.messages[0].id) ?? 0;
+  }
+
+  /**
+   * Fold one window of older history in front of the live rows ("load earlier").
+   *
+   * @param window `events` from GET /api/sessions/:id/feed?from=&to=
+   */
+  prependHistory(
+    sessionId: string,
+    window: { events?: FeedEvent[]; from?: number; atStart?: boolean },
+  ): SessionFeedState {
+    const id = String(sessionId);
+    const st = this.ensure(id);
+    const older = projectHistory(window?.events);
+    const historyPrefix = withHistory(older, st.historyPrefix);
+    const r = this.reducers.get(id)!;
+    const live = project(r, st.working, phaseFromFeed(st.phase));
+    const from = Number(window?.from);
+    const next: SessionFeedState = {
+      ...st,
+      historyPrefix,
+      historyFrom: Number.isFinite(from) && from > 0 ? from : st.historyFrom,
+      atStart: Boolean(window?.atStart) || st.atStart,
+      messages: withHistory(historyPrefix, live),
+      updatedAt: Date.now(),
+    };
+    this.states.set(id, next);
+    return next;
   }
 
   /**
@@ -823,7 +942,9 @@ export class SessionFeedStore {
     const next: SessionFeedState = {
       id,
       seq: Math.max(maxSeq, frameSeq, st.seq),
-      messages: changedShape ? project(r, working, phaseFromFeed(phase)) : st.messages,
+      messages: changedShape
+        ? withHistory(st.historyPrefix, project(r, working, phaseFromFeed(phase)))
+        : st.messages,
       live,
       owner,
       working,
@@ -836,6 +957,9 @@ export class SessionFeedStore {
       sessionKind: frame.sessionKind ?? st.sessionKind,
       turn: frame.turn ?? st.turn,
       truncated: truncated || st.truncated,
+      historyPrefix: st.historyPrefix,
+      historyFrom: st.historyFrom,
+      atStart: st.atStart,
       hasMore: Boolean(frame.hasMore),
       turnEndSeq: r.turnEndSeq,
       error: null,
@@ -901,7 +1025,13 @@ const MAX_PERSISTED_ROWS = 60;
 const MAX_PERSISTED_CHARS = 20_000;
 const MAX_PERSISTED_TOOL_OUTPUT = 2_000;
 
-type PersistedSession = { seq: number; at: number; messages: ChatMessage[] };
+type PersistedSession = {
+  seq: number;
+  at: number;
+  messages: ChatMessage[];
+  /** Older history existed behind the tail window when this was saved. */
+  truncated?: boolean;
+};
 type PersistedBag = Record<string, PersistedSession>;
 
 function readBag(): PersistedBag {
@@ -969,6 +1099,9 @@ export function persistFeed(state: SessionFeedState | null | undefined): void {
     seq: state.seq,
     at: Date.now(),
     messages: state.messages.slice(-MAX_PERSISTED_ROWS).map(slimMessage),
+    // Rows were dropped here too, so "load earlier" must survive the reload
+    // even for a chat whose tail window fitted.
+    truncated: state.truncated || state.messages.length > MAX_PERSISTED_ROWS,
   };
   const ids = Object.keys(bag);
   if (ids.length > MAX_PERSISTED) {
@@ -984,7 +1117,12 @@ export function loadPersistedFeed(sessionId: string | null | undefined): Persist
   if (!sessionId) return null;
   const row = readBag()[String(sessionId)];
   if (!row || !Number.isFinite(Number(row.seq))) return null;
-  return { seq: Number(row.seq), at: Number(row.at) || 0, messages: row.messages || [] };
+  return {
+    seq: Number(row.seq),
+    at: Number(row.at) || 0,
+    messages: row.messages || [],
+    truncated: Boolean(row.truncated),
+  };
 }
 
 export function forgetPersistedFeed(sessionId: string | null | undefined): void {

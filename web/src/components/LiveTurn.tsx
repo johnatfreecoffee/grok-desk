@@ -188,11 +188,15 @@ export function LiveTurn({ draft, streaming, onToolClick, onMedia }: Props) {
   );
 }
 
+/** Quiet for this long → badge it. Nothing is ever stopped automatically. */
+const QUIET_BADGE_MS = 6 * 60 * 1000;
+
 /** Compact status strip under the chat while a turn is live. */
 export function WorkingStrip({
   phase,
   label,
   queueLen,
+  quietMs = 0,
   onOpenQueue,
   onStop,
   onSendNow,
@@ -200,14 +204,27 @@ export function WorkingStrip({
   phase: string;
   label: string;
   queueLen: number;
+  /** P5 — how long the daemon says this turn has been silent. */
+  quietMs?: number;
   onOpenQueue?: () => void;
   onStop?: () => void;
   onSendNow?: () => void;
 }) {
+  const quiet = quietMs >= QUIET_BADGE_MS;
   return (
     <div className="working-strip">
       <span className={`work-pulse phase-${phase}`} />
       <span className="work-label">{label}</span>
+      {/* P5 — a long-quiet turn used to be killed by a watchdog. Now it says so
+          and leaves Stop, right there, to the person reading it. */}
+      {quiet && (
+        <span
+          className="work-quiet"
+          title="No stream activity for a while. Long tool calls do this — Desk will not stop it for you."
+        >
+          Quiet {Math.floor(quietMs / 60000)}m
+        </span>
+      )}
       {queueLen > 0 && (
         <button type="button" className="work-queue linkish" onClick={onOpenQueue}>
           {queueLen} queued — open queue

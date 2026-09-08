@@ -8,6 +8,8 @@ import os from "node:os";
 import { AcpBridge } from "./acp-bridge.js";
 
 const DEFAULT_MAX = Number(process.env.DESK_MAX_WORKERS || 4);
+/** How long a non-default worker may sit idle before it is reaped. */
+const DEFAULT_IDLE_MS = Number(process.env.DESK_WORKER_IDLE_MS || 10 * 60 * 1000);
 
 export class AcpPool extends EventEmitter {
   /**
@@ -23,8 +25,16 @@ export class AcpPool extends EventEmitter {
     /** sessionId → workerId */
     this.sessionToWorker = new Map();
     this._nextId = 1;
+    this.idleMs = Number.isFinite(Number(opts.idleMs)) ? Number(opts.idleMs) : DEFAULT_IDLE_MS;
+    /** Set by stopAll — the pool is shutting down and must not respawn. */
+    this.stopped = false;
+    /** Kept so `bridge.status()` still answers after shutdown without respawning. */
+    this._lastDefault = null;
+    /** pids SIGTERMed but not yet confirmed dead. @type {Set<number>} */
+    this._dying = new Set();
     const boot = this._spawn(opts.cwd || process.env.GROK_CWD || os.homedir());
     this.defaultId = boot.id;
+    this._lastDefault = boot;
   }
 
   /** Update mode for future spawns; existing workers get setPermissionMode on bridge. */
@@ -43,9 +53,12 @@ export class AcpPool extends EventEmitter {
   get defaultWorker() {
     let w = this.workers.get(this.defaultId);
     if (!w) {
+      // Shutdown must never resurrect a `grok agent` on the way out.
+      if (this.stopped) return this._lastDefault;
       w = this._spawn();
       this.defaultId = w.id;
     }
+    this._lastDefault = w;
     return w;
   }
 
@@ -93,9 +106,13 @@ export class AcpPool extends EventEmitter {
    * @returns {WorkerSlot|null} null if pool full and none free
    */
   acquire({ sessionId = null, cwd = null, preferFree = true } = {}) {
+    const take = (w) => {
+      w.lastUsedAt = Date.now();
+      return w;
+    };
     if (sessionId) {
       const bound = this.findBySession(sessionId);
-      if (bound) return bound;
+      if (bound) return take(bound);
     }
 
     if (preferFree) {
@@ -103,14 +120,14 @@ export class AcpPool extends EventEmitter {
       for (const w of this.workers.values()) {
         if (!w.busy && !w.bridge.sessionId && !w.sessionId) {
           if (cwd) w.bridge.cwd = cwd;
-          return w;
+          return take(w);
         }
       }
       // Idle worker that can be rebound
       for (const w of this.workers.values()) {
         if (!w.busy) {
           if (cwd) w.bridge.cwd = cwd;
-          return w;
+          return take(w);
         }
       }
     }
@@ -136,6 +153,7 @@ export class AcpPool extends EventEmitter {
 
   bindSession(worker, sessionId, cwd) {
     if (!worker) return;
+    worker.lastUsedAt = Date.now();
     if (worker.sessionId && worker.sessionId !== sessionId) {
       this.sessionToWorker.delete(worker.sessionId);
     }
@@ -154,7 +172,11 @@ export class AcpPool extends EventEmitter {
   }
 
   setBusy(worker, busy) {
-    if (worker) worker.busy = Boolean(busy);
+    if (!worker) return;
+    worker.busy = Boolean(busy);
+    // Idle age is measured from the last time a worker actually did something,
+    // so a worker that just finished a turn is not reaped a second later.
+    worker.lastUsedAt = Date.now();
   }
 
   /** Any worker currently mid-turn? */
@@ -180,18 +202,24 @@ export class AcpPool extends EventEmitter {
     const w = this.workers.get(workerId);
     if (!w) return false;
     if (w.sessionId) this.sessionToWorker.delete(w.sessionId);
+    // The bridge only SIGTERMs and then forgets the pid. An agent that is wedged
+    // (or ignoring SIGTERM) then outlives the pool with nobody holding a handle
+    // to it — one of those survived 16 hours holding a stale ownership entry.
+    const pids = w.bridge?.livePids?.() || [w.bridge?.proc?.pid];
     try {
       w.bridge.stop();
     } catch {
       /* */
     }
+    for (const pid of pids) this._escalate(pid);
     this.workers.delete(workerId);
     if (workerId === this.defaultId) {
       if (this.workers.size > 0) {
         this.defaultId = [...this.workers.keys()][0];
-      } else if (restartDefault) {
+      } else if (restartDefault && !this.stopped) {
         const nw = this._spawn();
         this.defaultId = nw.id;
+        this._lastDefault = nw;
       }
     }
     this.emit("worker_stopped", { workerId });
@@ -205,8 +233,106 @@ export class AcpPool extends EventEmitter {
     }
     const w = this._spawn();
     this.defaultId = w.id;
+    this._lastDefault = w;
     await w.bridge.ensure();
     return this.status();
+  }
+
+  /* ------------------------------------------------------------- P5 reaping */
+
+  /**
+   * Reap idle workers.
+   *
+   * Nothing called `stopWorker` before this, so every worker a parallel
+   * dispatch spawned lived until the daemon restarted (3–4 left over after a
+   * test run was normal). Each one holds a `grok agent` child, and each child
+   * holds a session — which is how a leaked worker kept a stale ownership entry
+   * alive for 16 hours.
+   *
+   * The default worker is never reaped: it is the warm path for the next
+   * prompt. A busy worker is never reaped. Everything else goes once it has
+   * been idle for `idleMs`.
+   *
+   * @returns {Promise<string[]>} the worker ids that were stopped
+   */
+  async reapIdle({ idleMs = this.idleMs, now = Date.now() } = {}) {
+    if (this.stopped) return [];
+    const reaped = [];
+    for (const [id, w] of [...this.workers]) {
+      if (id === this.defaultId) continue;
+      if (w.busy) continue;
+      const age = now - (w.lastUsedAt || w.createdAt || now);
+      if (age < idleMs) continue;
+      console.log(`[pool] reap ${id} — idle ${Math.round(age / 1000)}s`);
+      // eslint-disable-next-line no-await-in-loop
+      await this.stopWorker(id, { restartDefault: false });
+      reaped.push(id);
+    }
+    return reaped;
+  }
+
+  /**
+   * SIGTERM has been sent to `pid`; make sure it actually dies.
+   *
+   * `AcpBridge._teardown()` sends SIGTERM and immediately drops `proc`, so
+   * nothing followed up. This keeps the pid until it is confirmed gone.
+   */
+  _escalate(pid, graceMs = 700) {
+    if (!Number.isInteger(pid) || pid <= 0) return;
+    this._dying.add(pid);
+    const t = setTimeout(() => {
+      this._dying.delete(pid);
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return; // already reaped by SIGTERM — the normal case
+      }
+      try {
+        console.warn(`[pool] SIGKILL agent pid ${pid} — ignored SIGTERM`);
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* */
+      }
+    }, graceMs);
+    t.unref?.();
+  }
+
+  /**
+   * pids of the `grok agent` children this pool is responsible for: the live
+   * workers, plus anything stopped whose death has not been confirmed yet.
+   */
+  childPids() {
+    const out = new Set(this._dying);
+    for (const w of this.workers.values()) {
+      for (const pid of w.bridge?.livePids?.() || []) {
+        if (Number.isInteger(pid) && pid > 0) out.add(pid);
+      }
+    }
+    return [...out];
+  }
+
+  /**
+   * Shutdown: SIGTERM every `grok agent` child and refuse to spawn again.
+   *
+   * The daemon used to call `bridge.stop()`, which only ever touched the
+   * DEFAULT worker — every other worker's `grok agent` was orphaned on
+   * SIGTERM. Returns the pids it signalled so the caller can SIGKILL whatever
+   * ignored SIGTERM before the process exits.
+   */
+  stopAll() {
+    const pids = this.childPids();
+    this.stopped = true;
+    for (const [id, w] of [...this.workers]) {
+      if (w.sessionId) this.sessionToWorker.delete(w.sessionId);
+      try {
+        w.bridge.stop();
+      } catch {
+        /* */
+      }
+      this.workers.delete(id);
+    }
+    console.log(`[pool] stopAll — signalled ${pids.length} agent child(ren)`);
+    return pids;
   }
 
   /**
@@ -228,6 +354,7 @@ export class AcpPool extends EventEmitter {
       cwd: cwd || bridge.cwd,
       busy: false,
       createdAt: Date.now(),
+      lastUsedAt: Date.now(),
     };
     this.workers.set(id, w);
 
@@ -269,6 +396,7 @@ export class AcpPool extends EventEmitter {
       ready: st.ready,
       isDefault: w.id === this.defaultId,
       createdAt: w.createdAt,
+      lastUsedAt: w.lastUsedAt || w.createdAt,
     };
   }
 }
@@ -281,5 +409,6 @@ export class AcpPool extends EventEmitter {
  *   cwd: string|null,
  *   busy: boolean,
  *   createdAt: number,
+ *   lastUsedAt: number,
  * }} WorkerSlot
  */

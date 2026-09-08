@@ -42,7 +42,8 @@
     "test:store": "node --experimental-strip-types scripts/session-store-unit.mjs",
     "smoke:switch": "node --experimental-strip-types scripts/smoke-switch.mjs",
     "smoke:reload": "node --experimental-strip-types scripts/smoke-reload.mjs",
-    "smoke:cli": "node --experimental-strip-types scripts/smoke-cli.mjs"
+    "smoke:cli": "node --experimental-strip-types scripts/smoke-cli.mjs",
+    "smoke:longturn": "node --experimental-strip-types scripts/smoke-longturn.mjs"
   },
   "dependencies": {
     "web-push": "^3.6.7",

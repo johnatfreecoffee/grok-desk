@@ -62,6 +62,17 @@ export class AcpBridge extends EventEmitter {
     /** ask | auto | always-approve — when not always-approve, permission cards fire */
     this.permissionMode = opts.permissionMode || (this.alwaysApprove ? "always-approve" : "ask");
     this.proc = null;
+    /**
+     * P5 — EVERY `grok agent` pid this bridge has spawned that has not exited.
+     *
+     * `this.proc` alone is not enough: `_teardown()` nulls it and `_start()`
+     * only assigns it after `spawn()` returns, so two overlapping
+     * restarts (settings apply, phone always-approve, /api/restart) left a
+     * child with nobody holding a handle to it. Those are the `grok agent`
+     * processes that outlive the daemon and keep stale ownership entries.
+     * @type {Set<number>}
+     */
+    this.spawnedPids = new Set();
     this.rl = null;
     this.nextId = 1;
     this.pending = new Map(); // id → { resolve, reject }
@@ -143,6 +154,8 @@ export class AcpBridge extends EventEmitter {
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    const spawnedPid = this.proc.pid;
+    if (spawnedPid) this.spawnedPids.add(spawnedPid);
 
     this.proc.stderr.on("data", (buf) => {
       const s = buf.toString().trim();
@@ -151,6 +164,7 @@ export class AcpBridge extends EventEmitter {
 
     this.proc.on("exit", (code, signal) => {
       console.log(`[acp] agent exited code=${code} signal=${signal}`);
+      if (spawnedPid) this.spawnedPids.delete(spawnedPid);
       this.ready = false;
       this.sessionId = null;
       for (const [, p] of this.pending) {
@@ -158,7 +172,9 @@ export class AcpBridge extends EventEmitter {
       }
       this.pending.clear();
       this.emit("agent_exit", { code, signal });
-      this.proc = null;
+      // Only clear the handle if it is still THIS process: an overlapping
+      // restart may already have put a newer child here.
+      if (this.proc && this.proc.pid === spawnedPid) this.proc = null;
     });
 
     this.rl = readline.createInterface({ input: this.proc.stdout });
@@ -542,27 +558,34 @@ export class AcpBridge extends EventEmitter {
     this.proc.stdin.write(JSON.stringify(obj) + "\n");
   }
 
+  /**
+   * @param {string} method
+   * @param {object} params
+   * @param {number} timeoutMs  0 disables the timer entirely (see `prompt`).
+   */
   request(method, params = {}, timeoutMs = 120000) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`acp timeout: ${method}`));
-      }, timeoutMs);
+      const timer = timeoutMs
+        ? setTimeout(() => {
+            this.pending.delete(id);
+            reject(new Error(`acp timeout: ${method}`));
+          }, timeoutMs)
+        : null;
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           resolve(v);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           reject(e);
         },
       });
       try {
         this._write({ jsonrpc: "2.0", id, method, params });
       } catch (e) {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         this.pending.delete(id);
         reject(e);
       }
@@ -602,7 +625,12 @@ export class AcpBridge extends EventEmitter {
             sessionId: this.sessionId,
             prompt,
           },
-          600000, // long agent runs
+          // P5 — NO TIMEOUT. This was 600_000: a Desk timer that ended a real
+          // turn after 10 minutes, before the (now deleted) 18-minute wall
+          // watchdog could even fire. A coding agent routinely runs longer.
+          // Nothing hangs as a result: the agent's own exit rejects every
+          // pending request, and Stop / abandon reject the in-flight prompt.
+          0,
         );
         return result;
       } finally {
@@ -748,15 +776,25 @@ export class AcpBridge extends EventEmitter {
     } catch {
       /* */
     }
-    try {
-      this.proc?.kill("SIGTERM");
-    } catch {
-      /* */
+    // P5 — signal EVERY child this bridge has spawned, not just `this.proc`.
+    // An overlapping restart could leave an older child with no handle at all,
+    // and it then outlived the daemon holding a stale ownership entry.
+    for (const pid of [...this.spawnedPids]) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        this.spawnedPids.delete(pid); // already gone
+      }
     }
     this.rl = null;
     this.proc = null;
     this.ready = false;
     this.sessionId = null;
+  }
+
+  /** pids of `grok agent` children this bridge spawned that have not exited. */
+  livePids() {
+    return [...this.spawnedPids];
   }
 
   stop() {
