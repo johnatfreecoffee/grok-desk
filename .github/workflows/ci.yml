@@ -35,6 +35,9 @@ jobs:
       - name: Feed projector unit tests
         run: npm run test:feed
 
+      - name: Client projection unit tests
+        run: npm run test:store
+
       - name: Syntax-check daemon modules
         run: |
           node --check daemon/index.js

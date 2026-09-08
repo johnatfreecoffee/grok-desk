@@ -24,6 +24,7 @@ import {
   loadPersistedFeed,
   persistFeed,
   type FeedContext,
+  type FeedEvent,
   type FeedFrame,
   type FeedOwner,
   type FeedSubagent,
@@ -132,6 +133,14 @@ const SESSION_STATUS_KEY = "grok-desk-session-status";
 const SESSION_DONE_KEY = "grok-desk-session-done";
 const LAST_SESSION_KEY = "grok-desk-last-session";
 const SIDEBAR_OPEN_KEY = "grok-desk-sidebar-open";
+/**
+ * P5 — how far back one "Load earlier" click reaches, in feed events.
+ *
+ * Events, not rows: most of what the CLI writes is telemetry, so a page this
+ * size is typically a handful of turns. Press it again to keep going; the
+ * daemon says `atStart` when there is nothing older left.
+ */
+const HISTORY_PAGE_EVENTS = 5000;
 
 type LastSession = { id: string; cwd: string };
 
@@ -313,6 +322,18 @@ function DeskApp() {
   const [feedContext, setFeedContext] = useState<FeedContext | null>(null);
   /** P6 — `session_kind`: "headless" / "subagent" chats say what they are. */
   const [sessionKind, setSessionKind] = useState<string | null>(null);
+  /**
+   * P5 — how long the live Desk turn has been silent.
+   *
+   * The daemon used to kill a turn after 6 quiet minutes. It reports instead:
+   * this drives a badge next to the Stop button, and stopping is the user's
+   * call.
+   */
+  const [turnQuietMs, setTurnQuietMs] = useState(0);
+  /** P5 — older history exists behind what is rendered ("Load earlier"). */
+  const [canLoadEarlier, setCanLoadEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [earlierError, setEarlierError] = useState<string | null>(null);
   /** Where a subagent was opened from, so there is a way back to the parent. */
   const [childOrigin, setChildOrigin] = useState<
     { childId: string; parentId: string; parentCwd: string | null; parentTitle: string } | null
@@ -593,6 +614,7 @@ function DeskApp() {
       setSubagents([]);
       setFeedContext(null);
       setSessionKind(null);
+      setCanLoadEarlier(false);
       busyRef.current = false;
       setBusy(false);
       return;
@@ -643,6 +665,12 @@ function DeskApp() {
     setSubagents(st?.subagents || []);
     setFeedContext(st?.context || null);
     setSessionKind(st?.sessionKind || null);
+    // P5 — "Load earlier". `truncated` is the daemon saying the tail window it
+    // served has older history behind it; `atStart` is this client saying it
+    // has since walked back to the first event on disk.
+    setCanLoadEarlier(
+      Boolean(st?.truncated) && !st?.atStart && (st?.messages.length || 0) > 0,
+    );
     setBgWorkingBanner(otherWorkingId(sid) !== null);
   }, [otherWorkingId]);
 
@@ -655,11 +683,76 @@ function DeskApp() {
       // Reload / PWA resume: paint the persisted rows, then resume at that seq
       // instead of starting blank.
       const saved = loadPersistedFeed(sid);
-      if (saved?.messages.length) store.hydrate(sid, saved.seq, saved.messages);
+      if (saved?.messages.length) {
+        store.hydrate(sid, saved.seq, saved.messages, { truncated: saved.truncated });
+      }
     }
     subsRef.current.set(sid, cwd ?? subsRef.current.get(sid) ?? null);
     clientRef.current?.subscribeFeed(sid, store.cursor(sid), subsRef.current.get(sid));
   }, []);
+
+  /**
+   * P5 — "Load earlier": one bounded window of older history.
+   *
+   * `from=0` on the feed is the newest tail window, so a long chat opens on its
+   * last few hundred events with `truncated:true`. This walks backwards a page
+   * at a time — `GET /api/sessions/:id/feed?from=&to=` — and folds each window
+   * in FRONT of the live rows. The live subscription and its cursor are not
+   * touched: a turn streaming into this chat keeps streaming while history
+   * loads behind it.
+   */
+  const loadEarlier = useCallback(async () => {
+    const sid = agentRef.current?.sessionId || null;
+    if (!sid || isPendingId(sid) || sid.startsWith("mail:")) return;
+    const store = feedRef.current;
+    const st = store.get(sid);
+    if (!st || st.atStart) return;
+    // Where the loaded history currently starts: the lower bound of the last
+    // window we asked for, or the seq the oldest rendered row opened at.
+    const anchor = st.historyFrom > 0 ? Math.floor(st.historyFrom) : store.oldestRowSeq(sid);
+    const to = anchor - 1;
+    if (to <= 0) return;
+    const from = Math.max(0, to - HISTORY_PAGE_EVENTS);
+    setLoadingEarlier(true);
+    setEarlierError(null);
+    try {
+      const cwd = subsRef.current.get(sid) || agentRef.current?.cwd || "";
+      const qs = new URLSearchParams({ from: String(from), to: String(to) });
+      if (cwd) qs.set("cwd", cwd);
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/feed?${qs}`, {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error(`feed window ${res.status}`);
+      const win = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        events?: FeedEvent[];
+        from?: number;
+        atStart?: boolean;
+      };
+      if (!win.ok) throw new Error(win.error || "could not read earlier history");
+      // Keep the row the user is looking at under the cursor: rows are added
+      // ABOVE, so scrollTop has to grow by exactly how much taller we got.
+      const el = scrollerRef.current;
+      const beforeHeight = el?.scrollHeight ?? 0;
+      const beforeTop = el?.scrollTop ?? 0;
+      store.prependHistory(sid, win);
+      repaintViewed();
+      // Two frames: the first is scheduled before React has committed the new
+      // rows, so scrollHeight has not grown yet and the correction would be 0.
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          const node = scrollerRef.current;
+          if (!node) return;
+          node.scrollTop = beforeTop + (node.scrollHeight - beforeHeight);
+        }),
+      );
+    } catch (e) {
+      setEarlierError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }, [repaintViewed]);
 
   /**
    * The viewed chat plus everything still working stay subscribed — that is how
@@ -816,6 +909,7 @@ function DeskApp() {
      * daemon truth; neither is client guesswork.
      */
     const applyDeskTurnTruth = (snap: TurnSnapshot) => {
+      setTurnQuietMs(snap.turnActive ? Number(snap.turnQuietMs) || 0 : 0);
       const live = new Set<string>(
         (snap.liveSessionIds || []).filter(Boolean).map((s) => String(s)),
       );
@@ -1346,6 +1440,22 @@ function DeskApp() {
       window.removeEventListener("pageshow", onVis);
     };
   }, [resubscribeAll]);
+
+  /**
+   * P5 — keep the daemon's quiet clock fresh while a turn is live.
+   *
+   * The 18-minute wall and 6-minute stall watchdogs are gone; a turn that has
+   * gone quiet is reported, not killed. One status frame every 30s is what
+   * turns that report into a badge the user can act on.
+   */
+  useEffect(() => {
+    if (!busy) {
+      setTurnQuietMs(0);
+      return undefined;
+    }
+    const t = window.setInterval(() => clientRef.current?.requestStatus(), 30_000);
+    return () => window.clearInterval(t);
+  }, [busy]);
 
   useEffect(() => {
     scrollToBottom();
@@ -2964,6 +3074,21 @@ function DeskApp() {
 
         <div className="messages" ref={scrollerRef} onScroll={onMessagesScroll}>
           <div className="messages-inner">
+          {/* P5 — full history is reachable: the chat opens on a tail window,
+              this walks back through the rest a page at a time. */}
+          {canLoadEarlier && (
+            <div className="load-earlier">
+              <button
+                type="button"
+                className="load-earlier-btn"
+                onClick={() => void loadEarlier()}
+                disabled={loadingEarlier}
+              >
+                {loadingEarlier ? "Loading earlier…" : "Load earlier"}
+              </button>
+              {earlierError ? <span className="load-earlier-err">{earlierError}</span> : null}
+            </div>
+          )}
           {messages.length === 0 && sessionPhase !== "loading" && (
             <div className="empty">
               <h1>{isDesktop ? "Grok Desk" : "Local Grok"}</h1>
@@ -3105,6 +3230,7 @@ function DeskApp() {
                   : "Thinking…")
             }
             queueLen={queueLen}
+            quietMs={turnQuietMs}
             onOpenQueue={() => {
               clientRef.current?.send({ type: "queue_list" });
               setQueueOpen(true);

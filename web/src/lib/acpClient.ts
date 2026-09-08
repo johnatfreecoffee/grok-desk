@@ -63,6 +63,9 @@ export type TurnSnapshot = {
   phase?: string | null;
   turnStartedAt?: string | null;
   lastActivityAt?: string | null;
+  /** P5 — the live turn has been silent long enough to badge (never killed). */
+  turnQuiet?: boolean;
+  turnQuietMs?: number;
   partialDraft?: {
     id?: string;
     sessionId?: string;

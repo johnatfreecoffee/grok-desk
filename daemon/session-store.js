@@ -96,6 +96,11 @@ function saveDeskIndex(idx) {
     });
 }
 
+/** Await the serialized desk-index write chain (tests / delete verification). */
+export function flushDeskIndex() {
+  return deskIndexWriteChain;
+}
+
 /** True when a summary.json describes a subagent session (not a user chat). */
 export function isSubagentKind(s) {
   if (!s || typeof s !== "object") return false;
@@ -263,7 +268,13 @@ export function saveSettings(patch = {}) {
   }
   const p = settingsPath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(next, null, 2));
+  // P5 — atomic, like `saveDeskIndex`. A bare writeFileSync truncates first, so
+  // a crash (or two writers) between truncate and write leaves invalid JSON and
+  // `loadSettings` silently falls back to DEFAULT_SETTINGS — every preference
+  // gone, including the permission mode.
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.renameSync(tmp, p);
   return next;
 }
 
@@ -1077,16 +1088,18 @@ export function deleteSession(sessionId, cwd) {
   } catch {
     /* */
   }
-  // prune desk-index
+  // P5 — prune desk-index.
+  //
+  // This used to read the file itself and look for `idx.sessions[sessionId]`.
+  // The schema key is `sessionIds` (see `loadDeskIndex`), so the branch was
+  // dead: the index NEVER shrank, and every deleted session stayed in it
+  // forever. Go through loadDeskIndex/saveDeskIndex so the in-memory cache and
+  // the serialized tmp+rename write stay the one path that touches this file.
   try {
-    const idxPath = deskIndexPath();
-    if (fs.existsSync(idxPath)) {
-      const idx = JSON.parse(fs.readFileSync(idxPath, "utf8"));
-      if (idx.sessions && idx.sessions[sessionId]) {
-        delete idx.sessions[sessionId];
-        fs.writeFileSync(idxPath, JSON.stringify(idx, null, 2));
-        deskIndexCache = idx;
-      }
+    const idx = loadDeskIndex();
+    if (idx.sessionIds && idx.sessionIds[sessionId]) {
+      delete idx.sessionIds[sessionId];
+      saveDeskIndex(idx);
     }
   } catch {
     /* */
@@ -1302,38 +1315,41 @@ function loadDeskMessagesStore() {
   return {};
 }
 
+/**
+ * Atomic write. Only the delete path writes this file now (see below), but a
+ * torn write here used to take the WHOLE log with it: `loadDeskMessagesStore`
+ * swallows a JSON parse error and returns `{}`.
+ */
 function saveDeskMessagesStore(store) {
   const p = deskMessagesPath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(store));
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(store));
+  fs.renameSync(tmp, p);
 }
 
-/** Persist Desk UI turns so switching away mid-stream never loses the chat. */
+/**
+ * P5 — the shadow transcript is RETIRED.
+ *
+ * `~/.grok/sessions/<cwd>/<id>/` is the single source of truth and
+ * `daemon/session-feed.js` projects it. This file was a third copy kept in
+ * agreement by hand, written with a non-atomic whole-file read-modify-write:
+ *
+ *   - two parallel turns interleaved read → modify → write and lost messages;
+ *   - a crash mid-write left invalid JSON, and `loadDeskMessagesStore` returns
+ *     `{}` on a parse error — the entire log, every session, silently gone;
+ *   - it grew to 788 KB and had not been written since 28 Aug anyway.
+ *
+ * Writing stops here. Reading stays (`loadDeskMessages`, `deskLastMessageAtMap`)
+ * as a legacy fallback so chats that predate the feed still render, and the
+ * user's existing file is never deleted.
+ *
+ * These two remain as no-op-write seams because the prompt path still owes the
+ * sidebar its sort key on a real turn — that is a desk-index write, not a
+ * transcript write.
+ */
 export function appendDeskMessage(sessionId, message) {
   if (!sessionId || !message) return;
-  const store = loadDeskMessagesStore();
-  const list = Array.isArray(store[sessionId]) ? store[sessionId] : [];
-  const at = new Date().toISOString();
-  list.push({
-    id: message.id || `d_${Date.now()}`,
-    role: message.role,
-    content: String(message.content || "").slice(0, 20000),
-    thought: message.thought ? String(message.thought).slice(0, 40000) : undefined,
-    tools: Array.isArray(message.tools) ? message.tools.slice(0, 80) : undefined,
-    plan: Array.isArray(message.plan) ? message.plan.slice(0, 40) : undefined,
-    at,
-  });
-  // Cap per session
-  store[sessionId] = list.length > 300 ? list.slice(-300) : list;
-  // Cap total sessions tracked
-  const keys = Object.keys(store);
-  if (keys.length > 80) {
-    const ranked = keys
-      .map((k) => ({ k, at: store[k][store[k].length - 1]?.at || "" }))
-      .sort((a, b) => String(b.at).localeCompare(String(a.at)));
-    for (const drop of ranked.slice(80)) delete store[drop.k];
-  }
-  saveDeskMessagesStore(store);
   // Bump sidebar sort key — real user/assistant turn, not open
   try {
     touchSessionInteraction(sessionId, undefined);
@@ -1343,46 +1359,20 @@ export function appendDeskMessage(sessionId, message) {
 }
 
 /**
- * Upsert by message id — used for mid-turn partial assistant + final rewrite.
- * Prefer this over append for streaming rows so reloads don't stack duplicates.
+ * Streaming counterpart of `appendDeskMessage`. Also no longer persists.
+ * A mid-stream row is not a real interaction, so it does not bump the sort key.
  */
 export function upsertDeskMessage(sessionId, message) {
   if (!sessionId || !message) return;
-  const store = loadDeskMessagesStore();
-  const list = Array.isArray(store[sessionId]) ? store[sessionId] : [];
-  const at = new Date().toISOString();
-  const id = message.id || `d_${Date.now()}`;
-  const row = {
-    id,
-    role: message.role,
-    content: String(message.content || "").slice(0, 20000),
-    thought: message.thought ? String(message.thought).slice(0, 40000) : undefined,
-    tools: Array.isArray(message.tools) ? message.tools.slice(0, 80) : undefined,
-    plan: Array.isArray(message.plan) ? message.plan.slice(0, 40) : undefined,
-    streaming: Boolean(message.streaming),
-    at,
-  };
-  const idx = list.findIndex((m) => m && m.id === id);
-  if (idx >= 0) list[idx] = { ...list[idx], ...row };
-  else list.push(row);
-  store[sessionId] = list.length > 300 ? list.slice(-300) : list;
-  const keys = Object.keys(store);
-  if (keys.length > 80) {
-    const ranked = keys
-      .map((k) => ({ k, at: store[k][store[k].length - 1]?.at || "" }))
-      .sort((a, b) => String(b.at).localeCompare(String(a.at)));
-    for (const drop of ranked.slice(80)) delete store[drop.k];
-  }
-  saveDeskMessagesStore(store);
-  if (!message.streaming) {
-    try {
-      touchSessionInteraction(sessionId, undefined);
-    } catch {
-      /* */
-    }
+  if (message.streaming) return;
+  try {
+    touchSessionInteraction(sessionId, undefined);
+  } catch {
+    /* */
   }
 }
 
+/** Legacy read-only fallback — chats that predate the feed still render. */
 export function loadDeskMessages(sessionId) {
   if (!sessionId) return [];
   const store = loadDeskMessagesStore();
@@ -1399,6 +1389,10 @@ export function loadDeskMessages(sessionId) {
   }));
 }
 
+/**
+ * Drop ONE session's legacy rows when that session is deleted.
+ * The only remaining writer of this file, and it never removes the file itself.
+ */
 export function clearDeskMessages(sessionId) {
   if (!sessionId) return;
   const store = loadDeskMessagesStore();
