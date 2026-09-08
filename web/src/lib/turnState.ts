@@ -11,6 +11,18 @@ export type ToolCallView = {
   status: ToolStatus;
   detail?: string;
   description?: string;
+  /**
+   * The tool the CLI actually ran — `read_file`, `run_terminal_command`,
+   * `spawn_subagent`, … Taken from the FIRST `tool_call` title (the CLI later
+   * rewrites `title` into prose like ``Read `/path` ``) or from a
+   * `tool_started` / `tool_completed` event's `tool_name`. This is the field
+   * to classify on; `title` is display text and lies.
+   */
+  toolName?: string;
+  /** `duration_ms` from the `tool_completed` event. */
+  durationMs?: number;
+  /** `outcome` from the `tool_completed` event — "success" / "error" / … */
+  outcome?: string;
   isAgent?: boolean;
   isBackground?: boolean;
   /** Absolute/relative path when known */
@@ -52,15 +64,27 @@ export function createTurnDraft(id: string): TurnDraft {
   };
 }
 
-function isAgentTool(title: string, kind?: string): boolean {
-  const t = `${title} ${kind || ""}`.toLowerCase();
-  return (
-    t.includes("agent") ||
-    t.includes("subagent") ||
-    t.includes("spawn") ||
-    t.includes("task(") ||
-    t.startsWith("agent")
-  );
+/**
+ * The tools the CLI uses to start and follow a child agent.
+ *
+ * These are real tool names off the wire, not guesses. The old heuristic
+ * sniffed the word "agent" anywhere in the rendered title, which flagged every
+ * ``Execute `AGENT_NAME=grok ~/AgentMemory/bin/mem …` `` shell row as a
+ * subagent. Real subagents come from `subagent_spawned` and live in the strip.
+ */
+const AGENT_TOOLS = new Set(["spawn_subagent", "get_command_or_subagent_output"]);
+
+/** The tool name the CLI reports, when the title has not been rewritten yet. */
+export function normalizeToolName(title: string | undefined | null): string | undefined {
+  const t = String(title || "").trim();
+  // Rewritten display titles carry spaces/backticks; raw tool names never do.
+  if (!t || /[\s`]/.test(t)) return undefined;
+  return t.toLowerCase();
+}
+
+export function isAgentToolName(toolName?: string, kind?: string): boolean {
+  if (toolName && AGENT_TOOLS.has(toolName)) return true;
+  return String(kind || "").toLowerCase() === "subagent";
 }
 
 const OUTPUT_CAP = 256_000;
@@ -181,12 +205,14 @@ export function applyTurnUpdate(draft: TurnDraft, update: Record<string, unknown
     );
     const title = String(update.title || update.name || "tool");
     const tKind = update.kind ? String(update.kind) : undefined;
-    const agent = isAgentTool(title, tKind);
+    const toolName = normalizeToolName(title);
+    const agent = isAgentToolName(toolName, tKind);
     const out = extractOutput(update);
     const diff = extractDiff(update);
     draft.tools.push({
       id,
       title,
+      toolName,
       kind: tKind,
       status: String(update.status || "pending"),
       detail: toolDetail(update),
@@ -213,7 +239,11 @@ export function applyTurnUpdate(draft: TurnDraft, update: Record<string, unknown
     const t = draft.tools.find((x) => x.id === id);
     if (t) {
       if (update.status) t.status = String(update.status);
-      if (update.title) t.title = String(update.title);
+      if (update.title) {
+        // Keep the first raw tool name — later titles are rendered prose.
+        if (!t.toolName) t.toolName = normalizeToolName(String(update.title));
+        t.title = String(update.title);
+      }
       const d = toolDetail(update);
       if (d) t.detail = d;
       const p = toolPath(update);
@@ -280,14 +310,48 @@ export function applyTurnUpdate(draft: TurnDraft, update: Record<string, unknown
   }
 }
 
+/** Real tool name → icon bucket. Exact matches first, prose title last. */
+const TOOL_ICON: Record<string, string> = {
+  run_terminal_command: "shell",
+  read_file: "read",
+  list_dir: "read",
+  grep: "search",
+  glob: "search",
+  codebase_search: "search",
+  search_replace: "edit",
+  write_file: "edit",
+  create_file: "edit",
+  delete_file: "edit",
+  todo_write: "plan",
+  web_search: "web",
+  web_fetch: "web",
+  spawn_subagent: "agent",
+  get_command_or_subagent_output: "agent",
+};
+
 export function toolIconLabel(t: ToolCallView): string {
   if (t.isAgent) return "agent";
   if (t.isBackground) return "bg";
+  if (t.toolName && TOOL_ICON[t.toolName]) return TOOL_ICON[t.toolName];
   const n = t.title.toLowerCase();
-  if (n.includes("terminal") || n.includes("bash") || n.includes("shell")) return "shell";
+  if (n.includes("terminal") || n.includes("bash") || n.includes("shell") || n.startsWith("execute"))
+    return "shell";
   if (n.includes("read") || n.includes("file")) return "read";
   if (n.includes("search") || n.includes("grep")) return "search";
   if (n.includes("write") || n.includes("edit") || n.includes("replace")) return "edit";
   if (n.includes("web") || n.includes("fetch")) return "web";
   return "tool";
+}
+
+/** "1.2s" / "940ms" / "16m 10s" — one place so every surface reads the same. */
+export function formatDuration(ms: number | null | undefined): string | null {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n < 1000) return `${Math.round(n)}ms`;
+  if (n < 60_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}s`;
+  const mins = Math.floor(n / 60_000);
+  const secs = Math.round((n % 60_000) / 1000);
+  if (mins < 60) return secs ? `${mins}m ${secs}s` : `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ${mins % 60}m`;
 }

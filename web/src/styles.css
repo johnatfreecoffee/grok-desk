@@ -1952,10 +1952,13 @@ body.desk-app .topbar {
 .kind-search {
   color: #7dd3fc;
 }
-.kind-bg {
-  color: #a78bfa;
-  /* wait - no purple! use slate */
+.kind-bg,
+.kind-plan {
   color: #94a3b8;
+}
+.kind-read,
+.kind-web {
+  color: var(--muted);
 }
 
 .tool-title {
@@ -4879,5 +4882,382 @@ body.desk-app .topbar {
   .heat-grid {
     grid-template-rows: repeat(7, 8px);
     grid-auto-columns: 8px;
+  }
+}
+
+/* ------------------------------------------------ P6 · subagent strip */
+/*
+ * Sits between the banners and the transcript. It is a rail, not a card:
+ * one row, always the same height, horizontal scroll whatever the count —
+ * so a session with 83 children costs the conversation the same 45px a
+ * session with one child does. Nothing renders when there are no subagents.
+ */
+.subagent-strip {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.subagent-rail-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 4px 12px;
+  min-width: 0;
+}
+
+.subagent-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.subagent-lead:hover,
+.subagent-lead.open {
+  color: var(--blue);
+  border-color: rgba(57, 186, 230, 0.4);
+  background: var(--blue-bg);
+}
+
+.subagent-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--blue-bg);
+  color: var(--blue);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.subagent-running {
+  color: var(--amber);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.subagent-rail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 2px;
+}
+
+.subagent-rail::-webkit-scrollbar {
+  height: 4px;
+}
+.subagent-rail::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+.subagent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  max-width: 240px;
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.subagent-chip:hover {
+  border-color: rgba(57, 186, 230, 0.45);
+  background: var(--blue-bg);
+}
+
+.subagent-chip.st-working {
+  border-color: rgba(230, 180, 80, 0.4);
+}
+.subagent-chip.st-failed {
+  border-color: rgba(240, 113, 120, 0.4);
+}
+
+.subagent-chip-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.subagent-chip-type {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-chip-desc {
+  font-size: 11.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 170px;
+}
+
+.subagent-chip-meta {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.subagent-panel {
+  border-top: 1px solid var(--border);
+  padding: 10px 12px;
+  max-height: min(42vh, 340px);
+  overflow-y: auto;
+  background: var(--bg);
+}
+
+.subagent-node-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.subagent-node-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.subagent-node-actions .icon-btn {
+  min-height: 40px;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.subagent-report {
+  margin: 8px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------- P6 · context meter */
+
+.ctx-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.ctx-meter:hover {
+  border-color: rgba(57, 186, 230, 0.4);
+}
+
+.ctx-meter-bar {
+  display: block;
+  width: 34px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.ctx-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--green);
+}
+
+.ctx-meter.warn .ctx-meter-fill {
+  background: var(--amber);
+}
+.ctx-meter.err .ctx-meter-fill {
+  background: var(--red);
+}
+.ctx-meter.warn .ctx-meter-pct {
+  color: var(--amber);
+}
+.ctx-meter.err .ctx-meter-pct {
+  color: var(--red);
+}
+
+.ctx-meter-pct {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.ctx-drawer-meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.ctx-drawer-bar {
+  flex: 1 1 auto;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.ctx-drawer-fill {
+  height: 100%;
+  background: var(--green);
+}
+.ctx-drawer-meter.warn .ctx-drawer-fill {
+  background: var(--amber);
+}
+.ctx-drawer-meter.err .ctx-drawer-fill {
+  background: var(--red);
+}
+
+.ctx-drawer-num {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.ctx-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.ctx-tools .src-chip {
+  max-width: none;
+  font-family: var(--mono);
+  font-weight: 600;
+  text-transform: none;
+}
+
+/* ------------------------------------ P6 · machine-run session sources */
+
+/* Headless `grok -p` — a run, not a conversation. */
+.src-chip.src-headless {
+  background: rgba(148, 163, 184, 0.1);
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.32);
+}
+
+/* Subagent worker session (only listed when the setting is on). */
+.src-chip.src-subagent {
+  background: rgba(57, 186, 230, 0.1);
+  color: #7dd3fc;
+  border-color: rgba(57, 186, 230, 0.3);
+}
+
+.sess-row.machine .sess-title {
+  color: var(--muted);
+}
+
+/* --------------------------------------- P6 · background shell tasks */
+
+.artifact-bg-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.tool-dur {
+  font-family: var(--mono);
+  color: var(--muted);
+  margin-right: 6px;
+  text-transform: none;
+}
+
+@media (max-width: 720px) {
+  /* Phone: the rail stays exactly one row and never eats the transcript. */
+  .subagent-rail-row {
+    padding: 4px 8px;
+    gap: 6px;
+  }
+  .subagent-lead-label {
+    display: none;
+  }
+  .subagent-running {
+    display: none;
+  }
+  .subagent-chip {
+    max-width: 200px;
+  }
+  .subagent-chip-desc {
+    max-width: 130px;
+  }
+  .subagent-panel {
+    max-height: min(38vh, 280px);
+  }
+  .ctx-meter {
+    padding: 4px 7px;
+    gap: 4px;
+    /* Same 40px tap target the phone topbar gives every other control. */
+    min-height: 40px;
+  }
+  .ctx-meter-bar {
+    width: 22px;
+  }
+}
+
+/*
+ * Tablet band: the topbar's action row is already narrow at ~768 with the
+ * sidebar open, so the meter drops its bar and keeps only the number. (The
+ * row's overflow at that width predates this — see the topbar's own
+ * `overflow: hidden`; this just makes sure the meter is not what tips it.)
+ */
+@media (min-width: 721px) and (max-width: 1000px) {
+  .ctx-meter-bar {
+    display: none;
+  }
+  .ctx-meter {
+    padding: 5px 8px;
   }
 }

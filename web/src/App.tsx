@@ -13,6 +13,8 @@ import { LiveTurn, WorkingStrip } from "./components/LiveTurn";
 import { MediaLightbox, guessMediaKind, type MediaItem } from "./components/MediaLightbox";
 import { extractAutomationFence } from "./lib/automations";
 import { ArtifactPane } from "./components/ArtifactPane";
+import { ContextMeter } from "./components/ContextMeter";
+import { SubagentStrip } from "./components/SubagentStrip";
 import { applyTurnUpdate, createTurnDraft, type TurnDraft } from "./lib/turnState";
 import { createPendingId, isPendingId, shouldPaint } from "./lib/sessionStore";
 import {
@@ -21,8 +23,10 @@ import {
   feedRowSeq,
   loadPersistedFeed,
   persistFeed,
+  type FeedContext,
   type FeedFrame,
   type FeedOwner,
+  type FeedSubagent,
 } from "./lib/sessionFeed";
 import {
   artifactsFromDraft,
@@ -303,6 +307,16 @@ function DeskApp() {
   const [readOnly, setReadOnly] = useState(false);
   /** The owning CLI process, so the banner can name it instead of guessing. */
   const [owner, setOwner] = useState<FeedOwner | null>(null);
+  /** P6 — every child agent for the viewed session (feed `subagents`). */
+  const [subagents, setSubagents] = useState<FeedSubagent[]>([]);
+  /** P6 — context window usage from the session's signals.json. */
+  const [feedContext, setFeedContext] = useState<FeedContext | null>(null);
+  /** P6 — `session_kind`: "headless" / "subagent" chats say what they are. */
+  const [sessionKind, setSessionKind] = useState<string | null>(null);
+  /** Where a subagent was opened from, so there is a way back to the parent. */
+  const [childOrigin, setChildOrigin] = useState<
+    { childId: string; parentId: string; parentCwd: string | null; parentTitle: string } | null
+  >(null);
   /** UI flag: browsing another chat while a turn runs elsewhere */
   const [viewOnlyBrowse, setViewOnlyBrowse] = useState(false);
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>({});
@@ -325,7 +339,6 @@ function DeskApp() {
   const [forkOpen, setForkOpen] = useState(false);
   const [pinBottom, setPinBottom] = useState(true);
   const [mediaItem, setMediaItem] = useState<MediaItem | null>(null);
-  const [contextChip, setContextChip] = useState<{ used: number; limit: number } | null>(null);
   const [liveAgents, setLiveAgents] = useState<
     { workerId: string; sessionId: string | null; cwd: string | null; busy: boolean; isDefault?: boolean }[]
   >([]);
@@ -577,6 +590,9 @@ function DeskApp() {
       setMessages([]);
       setLiveDraft(null);
       setReadOnly(false);
+      setSubagents([]);
+      setFeedContext(null);
+      setSessionKind(null);
       busyRef.current = false;
       setBusy(false);
       return;
@@ -622,6 +638,11 @@ function DeskApp() {
     // pushes a frame the moment that owner exits, so this unlocks by itself.
     setReadOnly(Boolean(st?.readOnly));
     setOwner(st?.readOnly ? st.owner : null);
+    // P6 — terminal fidelity: the strip, the context meter and the "this is a
+    // headless run" label all read the same projection as the transcript.
+    setSubagents(st?.subagents || []);
+    setFeedContext(st?.context || null);
+    setSessionKind(st?.sessionKind || null);
     setBgWorkingBanner(otherWorkingId(sid) !== null);
   }, [otherWorkingId]);
 
@@ -1352,32 +1373,6 @@ function DeskApp() {
       .catch(() => {});
   }, [messages]);
 
-  useEffect(() => {
-    const sid = agent?.sessionId;
-    if (!sid) {
-      setContextChip(null);
-      return;
-    }
-    let cancelled = false;
-    const pull = () => {
-      void buildApi
-        .usage(sid, agent?.cwd)
-        .then((d) => {
-          if (cancelled) return;
-          const used = d.sessionUsage?.contextUsed;
-          const limit = d.sessionUsage?.contextLimit;
-          if (used != null && limit) setContextChip({ used: Number(used), limit: Number(limit) });
-        })
-        .catch(() => {});
-    };
-    pull();
-    const id = window.setInterval(pull, 20_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [agent?.sessionId, agent?.cwd]);
-
 
 
   const fileToAttachment = useCallback(async (file: File): Promise<AttachmentPreview> => {
@@ -1842,6 +1837,8 @@ function DeskApp() {
       suppressPaintRef.current = false;
       viewOnlyRef.current = false;
       setViewOnlyBrowse(false);
+      // Any deliberate navigation ends the "came from a subagent chip" trail.
+      setChildOrigin(null);
       // Another chat working is NOT a reason to lock this composer — but it must
       // not have its turn stolen either, so the daemon is told viewOnly.
       const viewOnly = Boolean(otherWorkingId(s.id));
@@ -1870,6 +1867,39 @@ function DeskApp() {
       bindSession,
       otherWorkingId,
     ],
+  );
+
+  /**
+   * P6 — open a subagent's child session from the strip.
+   *
+   * The sidebar hides subagent sessions (`showSubagentSessions` is off by
+   * default and `trackDeskSession` refuses to index them), so this cannot go
+   * through the session list. It does not have to: a child session is a real
+   * directory under `~/.grok/sessions/`, and `session/load` + the feed take an
+   * id, not a sidebar row. The one thing the list would have given us is a way
+   * back, so we remember the parent ourselves.
+   */
+  const openChildSession = useCallback(
+    (childSessionId: string, childCwd: string | null, title: string) => {
+      const parentId = agentRef.current?.sessionId || null;
+      const parentCwd = agentRef.current?.cwd || null;
+      const parentTitle =
+        (parentId ? sessionTitles[parentId] : null) || folderName(parentCwd) || "parent chat";
+      openSession({
+        id: childSessionId,
+        cwd: childCwd || parentCwd || "",
+        title: title || "Subagent",
+        updatedAt: null,
+        createdAt: null,
+        numMessages: 0,
+        model: null,
+        agentName: null,
+      });
+      if (parentId && parentId !== childSessionId) {
+        setChildOrigin({ childId: childSessionId, parentId, parentCwd, parentTitle });
+      }
+    },
+    [openSession, sessionTitles],
   );
 
   const copyWholeChat = useCallback(async () => {
@@ -2311,6 +2341,7 @@ function DeskApp() {
       <SessionDrawers
         sessionId={agent?.sessionId}
         cwd={agent?.cwd}
+        context={feedContext}
         open={sessionDrawer}
         onClose={() => setSessionDrawer(null)}
         onReusePrompt={(text) => setInput(text)}
@@ -2538,6 +2569,9 @@ function DeskApp() {
               <span className="dot" />
               <span className="pill-label">{statusPill.label}</span>
             </span>
+            {/* P6 — /context parity: the number that says this chat is about
+                to auto-compact, next to the rest of the session's status. */}
+            <ContextMeter context={feedContext} onOpen={() => setSessionDrawer("context")} />
             <div className="mode-chip-row desktop-only-actions" title="Agent mode">
               {(
                 [
@@ -2887,6 +2921,46 @@ function DeskApp() {
             This is the same chat. Send continues it — attaching the agent if needed.
           </div>
         )}
+        {/* P6 — say what this chat actually is. 80 headless `grok -p` runs on
+            this machine listed as ordinary conversations; subagent children
+            opened from the strip are not chats you started either. */}
+        {sessionKind === "headless" && (
+          <div className="banner info" role="status">
+            Headless run — this session was started by <code>grok -p</code>, not a chat.
+            Its transcript is here in full; sending continues it as a normal chat.
+          </div>
+        )}
+        {childOrigin && agent?.sessionId === childOrigin.childId && (
+          <div className="banner info" role="status">
+            Subagent session — a child of {childOrigin.parentTitle}.
+            <button
+              type="button"
+              className="icon-btn"
+              style={{ marginLeft: 10, padding: "2px 10px" }}
+              onClick={() => {
+                const back = childOrigin;
+                openSession({
+                  id: back.parentId,
+                  cwd: back.parentCwd || "",
+                  title: back.parentTitle,
+                  updatedAt: null,
+                  createdAt: null,
+                  numMessages: 0,
+                  model: null,
+                  agentName: null,
+                });
+              }}
+            >
+              Back to parent
+            </button>
+          </div>
+        )}
+
+        <SubagentStrip
+          subagents={subagents}
+          cwd={agent?.cwd || null}
+          onOpenChild={openChildSession}
+        />
 
         <div className="messages" ref={scrollerRef} onScroll={onMessagesScroll}>
           <div className="messages-inner">
@@ -3048,17 +3122,6 @@ function DeskApp() {
           {sessionPhase === "creating" ? " · starting chat" : ""}
           {sessionPhase === "loading" ? " · opening" : ""}
           {historyOnly ? " · history only" : ""}
-
-          {contextChip ? (
-            <button
-              type="button"
-              className="context-chip"
-              title="Open usage"
-              onClick={() => setDeskView("usage")}
-            >
-              {Math.round((contextChip.used / Math.max(1, contextChip.limit)) * 100)}% ctx
-            </button>
-          ) : null}
         </div>
 
         <div
@@ -3236,6 +3299,8 @@ function DeskApp() {
         artifacts={liveArtifacts}
         focusId={artifactFocus}
         cwd={agent?.cwd || null}
+        sessionId={agent?.sessionId || null}
+        busy={busy}
         onClose={() => {
           setArtifactsOpen(false);
           setArtifactsPinned(false);
@@ -3337,6 +3402,14 @@ function DeskApp() {
     </div>
     </div>
   );
+}
+
+/** Last path segment of a cwd — "" when there is no cwd. */
+function folderName(cwd: string | null | undefined): string {
+  const c = String(cwd || "").replace(/\/+$/, "");
+  if (!c) return "";
+  const parts = c.split("/");
+  return parts[parts.length - 1] || c;
 }
 
 function projectLabel(cwd: string): string {

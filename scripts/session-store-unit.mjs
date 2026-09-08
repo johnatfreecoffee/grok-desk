@@ -69,6 +69,7 @@ function frame(events, opts = {}) {
     working: opts.working ?? false,
     context: opts.context ?? null,
     subagents: opts.subagents ?? [],
+    sessionKind: opts.sessionKind ?? null,
     turn: opts.turn ?? null,
     truncated: Boolean(opts.truncated),
     hasMore: Boolean(opts.hasMore),
@@ -451,6 +452,168 @@ test("hydrate + persist give a reload the cursor instead of a blank chat", () =>
     frame([ev("agent_message", { text: " continued" })], { fromSeq: 2 }),
   ).state;
   assert.deepEqual(texts(st), ["user:before reload", "assistant:reply continued"]);
+});
+
+/* --------------------------------------------------- P6 · tool identity */
+
+test("a tool's identity is its real name, not the rendered title", () => {
+  seq = 0;
+  const store = new SessionFeedStore();
+  // The CLI opens a tool call with the raw tool name, then rewrites `title`
+  // into prose. Both of these used to be classified by sniffing the word
+  // "agent" out of that prose — which flagged every `AGENT_NAME=… mem` shell
+  // command as a subagent, and missed nothing else.
+  let st = store.applyFeed(
+    SID,
+    frame([
+      ev("agent_message", { text: "working" }),
+      ev("tool_call", { toolCallId: "spawn1", title: "spawn_subagent", status: "pending" }),
+      ev("tool_call", { toolCallId: "sh1", title: "run_terminal_command", status: "pending" }),
+    ]),
+  ).state;
+
+  st = store.applyFeed(
+    SID,
+    frame(
+      [
+        ev("tool_call_update", {
+          toolCallId: "spawn1",
+          title: "[subagent:general-purpose] P2 Imagine auth",
+          toolKind: "other",
+        }),
+        ev("tool_call_update", {
+          toolCallId: "sh1",
+          title: "Execute `AGENT_NAME=grok ~/AgentMemory/bin/mem session NN`",
+          toolKind: "execute",
+        }),
+      ],
+      { fromSeq: 3 },
+    ),
+  ).state;
+
+  const tools = st.messages[0].tools;
+  const spawn = tools.find((t) => t.id === "spawn1");
+  const sh = tools.find((t) => t.id === "sh1");
+  assert.equal(spawn.toolName, "spawn_subagent");
+  assert.equal(spawn.isAgent, true, "spawn_subagent is a real agent tool");
+  assert.equal(sh.toolName, "run_terminal_command");
+  assert.equal(
+    sh.isAgent,
+    false,
+    "a shell command that merely mentions AgentMemory is not a subagent",
+  );
+  // The prose title still renders — it is display text, not identity.
+  assert.match(sh.title, /AgentMemory/);
+});
+
+test("tool_status carries the real duration and outcome from events.jsonl", () => {
+  seq = 0;
+  const store = new SessionFeedStore();
+  let st = store.applyFeed(
+    SID,
+    frame([
+      ev("agent_message", { text: "working" }),
+      ev("tool_call", { toolCallId: "t1", title: "grep", status: "in_progress" }),
+    ]),
+  ).state;
+  assert.equal(st.messages[0].tools[0].durationMs, undefined);
+
+  st = store.applyFeed(
+    SID,
+    frame(
+      [
+        {
+          ...ev("tool_status", {
+            toolCallId: "t1",
+            tool: "grep",
+            phase: "completed",
+            durationMs: 42,
+            outcome: "success",
+          }),
+          src: "events",
+        },
+      ],
+      { fromSeq: 2 },
+    ),
+  ).state;
+  const t = st.messages[0].tools[0];
+  assert.equal(t.durationMs, 42);
+  assert.equal(t.outcome, "success");
+  // The CLI died before writing tool_call_update; the event log closes the row.
+  assert.equal(t.status, "completed");
+});
+
+test("a tool_status for a tool outside the window is ignored, not invented", () => {
+  seq = 0;
+  const store = new SessionFeedStore();
+  const st = store.applyFeed(
+    SID,
+    frame([
+      ev("agent_message", { text: "working" }),
+      { ...ev("tool_status", { toolCallId: "gone", tool: "grep", phase: "completed", durationMs: 9 }), src: "events" },
+    ]),
+  ).state;
+  assert.equal(st.messages[0].tools, undefined, "no phantom tool row");
+});
+
+test("a reload keeps tool identity — toolName, duration and outcome survive", () => {
+  bag.clear();
+  seq = 0;
+  const store = new SessionFeedStore();
+  store.applyFeed(
+    SID,
+    frame([
+      ev("agent_message", { text: "working" }),
+      ev("tool_call", { toolCallId: "t1", title: "run_terminal_command", status: "completed" }),
+      { ...ev("tool_status", { toolCallId: "t1", tool: "run_terminal_command", phase: "completed", durationMs: 188, outcome: "success" }), src: "events" },
+    ]),
+  );
+  persistFeed(store.get(SID));
+  const saved = loadPersistedFeed(SID);
+  const t = saved.messages[0].tools[0];
+  assert.equal(t.toolName, "run_terminal_command");
+  assert.equal(t.durationMs, 188);
+  assert.equal(t.outcome, "success");
+});
+
+test("subagents, context and sessionKind ride the frame, not the transcript", () => {
+  seq = 0;
+  const store = new SessionFeedStore();
+  const st = store.applyFeed(
+    SID,
+    frame([ev("agent_message", { text: "hi" })], {
+      subagents: [
+        {
+          id: "kid1",
+          childSessionId: "kid1",
+          type: "general-purpose",
+          description: "P2 Imagine auth",
+          status: "completed",
+          durationMs: 402_000,
+          toolCalls: 64,
+          output: "done",
+        },
+      ],
+      context: {
+        usagePct: 48,
+        tokensUsed: 241_279,
+        windowTokens: 500_000,
+        turnCount: 10,
+        toolCallCount: 260,
+        errorCount: 3,
+        toolFailureCount: 3,
+        toolsUsed: ["grep"],
+        primaryModelId: "grok-4.6",
+      },
+      sessionKind: "headless",
+    }),
+  ).state;
+  assert.equal(st.subagents.length, 1);
+  assert.equal(st.subagents[0].childSessionId, "kid1");
+  assert.equal(st.context.usagePct, 48);
+  assert.equal(st.sessionKind, "headless");
+  // …and none of it becomes a chat row.
+  assert.deepEqual(texts(st), ["assistant:hi"]);
 });
 
 test("workingIds / otherWorkingId drive the background banner", () => {

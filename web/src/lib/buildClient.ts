@@ -144,6 +144,22 @@ export type SubagentInfo = {
   turns: number | null;
 };
 
+/**
+ * A background *shell* task — `task_backgrounded` / `task_completed`, recorded
+ * in `background_tasks_manifest.json` with its stdout in `terminal/call-*.log`.
+ * Not a subagent.
+ */
+export type BackgroundTaskInfo = {
+  taskId: string;
+  command: string | null;
+  cwd: string | null;
+  kind: string | null;
+  startedAt: number | null;
+  hasLog: boolean;
+  logBytes: number | null;
+  logModifiedAt: number | null;
+};
+
 export type AutomationJob = {
   id: string;
   title: string;
@@ -253,6 +269,19 @@ export const buildApi = {
       `/api/build/subagents?sessionId=${encodeURIComponent(sessionId)}${
         cwd ? `&cwd=${encodeURIComponent(cwd)}` : ""
       }`,
+    ),
+  /** P6 — background *shell* tasks for a session (not subagents). */
+  backgroundTasks: (sessionId: string, cwd?: string | null) =>
+    get<{ ok: boolean; tasks: BackgroundTaskInfo[] }>(
+      `/api/build/background-tasks?sessionId=${encodeURIComponent(sessionId)}${
+        cwd ? `&cwd=${encodeURIComponent(cwd)}` : ""
+      }`,
+    ),
+  backgroundTaskLog: (sessionId: string, taskId: string, cwd?: string | null) =>
+    get<{ ok: boolean; log?: string; bytes?: number; truncated?: boolean; error?: string }>(
+      `/api/build/background-task-log?sessionId=${encodeURIComponent(
+        sessionId,
+      )}&taskId=${encodeURIComponent(taskId)}${cwd ? `&cwd=${encodeURIComponent(cwd)}` : ""}`,
     ),
   doctor: () =>
     get<{

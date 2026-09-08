@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import type { Artifact, ArtifactKind } from "../lib/artifacts";
 import { copyTextToClipboard } from "../lib/clipboard";
-import { buildApi } from "../lib/buildClient";
+import { buildApi, type BackgroundTaskInfo } from "../lib/buildClient";
 import { ModuleInfo } from "./ModuleInfo";
 
 type Tab = "tasks" | "terminal" | "files" | "preview";
@@ -27,6 +27,10 @@ type Props = {
   onRevealPath?: (path: string) => void;
   /** Session cwd for relative path resolve */
   cwd?: string | null;
+  /** Viewed session — background shell tasks are read per session. */
+  sessionId?: string | null;
+  /** A turn is running: keep background logs refreshing. */
+  busy?: boolean;
 };
 
 const TABS: { id: Tab; label: string; icon: typeof Terminal }[] = [
@@ -41,7 +45,16 @@ function byKind(arts: Artifact[], kind: ArtifactKind | ArtifactKind[]): Artifact
   return arts.filter((a) => kinds.includes(a.kind));
 }
 
-export function ArtifactPane({ open, artifacts, focusId, onClose, onRevealPath, cwd }: Props) {
+export function ArtifactPane({
+  open,
+  artifacts,
+  focusId,
+  onClose,
+  onRevealPath,
+  cwd,
+  sessionId,
+  busy,
+}: Props) {
   const [tab, setTab] = useState<Tab>("tasks");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -87,6 +100,67 @@ export function ArtifactPane({ open, artifacts, focusId, onClose, onRevealPath, 
     window.addEventListener("desk-terminal", onTerm);
     return () => window.removeEventListener("desk-terminal", onTerm);
   }, []);
+
+  /*
+   * P6 — background *shell* tasks. `task_backgrounded` puts a tool row in the
+   * transcript and then the output goes to `terminal/call-*.log` on disk,
+   * which Desk never read. These are shell commands, not subagents, so they
+   * belong here in the terminal rail and never in the subagent strip.
+   */
+  const [bgTasks, setBgTasks] = useState<BackgroundTaskInfo[]>([]);
+  const [bgOpenId, setBgOpenId] = useState<string | null>(null);
+  const [bgLog, setBgLog] = useState<{ id: string; log: string; truncated: boolean } | null>(null);
+
+  useEffect(() => {
+    if (!open || tab !== "terminal" || !sessionId) {
+      setBgTasks([]);
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      void buildApi
+        .backgroundTasks(sessionId, cwd)
+        .then((r) => {
+          if (!cancelled) setBgTasks(r.ok ? r.tasks || [] : []);
+        })
+        .catch(() => {
+          if (!cancelled) setBgTasks([]);
+        });
+    };
+    load();
+    if (!busy) return () => { cancelled = true; };
+    const t = window.setInterval(load, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [open, tab, sessionId, cwd, busy]);
+
+  useEffect(() => {
+    if (!bgOpenId || !sessionId) {
+      setBgLog(null);
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      void buildApi
+        .backgroundTaskLog(sessionId, bgOpenId, cwd)
+        .then((r) => {
+          if (cancelled) return;
+          setBgLog({ id: bgOpenId, log: r.log || "", truncated: Boolean(r.truncated) });
+        })
+        .catch(() => {
+          if (!cancelled) setBgLog({ id: bgOpenId, log: "", truncated: false });
+        });
+    };
+    load();
+    if (!busy) return () => { cancelled = true; };
+    const t = window.setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [bgOpenId, sessionId, cwd, busy]);
 
   const taskList = useMemo(() => {
     const seen = new Set<string>();
@@ -137,7 +211,7 @@ export function ArtifactPane({ open, artifacts, focusId, onClose, onRevealPath, 
           const Icon = t.icon;
           const count =
             t.id === "terminal"
-              ? terminals.length
+              ? terminals.length + bgTasks.length
               : t.id === "files"
                 ? files.length
                 : t.id === "tasks"
@@ -192,8 +266,46 @@ export function ArtifactPane({ open, artifacts, focusId, onClose, onRevealPath, 
                 <pre className="artifact-term-pre artifact-output">{ptyLog}</pre>
               </div>
             ) : null}
-            {terminals.length === 0 && !ptyLog && (
-              <div className="artifact-empty">Shell commands stream here.</div>
+            {bgTasks.map((t) => {
+              const openThis = bgOpenId === t.taskId;
+              const cmd = (t.command || "background task").replace(/\s+/g, " ").trim();
+              return (
+                <div key={t.taskId} className="artifact-term-block">
+                  <div className="artifact-term-head">
+                    <Terminal size={12} />
+                    <span title={t.command || undefined}>{cmd}</span>
+                    <span className="artifact-item-st st-run">background</span>
+                    <button
+                      type="button"
+                      className="icon-btn sm"
+                      title={openThis ? "Hide output" : "Show output"}
+                      aria-expanded={openThis}
+                      onClick={() => setBgOpenId(openThis ? null : t.taskId)}
+                    >
+                      {openThis ? "Hide" : "Log"}
+                    </button>
+                  </div>
+                  {openThis ? (
+                    <pre className="artifact-term-pre artifact-output">
+                      {bgLog?.id === t.taskId
+                        ? (bgLog.truncated ? "…[earlier output trimmed]\n" : "") +
+                          (bgLog.log || "(no output yet)")
+                        : "…"}
+                    </pre>
+                  ) : (
+                    <div className="artifact-bg-meta">
+                      {t.cwd ? <span title={t.cwd}>{t.cwd.split("/").pop()}</span> : null}
+                      {t.logBytes != null ? <span>{Math.round(t.logBytes / 1024)} KB</span> : null}
+                      {t.startedAt ? <span>{new Date(t.startedAt).toLocaleTimeString()}</span> : null}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {terminals.length === 0 && bgTasks.length === 0 && !ptyLog && (
+              <div className="artifact-empty">
+                Shell commands stream here — including background tasks the agent left running.
+              </div>
             )}
             {terminals.map((a) => (
               <div key={a.id} className="artifact-term-block">

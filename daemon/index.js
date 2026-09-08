@@ -2450,6 +2450,7 @@ wss.on("connection", (ws, req) => {
         owner: payload?.owner ?? null,
         context: null,
         subagents: [],
+        sessionKind: null,
         turn: null,
         truncated: false,
         hasMore: false,
@@ -2491,6 +2492,10 @@ wss.on("connection", (ws, req) => {
       owner,
       context: payload.context ?? null,
       subagents: payload.subagents || [],
+      // P6 — `summary.sessionKind` already comes back from the projector; the
+      // frame just never carried it, so a headless `grok -p` chat looked like
+      // any other conversation in the chat pane. One field, no new read.
+      sessionKind: payload.summary?.sessionKind ?? null,
       turn: payload.turn ?? null,
       truncated: Boolean(payload.truncated),
       hasMore,
@@ -2591,8 +2596,8 @@ wss.on("connection", (ws, req) => {
      *   client → daemon: subscribe   {sessionId, fromSeq}
      *   client → daemon: unsubscribe {sessionId}
      *   daemon → client: feed {sessionId, fromSeq, seq, events[], live, phase,
-     *                          owner, context, subagents, turn, truncated,
-     *                          hasMore, working}
+     *                          owner, context, subagents, sessionKind, turn,
+     *                          truncated, hasMore, working}
      * fromSeq 0 = tail window (newest events, `truncated` if older exist).
      * fromSeq > 0 = resume: page forward from that cursor, `hasMore` when the
      * batch was capped at FEED_MAX_EVENTS.
