@@ -52,7 +52,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Rewrite `scripts/session-store-unit.mjs` against the code that ships
   - Proof: `npm run smoke:switch` · `npm run smoke:reload`; sending "ok" twice keeps both
 
-- [ ] **P4 Ownership + no clobber**
+- [x] **P4 Ownership + no clobber**
   - Read `active_sessions.json`; refuse `session/load` while a live pid owns the session
   - "Running in Terminal" state, read-only composer, auto-takeover when the pid exits
   - Ownership guard on `deleteSession`
@@ -76,6 +76,9 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Stop writing `desk-messages.json` (read-only legacy fallback)
   - Fix the dead `desk-index` prune (`idx.sessions` vs `idx.sessionIds`); atomic writes
   - Replace the 4000 / 8000 / 200-row truncation with a tail window + "load earlier"
+  - **The ACP pool never reaps workers.** `pool.stopWorker` / `restartAll` exist but are called
+    from nowhere, so spawned workers accumulate until a daemon restart (observed: 3 idle
+    workers after test runs). Wire them up.
   - **The daemon does not kill its ACP children on SIGTERM** — that is how a worker leaked a
     `grok` process for 16 hours holding a stale ownership entry. Reap the pool on shutdown.
   - `deliverFeed` labels each frame's `fromSeq` with `handle.lastSeq` *at send time*, which
