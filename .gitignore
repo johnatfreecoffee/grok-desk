@@ -37,3 +37,6 @@ tools/phone-mcp/node_modules/
 # OS
 .AppleDouble
 .LSOverride
+
+# agent worktrees
+.claude/worktrees/
