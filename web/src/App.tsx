@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DeskClient,
-  fetchTurnTruth,
   type AgentStatus,
   type AttachmentPreview,
   type ChatMessage,
@@ -15,12 +14,15 @@ import { MediaLightbox, guessMediaKind, type MediaItem } from "./components/Medi
 import { extractAutomationFence } from "./lib/automations";
 import { ArtifactPane } from "./components/ArtifactPane";
 import { applyTurnUpdate, createTurnDraft, type TurnDraft } from "./lib/turnState";
+import { createPendingId, isPendingId, shouldPaint } from "./lib/sessionStore";
 import {
-  SessionStore,
-  hydrateMessages,
-  isPendingId,
-  shouldPaint,
-} from "./lib/sessionStore";
+  SessionFeedStore,
+  draftFromState,
+  feedRowSeq,
+  loadPersistedFeed,
+  persistFeed,
+  type FeedFrame,
+} from "./lib/sessionFeed";
 import {
   artifactsFromDraft,
   shouldAutoOpenArtifacts,
@@ -296,6 +298,8 @@ function DeskApp() {
   /** creating | loading | ready | history_only | error | idle */
   const [sessionPhase, setSessionPhase] = useState<string>("idle");
   const [historyOnly, setHistoryOnly] = useState(false);
+  /** A terminal `grok` owns this session (feed `owner && ok`) — no sending. */
+  const [readOnly, setReadOnly] = useState(false);
   /** UI flag: browsing another chat while a turn runs elsewhere */
   const [viewOnlyBrowse, setViewOnlyBrowse] = useState(false);
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>({});
@@ -332,16 +336,24 @@ function DeskApp() {
   const isMailSession = Boolean(agent?.sessionId?.startsWith("mail:"));
 
   const clientRef = useRef<DeskClient | null>(null);
-  const draftRef = useRef<TurnDraft | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  /** In-memory transcript per session so switch-away never blanks the chat. */
-  const sessionCacheRef = useRef<Map<string, ChatMessage[]>>(new Map());
-  /** Isolation: pending new chats, live ids, no cross-thread paint. */
-  const storeRef = useRef(new SessionStore());
-  /** Live turn drafts that survive session switch / sidebar open-close. */
-  const liveDraftBySessionRef = useRef<Map<string, TurnDraft>>(new Map());
+  /** P3 — the projection of ~/.grok/sessions. The ONLY transcript truth. */
+  const feedRef = useRef(new SessionFeedStore());
+  /** sessionId → cwd for every tail this socket is subscribed to. */
+  const subsRef = useRef<Map<string, string | null>>(new Map());
+  /** Sessions the daemon says have a live Desk (ACP) turn. */
+  const deskLiveRef = useRef<Set<string>>(new Set());
+  /**
+   * Low-latency overlay for a Desk turn: `grok agent stdio` only flushes
+   * agent_message_chunk into updates.jsonl at turn end, so the ACP stream is
+   * the same content arriving earlier. Display-only, one per session, retired
+   * by the feed's own turn_end.
+   */
+  const overlayRef = useRef<Map<string, { draft: TurnDraft; startSeq: number }>>(new Map());
+  /** Optimistic user bubbles waiting for the feed to write the real row. */
+  const pendingUserRef = useRef<Map<string, { rows: ChatMessage[]; base: number }>>(new Map());
   const appliedAutoRef = useRef<Set<string>>(new Set());
   const messagesRef = useRef<ChatMessage[]>([]);
   const agentRef = useRef<AgentStatus | null>(null);
@@ -504,19 +516,6 @@ function DeskApp() {
     mergeArtifactsRef.current = mergeArtifacts;
   }, [mergeArtifacts]);
 
-  const stashSession = useCallback(() => {
-    const id = agentRef.current?.sessionId;
-    if (!id) return;
-    const snap = messagesRef.current
-      .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => ({
-        ...m,
-        streaming: false,
-        queued: false,
-      }));
-    if (snap.length) sessionCacheRef.current.set(id, snap);
-  }, []);
-
   /** Set sidebar status for a session. Pass null to clear (read/idle). */
   const setSessionListStatus = useCallback((id: string | null | undefined, status: SessionListStatus | null) => {
     if (!id) return;
@@ -549,11 +548,181 @@ function DeskApp() {
     });
   }, []);
 
-  const pickMessages = useCallback((sessionId: string, disk: ChatMessage[]): ChatMessage[] => {
-    const cached = sessionCacheRef.current.get(sessionId) || [];
-    const draft = liveDraftBySessionRef.current.get(sessionId) || null;
-    return hydrateMessages(disk, cached, draft);
+  /* ------------------------------------------------------------ P3 feed */
+
+  const countUserRows = (list: ChatMessage[]): number =>
+    list.reduce((n, m) => (m.role === "user" ? n + 1 : n), 0);
+
+  /** Any session other than `except` that is mid-turn (background banner). */
+  const otherWorkingId = useCallback((except: string | null | undefined): string | null => {
+    const skip = except ? String(except) : null;
+    for (const id of deskLiveRef.current) if (id !== skip) return id;
+    return feedRef.current.otherWorkingId(skip);
   }, []);
+
+  /**
+   * Repaint the viewed chat from the feed.
+   *
+   * messages = feed projection
+   *          + optimistic user echo not yet on disk
+   *          + the live overlay row while a Desk turn is in flight
+   * Nothing else may call setMessages.
+   */
+  const repaintViewed = useCallback(() => {
+    const sid = agentRef.current?.sessionId || null;
+    if (!sid) {
+      setMessages([]);
+      setLiveDraft(null);
+      setReadOnly(false);
+      busyRef.current = false;
+      setBusy(false);
+      return;
+    }
+    const st = feedRef.current.get(sid);
+    const overlay = overlayRef.current.get(sid) || null;
+    // The feed's turn_end is the one finalize: past it, the overlay is gone.
+    const showOverlay = Boolean(overlay && (!st || st.turnEndSeq <= overlay.startSeq));
+    const rows: ChatMessage[] = st ? [...st.messages] : [];
+    const pending = pendingUserRef.current.get(sid);
+    if (pending?.rows.length) rows.push(...pending.rows);
+    if (showOverlay && overlay) {
+      // The feed is part-way through flushing this same turn (the CLI writes
+      // agent_message_chunk to updates.jsonl in bursts). Its partial assistant
+      // row and the overlay are the SAME reply — render one, not two. The
+      // turn's user row is kept; only assistant rows opened after the turn
+      // started are the overlay's own content.
+      for (let i = rows.length - 1; i >= 0; i -= 1) {
+        const m = rows[i];
+        if (m.role !== "assistant") continue;
+        const rowSeq = feedRowSeq(m.id);
+        if (rowSeq != null && rowSeq > overlay.startSeq) rows.splice(i, 1);
+      }
+      const d = overlay.draft;
+      rows.push({
+        id: d.id,
+        role: "assistant",
+        content: d.content,
+        thought: d.thought || undefined,
+        tools: d.tools,
+        plan: d.plan,
+        phase: d.phase,
+        streaming: true,
+      });
+    }
+    setMessages(rows);
+    setLiveDraft(showOverlay && overlay ? overlay.draft : draftFromState(st));
+    const working = Boolean(st?.working) || deskLiveRef.current.has(sid);
+    busyRef.current = working;
+    setBusy(working);
+    // owner && ok — `owner` alone is populated even when the dir is gone (P2 QC).
+    setReadOnly(Boolean(st?.readOnly));
+    setBgWorkingBanner(otherWorkingId(sid) !== null);
+  }, [otherWorkingId]);
+
+  /** Subscribe one session at its stored cursor (0 = newest tail window). */
+  const feedSubscribeTo = useCallback((sessionId: string | null | undefined, cwd?: string | null) => {
+    const sid = sessionId ? String(sessionId) : "";
+    if (!sid || isPendingId(sid) || sid.startsWith("mail:")) return;
+    const store = feedRef.current;
+    if (!store.has(sid)) {
+      // Reload / PWA resume: paint the persisted rows, then resume at that seq
+      // instead of starting blank.
+      const saved = loadPersistedFeed(sid);
+      if (saved?.messages.length) store.hydrate(sid, saved.seq, saved.messages);
+    }
+    subsRef.current.set(sid, cwd ?? subsRef.current.get(sid) ?? null);
+    clientRef.current?.subscribeFeed(sid, store.cursor(sid), subsRef.current.get(sid));
+  }, []);
+
+  /**
+   * The viewed chat plus everything still working stay subscribed — that is how
+   * leaving A mid-turn keeps A's stream complete while you read B.
+   */
+  const reconcileFeedSubs = useCallback(() => {
+    const viewed = agentRef.current?.sessionId || null;
+    const keep = new Set<string>();
+    if (viewed && !isPendingId(viewed)) keep.add(String(viewed));
+    for (const id of deskLiveRef.current) keep.add(id);
+    for (const id of feedRef.current.workingIds()) keep.add(id);
+    for (const id of [...subsRef.current.keys()]) {
+      if (keep.has(id)) continue;
+      subsRef.current.delete(id);
+      clientRef.current?.unsubscribeFeed(id);
+    }
+    for (const id of keep) {
+      if (subsRef.current.has(id)) continue;
+      feedSubscribeTo(id, id === viewed ? agentRef.current?.cwd || null : null);
+    }
+  }, [feedSubscribeTo]);
+
+  /** After a reconnect / visibility change: resume every tail at its cursor. */
+  const resubscribeAll = useCallback(() => {
+    const viewed = agentRef.current?.sessionId || null;
+    const ids = new Set<string>([...subsRef.current.keys()]);
+    if (viewed && !isPendingId(viewed)) ids.add(String(viewed));
+    for (const id of deskLiveRef.current) ids.add(id);
+    for (const id of ids) {
+      feedSubscribeTo(id, subsRef.current.get(id) ?? (id === viewed ? agentRef.current?.cwd || null : null));
+    }
+  }, [feedSubscribeTo]);
+
+  /** Point the view at a session: bind, subscribe, repaint. */
+  const bindSession = useCallback(
+    (sessionId: string, cwd: string | null) => {
+      const prev = agentRef.current?.sessionId || null;
+      setAgent((a) => {
+        const next = a
+          ? { ...a, sessionId, cwd: cwd || a.cwd, ready: true }
+          : { agentAlive: true, ready: true, sessionId, cwd: cwd || "", grokBin: "" };
+        agentRef.current = next as AgentStatus;
+        return next as AgentStatus;
+      });
+      if (prev && prev !== sessionId) {
+        // Leaving: drop the tail unless that chat is still working.
+        const keepPrev =
+          deskLiveRef.current.has(prev) || feedRef.current.isWorking(prev);
+        if (!keepPrev && subsRef.current.has(prev)) {
+          subsRef.current.delete(prev);
+          clientRef.current?.unsubscribeFeed(prev);
+        }
+      }
+      feedSubscribeTo(sessionId, cwd);
+      repaintViewed();
+    },
+    [feedSubscribeTo, repaintViewed],
+  );
+
+  /** Optimistic user bubble until the feed writes the real one. */
+  const pushPendingUser = useCallback(
+    (sessionId: string | null | undefined, row: ChatMessage) => {
+      const sid = sessionId ? String(sessionId) : "";
+      if (!sid) return;
+      const cur = pendingUserRef.current.get(sid);
+      if (cur) cur.rows.push(row);
+      else {
+        pendingUserRef.current.set(sid, {
+          rows: [row],
+          base: countUserRows(feedRef.current.get(sid)?.messages || []),
+        });
+      }
+      repaintViewed();
+    },
+    [repaintViewed],
+  );
+
+  /** Mark a Desk turn live for this session (send / queue). */
+  const markDeskTurn = useCallback(
+    (sessionId: string | null | undefined) => {
+      const sid = sessionId ? String(sessionId) : "";
+      if (!sid) return;
+      deskLiveRef.current.add(sid);
+      if (!turnSessionRef.current) turnSessionRef.current = sid;
+      setSessionListStatus(sid, "working");
+      reconcileFeedSubs();
+      repaintViewed();
+    },
+    [reconcileFeedSubs, repaintViewed, setSessionListStatus],
+  );
 
   const pinBottomRef = useRef(true);
   const scrollToBottom = useCallback((force = false) => {
@@ -610,184 +779,32 @@ function DeskApp() {
     const client = new DeskClient();
     clientRef.current = client;
 
-    /** Strip streaming from every message (zombies after reconnect unlock). */
-    const stripAllStreaming = (list: ChatMessage[]): ChatMessage[] =>
-      list.map((m) => (m.streaming ? { ...m, streaming: false, phase: m.phase === "idle" ? m.phase : "idle" } : m));
-
-    /** Unlock UI + finalize draft when server is idle but client still thinks mid-turn. */
-    const finalizeIdleTurn = (opts?: {
-      pullTranscript?: boolean;
-      error?: boolean;
-      reason?: string;
-    }) => {
-      const sid = turnSessionRef.current || agentRef.current?.sessionId || null;
-      const draft = draftRef.current;
-      const viewing = shouldPaint(agentRef.current?.sessionId, sid);
-
-      busyRef.current = false;
-      setBusy(false);
-      setBgWorkingBanner(false);
-
-      const applyFinalizeList = (prev: ChatMessage[]): ChatMessage[] => {
-        let next = stripAllStreaming(prev);
-        if (draft) {
-          next = next.map((m) =>
-            m.id === draft.id
-              ? {
-                  ...m,
-                  streaming: false,
-                  content:
-                    draft.content ||
-                    m.content ||
-                    (draft.tools.length ? "" : "✓"),
-                  thought: draft.thought || undefined,
-                  tools: draft.tools,
-                  plan: draft.plan,
-                  phase: "idle",
-                }
-              : m,
-          );
-          if (!next.some((m) => m.id === draft.id)) {
-            next.push({
-              id: draft.id,
-              role: "assistant",
-              content: draft.content || (draft.tools.length ? "" : "✓"),
-              thought: draft.thought || undefined,
-              tools: draft.tools,
-              plan: draft.plan,
-              phase: "idle",
-              streaming: false,
-            });
-          }
-        }
-        return next;
-      };
-
-      if (viewing) {
-        setMessages((prev) => {
-          const next = applyFinalizeList(prev);
-          if (sid) sessionCacheRef.current.set(sid, next);
-          return next;
-        });
-        setLiveDraft(null);
-      } else if (sid) {
-        const cached = sessionCacheRef.current.get(sid) || [];
-        sessionCacheRef.current.set(sid, applyFinalizeList(cached));
-      } else {
-        setMessages((prev) => stripAllStreaming(prev));
+    /**
+     * P3 — the daemon's own turn truth for a Desk-driven turn.
+     *
+     * The feed's `working` is `live && owner`, and `owner` only exists for a
+     * session a terminal `grok` registered in active_sessions.json. A turn Desk
+     * itself started has no owner row, so the daemon's session-scoped
+     * turn_start / turn_end / liveSessionIds is what marks it live. Both are
+     * daemon truth; neither is client guesswork.
+     */
+    const applyDeskTurnTruth = (snap: TurnSnapshot) => {
+      const live = new Set<string>(
+        (snap.liveSessionIds || []).filter(Boolean).map((s) => String(s)),
+      );
+      if (snap.turnActive && snap.activeSessionId) live.add(String(snap.activeSessionId));
+      for (const id of [...deskLiveRef.current]) {
+        if (!live.has(id)) deskLiveRef.current.delete(id);
       }
-
-      draftRef.current = null;
-      if (viewing) setLiveDraft(null);
-      if (sid) {
-        liveDraftBySessionRef.current.delete(sid);
-        if (opts?.error) setSessionListStatus(sid, "error");
-        else if (viewing) setSessionListStatus(sid, null);
-        else setSessionListStatus(sid, "done");
+      for (const id of live) {
+        deskLiveRef.current.add(id);
+        setSessionListStatus(id, "working");
       }
-      turnSessionRef.current = null;
-      setSidebarTick((n) => n + 1);
-
-      if (opts?.pullTranscript !== false && sid && viewing) {
-        void (async () => {
-          try {
-            const q = agentRef.current?.cwd
-              ? `?cwd=${encodeURIComponent(agentRef.current.cwd)}`
-              : "";
-            const resp = await fetch(
-              `/api/sessions/${encodeURIComponent(sid)}/transcript${q}`,
-            );
-            if (!resp.ok) return;
-            if (agentRef.current?.sessionId !== sid) return;
-            const data = await resp.json();
-            const disk: ChatMessage[] = (data.messages || []).map(
-              (m: {
-                id?: string;
-                role: string;
-                content: string;
-                thought?: string;
-                tools?: ChatMessage["tools"];
-                plan?: ChatMessage["plan"];
-              }) => ({
-                id: m.id || uid(),
-                role: m.role as ChatMessage["role"],
-                content: m.content || "",
-                thought: m.thought,
-                tools: m.tools,
-                plan: m.plan,
-                streaming: false,
-              }),
-            );
-            if (!disk.length) return;
-            const merged = stripAllStreaming(pickMessages(sid, disk));
-            sessionCacheRef.current.set(sid, merged);
-            setMessages(merged);
-          } catch {
-            /* */
-          }
-        })();
+      if (!turnSessionRef.current || !live.has(turnSessionRef.current)) {
+        turnSessionRef.current = otherWorkingId(null);
       }
-    };
-
-    /** Apply server turn truth (WS status/hello or HTTP /api/turn). */
-    const applyTurnTruth = (snap: TurnSnapshot, source: string) => {
-      const active = Boolean(snap.turnActive);
-      const liveSid =
-        snap.activeSessionId ||
-        snap.bridgeSessionId ||
-        (active ? turnSessionRef.current : null) ||
-        null;
-
-      if (!active) {
-        if (busyRef.current || draftRef.current) {
-          finalizeIdleTurn({ pullTranscript: true, reason: source });
-        }
-        return;
-      }
-
-      // Server live — record who is live; only claim view busy when viewing that session
-      if (liveSid) {
-        const viewed = agentRef.current?.sessionId;
-        if (!turnSessionRef.current || turnSessionRef.current === liveSid) {
-          turnSessionRef.current = liveSid;
-        } else if (!viewed || viewed === liveSid) {
-          // Viewing the live one (or blank after complete attach) — claim if paint allowed
-          if (!suppressPaintRef.current) turnSessionRef.current = liveSid;
-        }
-        // Always keep draft in map for liveSid
-        setSessionListStatus(liveSid, "working");
-        const partial = snap.partialDraft;
-        if (partial) {
-          const id = partial.id || draftRef.current?.id || uid();
-          const draft = createTurnDraft(id);
-          draft.content = partial.content || "";
-          draft.thought = partial.thought || "";
-          draft.tools = (partial.tools as TurnDraft["tools"]) || [];
-          draft.plan = (partial.plan as TurnDraft["plan"]) || [];
-          draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
-          liveDraftBySessionRef.current.set(liveSid, draft);
-          if (
-            !suppressPaintRef.current &&
-            viewed &&
-            viewed === liveSid
-          ) {
-            draftRef.current = draft;
-            setLiveDraft(draft);
-          }
-        }
-        const viewingLive =
-          !suppressPaintRef.current && Boolean(viewed) && viewed === liveSid;
-        if (viewingLive) {
-          setBusy(true);
-          busyRef.current = true;
-        }
-        setBgWorkingBanner(
-          Boolean(
-            turnSessionRef.current &&
-              (!viewed || viewed !== turnSessionRef.current),
-          ),
-        );
-      }
+      reconcileFeedSubs();
+      repaintViewed();
     };
 
     client.connect({
@@ -804,22 +821,15 @@ function DeskApp() {
         } catch {
           /* */
         }
+        // Every socket is a fresh subscription surface — resume at the cursor.
+        resubscribeAll();
       },
       onClose: () => {
         setConnected(false);
-        // Do NOT fake-finalize the turn. Phone WS flaps mid-stream; agent keeps
-        // working on the Mac. Keep streaming UI + busy so reconnect can resume.
-        if (busyRef.current || draftRef.current) {
-          const draft = draftRef.current;
-          const sid = turnSessionRef.current || agentRef.current?.sessionId;
-          if (draft && sid) liveDraftBySessionRef.current.set(sid, { ...draft });
-          // Stay "working" — status pill will say daemon offline via connected=false
-        }
-        // Allow hello on next socket to re-bind session without forced load thrash
-        // only if we were NOT mid-turn
-        if (!busyRef.current && !draftRef.current) {
-          restoredSessionRef.current = false;
-        }
+        // Do NOT fake-finalize. The agent keeps working on the Mac while the
+        // phone's socket flaps; the feed replays from our cursor on reconnect.
+        subsRef.current.clear();
+        if (!busyRef.current) restoredSessionRef.current = false;
       },
       onStatus: (info) => {
         if (info.agent) setAgent(info.agent);
@@ -830,7 +840,7 @@ function DeskApp() {
         if (snap.agents) setLiveAgents(snap.agents);
         if (snap.liveSessionIds) setLiveSessionIds(snap.liveSessionIds);
         if (snap.pool) setPoolInfo(snap.pool);
-        applyTurnTruth(snap, "ws-status");
+        applyDeskTurnTruth(snap);
       },
       onAgentsRoster: (info) => {
         if (info.agents) setLiveAgents(info.agents);
@@ -846,7 +856,6 @@ function DeskApp() {
           detail: info.detail,
           options: info.options,
         });
-        // Open artifacts so user sees context
         setArtifactsOpen(true);
       },
       onQuestionRequest: (info) => {
@@ -856,9 +865,7 @@ function DeskApp() {
           sessionId: info.sessionId,
           questions: info.questions || [],
         });
-        if (info.sessionId) {
-          setSessionListStatus(info.sessionId, "question");
-        }
+        if (info.sessionId) setSessionListStatus(info.sessionId, "question");
         setDeskView("chat");
       },
       onPlanApprovalRequest: (info) => {
@@ -883,6 +890,90 @@ function DeskApp() {
         else if (m === "plan") setModeChip("plan");
         else setModeChip("agent");
       },
+
+      /* ------------------------------------------------------- the feed */
+      /**
+       * One session's on-disk truth. This is the ONLY writer of transcript
+       * state. The feed's own `turn_end` is the ONLY finalize.
+       */
+      onFeed: (frame) => {
+        const sid = frame?.sessionId ? String(frame.sessionId) : "";
+        if (!sid) return;
+        const store = feedRef.current;
+        const prevTurnEndSeq = store.get(sid)?.turnEndSeq || 0;
+        const res = store.applyFeed(sid, frame as FeedFrame);
+        if (res.ignored) return;
+        if (res.gap) {
+          // Frame started past our cursor — refetch instead of concatenating
+          // over a hole.
+          client.subscribeFeed(sid, res.state.seq, subsRef.current.get(sid) || undefined);
+          return;
+        }
+        const st = res.state;
+
+        // Optimistic user echo retires as the feed produces the real rows.
+        // Counted, never content-matched — sending "ok" twice keeps both.
+        const pending = pendingUserRef.current.get(sid);
+        if (pending) {
+          const n = countUserRows(st.messages);
+          while (pending.rows.length && n > pending.base) {
+            pending.rows.shift();
+            pending.base += 1;
+          }
+          if (!pending.rows.length) pendingUserRef.current.delete(sid);
+        }
+
+        // THE finalize. A catch-up frame replays old turn_ends, so it may never
+        // close a turn that is running right now.
+        const overlay = overlayRef.current.get(sid);
+        if (
+          overlay &&
+          !frame.catchUp &&
+          st.turnEndSeq > prevTurnEndSeq &&
+          st.turnEndSeq > overlay.startSeq
+        ) {
+          overlayRef.current.delete(sid);
+          deskLiveRef.current.delete(sid);
+          if (turnSessionRef.current === sid) turnSessionRef.current = otherWorkingId(sid);
+          setSessionListStatus(
+            sid,
+            shouldPaint(agentRef.current?.sessionId, sid) ? null : "done",
+          );
+          setSidebarTick((n) => n + 1);
+        }
+
+        if (st.working) setSessionListStatus(sid, "working");
+        if (st.error && frame.catchUp) {
+          // The session dir is not there (yet). Never lock the composer on it.
+          console.warn("[feed]", sid.slice(0, 8), st.error);
+        }
+        persistFeed(st);
+
+        if (shouldPaint(agentRef.current?.sessionId, sid)) {
+          repaintViewed();
+          if (res.changed) scrollToBottom();
+          if (st.messages.length) {
+            setLoadingSession(false);
+            setSessionPhase((p) => (p === "loading" ? "ready" : p));
+          }
+        } else {
+          setBgWorkingBanner(otherWorkingId(agentRef.current?.sessionId) !== null);
+        }
+      },
+      onUnsubscribed: (info) => {
+        if (info.sessionId) subsRef.current.delete(String(info.sessionId));
+      },
+      onStopped: (info) => {
+        if (!info.sessionId) return;
+        deskLiveRef.current.delete(info.sessionId);
+        overlayRef.current.delete(info.sessionId);
+        setSessionListStatus(info.sessionId, null);
+        if (turnSessionRef.current === info.sessionId) {
+          turnSessionRef.current = otherWorkingId(info.sessionId);
+        }
+        repaintViewed();
+      },
+
       onHello: (info) => {
         setAgent(info.agent);
         if (typeof (info as { speakReady?: boolean }).speakReady === "boolean") {
@@ -895,7 +986,6 @@ function DeskApp() {
           activeSessionId?: string;
           bridgeSessionId?: string;
           queueSessionIds?: string[];
-          partialDraft?: TurnDraft & { sessionId?: string; id?: string };
           agents?: typeof liveAgents;
           liveSessionIds?: string[];
           pool?: { maxWorkers: number; workerCount: number; busyCount: number };
@@ -903,11 +993,6 @@ function DeskApp() {
         if (hello.agents) setLiveAgents(hello.agents);
         if (hello.liveSessionIds) setLiveSessionIds(hello.liveSessionIds);
         if (hello.pool) setPoolInfo(hello.pool);
-        const liveSid =
-          hello.activeSessionId ||
-          hello.bridgeSessionId ||
-          (hello.turnActive ? turnSessionRef.current : null) ||
-          null;
         const queued = Array.isArray(hello.queueSessionIds) ? hello.queueSessionIds : [];
         // Rehydrate dots from server; strip stale working/* from localStorage
         setSessionStatuses((prev) => {
@@ -916,239 +1001,63 @@ function DeskApp() {
           for (const [id, s] of Object.entries(prev)) {
             if (s && !LIVE.has(s)) next[id] = s;
           }
-          if (hello.turnActive && liveSid) next[liveSid] = "working";
-          for (const q of queued) {
-            if (q && q !== liveSid) next[q] = next[q] || "working";
-          }
+          for (const id of hello.liveSessionIds || []) if (id) next[id] = "working";
+          for (const q of queued) if (q) next[q] = next[q] || "working";
           persistSessionStatuses(next);
           return next;
         });
-        applyTurnTruth(hello as TurnSnapshot, "hello");
-        // PWA cold start only (restoredSessionRef is the one-shot guard). turnActive is
-        // daemon-global, so it must NOT skip the restore — that lands the user on the bridge
-        // session instead of the chat they were reading. Safe mid-turn: when the restored id
-        // is the live one the daemon attaches (sameLive) and when another session owns the
-        // turn it falls back to view-only. It only abandons when nothing is busy.
+        applyDeskTurnTruth(hello as TurnSnapshot);
+
+        // PWA cold start only. `turnActive` is daemon-global, so it must NOT
+        // skip the restore — that lands you on the bridge session instead of
+        // the chat you were reading.
         if (!restoredSessionRef.current) {
           restoredSessionRef.current = true;
           const last = loadLastSession();
-          const curId = info.agent?.sessionId;
-          const liveSid = turnSessionRef.current;
-          if (liveSid && last?.id === liveSid && liveDraftBySessionRef.current.has(liveSid)) {
+          const curId = info.agent?.sessionId || null;
+          if (last?.id) {
             preferredCwdRef.current = last.cwd;
-            const draft = liveDraftBySessionRef.current.get(liveSid)!;
-            draftRef.current = draft;
-            setLiveDraft(draft);
-          } else if (last && last.id && last.id !== curId) {
-            preferredCwdRef.current = last.cwd;
-            setSessionPhase("loading");
-            setLoadingSession(true);
-            client.loadSession(last.id, last.cwd);
-          } else if (last?.cwd) {
-            preferredCwdRef.current = last.cwd;
+            // Bind and paint from the persisted cursor FIRST — the daemon may
+            // already be attached to this session, in which case there is no
+            // load_session round trip to wait for and the chat would otherwise
+            // come back blank.
+            bindSession(last.id, last.cwd);
+            if (last.id !== curId) {
+              setSessionPhase("loading");
+              setLoadingSession(true);
+              client.loadSession(last.id, last.cwd);
+            }
+          } else if (curId) {
+            bindSession(curId, info.agent?.cwd || null);
           } else if (info.agent?.cwd) {
             preferredCwdRef.current = info.agent.cwd;
           }
         }
+        resubscribeAll();
       },
       onReady: (info) => setAgent(info.agent),
+
       onSession: (info) => {
         const prevSid = agentRef.current?.sessionId || null;
-        const midTurn = Boolean(
-          busyRef.current || draftRef.current || turnSessionRef.current,
-        );
-        // User New / parallel blank session / creating phase — never steal live turn
-        const creatingOrSwitching =
-          suppressPaintRef.current ||
-          Boolean((info as { parallel?: boolean }).parallel);
-
-        const bindAgentSession = () => {
-          setAgent((a) => {
-            const next = a
-              ? { ...a, sessionId: info.sessionId, cwd: info.cwd || a.cwd, ready: true }
-              : {
-                  agentAlive: true,
-                  ready: true,
-                  sessionId: info.sessionId,
-                  cwd: info.cwd,
-                  grokBin: "",
-                };
-            agentRef.current = next as any;
-            return next as any;
-          });
-        };
-
         if (info.cwd) preferredCwdRef.current = info.cwd;
         saveLastSession(info.sessionId, info.cwd);
-        // Ensure new chats appear in sidebar immediately under the project
         setSessionTitles((prev) =>
           prev[info.sessionId] ? prev : { ...prev, [info.sessionId]: info.title || "New chat" },
         );
-        setSidebarTick((n) => n + 1);
 
-        // Rebase a pending new-chat onto the real ACP id. Never copy A → B.
-        const oldOwner = turnSessionRef.current || prevSid;
-        const pendingView = isPendingId(prevSid) ? prevSid : null;
-        if (pendingView) {
-          storeRef.current.rebase(pendingView, info.sessionId);
-          const cached = sessionCacheRef.current.get(pendingView);
-          if (cached?.length) {
-            sessionCacheRef.current.set(info.sessionId, cached);
-            sessionCacheRef.current.delete(pendingView);
-          }
-          const live = liveDraftBySessionRef.current.get(pendingView);
-          if (live) {
-            liveDraftBySessionRef.current.set(info.sessionId, live);
-            liveDraftBySessionRef.current.delete(pendingView);
+        // Rebase a pending new-chat onto the real ACP id. Never copy A → B:
+        // only the optimistic echo the user typed into the pending view moves.
+        if (isPendingId(prevSid)) {
+          const held = pendingUserRef.current.get(prevSid!);
+          pendingUserRef.current.delete(prevSid!);
+          if (held?.rows.length) {
+            pendingUserRef.current.set(info.sessionId, { rows: held.rows, base: 0 });
           }
         }
 
-        // Established live owner with its own draft → this is a parallel/new session
-        const parallelSteal =
-          Boolean(turnSessionRef.current) &&
-          turnSessionRef.current !== info.sessionId &&
-          (liveDraftBySessionRef.current.has(turnSessionRef.current!) ||
-            creatingOrSwitching ||
-            Boolean(pendingView));
-
-        // Delayed session id on the SAME turn only when we still have a pending/null view.
-        // Never remap a real live A onto a new B id.
-        if (
-          midTurn &&
-          !creatingOrSwitching &&
-          !parallelSteal &&
-          (!prevSid || isPendingId(prevSid))
-        ) {
-          bindAgentSession();
-          if (oldOwner && isPendingId(oldOwner) && oldOwner !== info.sessionId) {
-            const cached = sessionCacheRef.current.get(oldOwner);
-            if (cached?.length) sessionCacheRef.current.set(info.sessionId, cached);
-            const live = liveDraftBySessionRef.current.get(oldOwner);
-            if (live) liveDraftBySessionRef.current.set(info.sessionId, live);
-            turnSessionRef.current = info.sessionId;
-            setSessionListStatus(info.sessionId, "working");
-          }
-          suppressPaintRef.current = false;
-          setLoadingSession(false);
-          setSessionPhase("ready");
-          setHistoryOnly(false);
-          setSidebarTick((n) => n + 1);
-          return;
-        }
-
-        // Creating blank / parallel new session while another turn lives: bind B
-        // writable. Do not lock the composer. Do not steal A's transcript.
-        if (
-          creatingOrSwitching ||
-          parallelSteal ||
-          (midTurn &&
-            turnSessionRef.current &&
-            info.sessionId !== turnSessionRef.current)
-        ) {
-          bindAgentSession();
-          storeRef.current.view(info.sessionId, info.cwd || null);
-          setSessionListStatus(info.sessionId, null);
-          const pending = pendingPromptRef.current;
-          if (pending) {
-            const seed: ChatMessage[] = [
-              {
-                id: uid(),
-                role: "user",
-                content: pending.label || pending.text,
-              },
-            ];
-            setMessages(seed);
-            sessionCacheRef.current.set(info.sessionId, seed);
-            const t = (pending.label || pending.text).trim().replace(/\s+/g, " ");
-            setSessionTitles((prev) => ({
-              ...prev,
-              [info.sessionId]:
-                (t.length > 72 ? t.slice(0, 72) + "…" : t) || info.title || "New chat",
-            }));
-          } else {
-            const existing = sessionCacheRef.current.get(info.sessionId);
-            setMessages(existing && existing.length ? existing : []);
-            if (!existing) sessionCacheRef.current.set(info.sessionId, []);
-            setSessionTitles((prev) => ({
-              ...prev,
-              [info.sessionId]: info.title || "New chat",
-            }));
-          }
-          // B is idle in the view; A may still own turnSessionRef
-          busyRef.current = false;
-          setBusy(false);
-          setLiveDraft(null);
-          draftRef.current = null;
-          setBgWorkingBanner(storeRef.current.otherLiveId() !== null);
-          // Composer stays writable — viewOnly is not a lock
-          viewOnlyRef.current = false;
-          setViewOnlyBrowse(false);
-          suppressPaintRef.current = false;
-          setQueueLen(0);
-          setLoadingSession(false);
-          setSessionPhase("ready");
-          setHistoryOnly(false);
-          setSessionArtifacts([]);
-          setArtifactFocus(null);
-          if (!artifactsPinnedRef.current) setArtifactsOpen(false);
-          setSidebarTick((n) => n + 1);
-          if (focusComposerRef.current) {
-            focusComposerRef.current = false;
-            window.setTimeout(() => focusComposer(), 50);
-          }
-          if (pending) {
-            pendingPromptRef.current = null;
-            storeRef.current.markLive(info.sessionId);
-            setSessionListStatus(info.sessionId, "working");
-            busyRef.current = true;
-            setBusy(true);
-            setBgWorkingBanner(storeRef.current.otherLiveId() !== null);
-            viewOnlyRef.current = false;
-            setViewOnlyBrowse(false);
-            setTimeout(() => {
-              clientRef.current?.prompt(pending.text, pending.atts, {
-                sessionId: info.sessionId,
-                clientMsgId: uid(),
-              });
-            }, 80);
-          }
-          return;
-        }
-
-        bindAgentSession();
+        bindSession(info.sessionId, info.cwd || null);
         setSessionListStatus(info.sessionId, null);
-        const pending = pendingPromptRef.current;
-        if (pending) {
-          const seed: ChatMessage[] = [
-            {
-              id: uid(),
-              role: "user",
-              content: pending.label || pending.text,
-            },
-          ];
-          setMessages(seed);
-          sessionCacheRef.current.set(info.sessionId, seed);
-          const t = (pending.label || pending.text).trim().replace(/\s+/g, " ");
-          setSessionTitles((prev) => ({
-            ...prev,
-            [info.sessionId]:
-              (t.length > 72 ? t.slice(0, 72) + "…" : t) || info.title || "New chat",
-          }));
-        } else {
-          setMessages([]);
-          sessionCacheRef.current.set(info.sessionId, []);
-          setSessionTitles((prev) => ({
-            ...prev,
-            [info.sessionId]: info.title || "New chat",
-          }));
-        }
-        setBusy(false);
-        busyRef.current = false;
-        setLiveDraft(null);
-        draftRef.current = null;
-        viewOnlyRef.current = false;
-        setViewOnlyBrowse(false);
-        suppressPaintRef.current = false; // New chat session ready — paint allowed
+        suppressPaintRef.current = false;
         setQueueLen(0);
         setLoadingSession(false);
         setSessionPhase("ready");
@@ -1159,11 +1068,20 @@ function DeskApp() {
         setSidebarTick((n) => n + 1);
         if (focusComposerRef.current) {
           focusComposerRef.current = false;
-          // Secondary re-focus after session ready (primary was sync on +)
           window.setTimeout(() => focusComposer(), 50);
         }
+
+        const pending = pendingPromptRef.current;
         if (pending) {
           pendingPromptRef.current = null;
+          const t = (pending.label || pending.text).trim().replace(/\s+/g, " ");
+          setSessionTitles((prev) => ({
+            ...prev,
+            [info.sessionId]: (t.length > 72 ? `${t.slice(0, 72)}…` : t) || "New chat",
+          }));
+          deskLiveRef.current.add(info.sessionId);
+          setSessionListStatus(info.sessionId, "working");
+          repaintViewed();
           setTimeout(() => {
             clientRef.current?.prompt(pending.text, pending.atts, {
               sessionId: info.sessionId,
@@ -1172,164 +1090,22 @@ function DeskApp() {
           }, 80);
         }
       },
+
       onSessionLoaded: (info) => {
-        setAgent((a) => {
-          const next = a
-            ? { ...a, sessionId: info.sessionId, cwd: info.cwd || a.cwd, ready: true }
-            : {
-                agentAlive: true,
-                ready: true,
-                sessionId: info.sessionId,
-                cwd: info.cwd,
-                grokBin: "",
-              };
-          agentRef.current = next as any;
-          return next as any;
-        });
+        // The transcript is NOT taken from this frame any more — the feed owns
+        // it. This only binds the session and reports whether the agent
+        // attached.
+        bindSession(info.sessionId, info.cwd || null);
         if (info.cwd) preferredCwdRef.current = info.cwd;
         saveLastSession(info.sessionId, info.cwd);
-        const disk = (info.messages || []).map((m) => ({
-          id: m.id || uid(),
-          role: m.role,
-          content: m.content,
-          thought: (m as ChatMessage).thought,
-          tools: (m as ChatMessage).tools,
-          plan: (m as ChatMessage).plan,
-          streaming: Boolean((m as ChatMessage).streaming),
-        }));
-        let merged = pickMessages(info.sessionId, disk);
-        // Restore live stream if this session still has an in-flight turn
-        const partial = (info as { partialDraft?: TurnDraft & { id?: string } }).partialDraft;
-        const live =
-          liveDraftBySessionRef.current.get(info.sessionId) ||
-          (partial
-            ? (() => {
-                const d = createTurnDraft(partial.id || uid());
-                d.content = partial.content || "";
-                d.thought = partial.thought || "";
-                d.tools = partial.tools || [];
-                d.plan = partial.plan || [];
-                d.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
-                return d;
-              })()
-            : null);
-        if (live) liveDraftBySessionRef.current.set(info.sessionId, live);
-        // Fold partial/live into transcript so switch-back never drops the last reply mid-stream
-        if (live && (live.content || live.thought || live.tools?.length)) {
-          const has = merged.some(
-            (m) => m.id === live.id || (m.streaming && m.role === "assistant"),
-          );
-          if (has) {
-            merged = merged.map((m) =>
-              m.id === live.id || (m.streaming && m.role === "assistant")
-                ? {
-                    ...m,
-                    id: live.id,
-                    content: live.content || m.content,
-                    thought: live.thought || m.thought,
-                    tools: live.tools?.length ? live.tools : m.tools,
-                    plan: live.plan?.length ? live.plan : m.plan,
-                    phase: live.phase,
-                    streaming: true,
-                  }
-                : m,
-            );
-          } else {
-            merged = [
-              ...merged,
-              {
-                id: live.id,
-                role: "assistant",
-                content: live.content,
-                thought: live.thought || undefined,
-                tools: live.tools,
-                plan: live.plan,
-                phase: live.phase,
-                streaming: true,
-              },
-            ];
-          }
-        }
-        // Drop sticky streaming flag on finished rows from desk shadow
-        if (!(info as { turnActive?: boolean }).turnActive && !live) {
-          merged = merged.map((m) => (m.streaming ? { ...m, streaming: false } : m));
-        }
-        setMessages(merged);
-        sessionCacheRef.current.set(info.sessionId, merged);
-        // This session is "live" only when it owns the turn (not a sibling worker)
-        const ownsLive =
-          turnSessionRef.current === info.sessionId ||
-          (live && turnSessionRef.current === info.sessionId);
-        const turnActive = Boolean(
-          ownsLive ||
-            (live && !turnSessionRef.current) ||
-            (Boolean(partial) &&
-              (!turnSessionRef.current || turnSessionRef.current === info.sessionId)),
-        );
-        const viewOnly = Boolean((info as { viewOnly?: boolean }).viewOnly);
         suppressPaintRef.current = false;
-        storeRef.current.view(info.sessionId, info.cwd || null);
-        if (turnActive && (live || turnSessionRef.current === info.sessionId || partial)) {
-          viewOnlyRef.current = false;
-          setViewOnlyBrowse(false);
-          if (live) {
-            draftRef.current = live;
-            setLiveDraft(live);
-            storeRef.current.markLive(info.sessionId);
-            if (!turnSessionRef.current || turnSessionRef.current === info.sessionId) {
-              turnSessionRef.current = info.sessionId;
-            }
-          }
-          busyRef.current = true;
-          setBusy(true);
-          setBgWorkingBanner(storeRef.current.otherLiveId() !== null);
-          setHistoryOnly(false);
-          setSessionPhase("ready");
-        } else if (
-          viewOnly ||
-          (turnSessionRef.current && turnSessionRef.current !== info.sessionId)
-        ) {
-          // Browsing another chat while a background turn runs — pane is idle
-          // but composer stays writable (viewOnly on the wire = don't steal worker).
-          viewOnlyRef.current = false;
-          setViewOnlyBrowse(false);
-          setLiveDraft(null);
-          draftRef.current = null;
-          busyRef.current = false;
-          setBusy(false);
-          setBgWorkingBanner(true);
-          setHistoryOnly(false);
-          setSessionPhase("ready");
-        } else if (live && turnSessionRef.current === info.sessionId) {
-          viewOnlyRef.current = false;
-          setViewOnlyBrowse(false);
-          draftRef.current = live;
-          setLiveDraft(live);
-          busyRef.current = true;
-          setBusy(true);
-          setBgWorkingBanner(false);
-          setHistoryOnly(false);
-          setSessionPhase("ready");
-        } else {
-          viewOnlyRef.current = false;
-          setViewOnlyBrowse(false);
-          busyRef.current = false;
-          setBusy(false);
-          setLiveDraft(null);
-          draftRef.current = null;
-          setBgWorkingBanner(
-            Boolean(
-              turnSessionRef.current && turnSessionRef.current !== info.sessionId,
-            ),
-          );
-          setSessionPhase(info.agentResumed === false ? "history_only" : "ready");
-          setHistoryOnly(info.agentResumed === false);
-        }
         setQueueLen(0);
         setLoadingSession(false);
         setSessionArtifacts([]);
         setArtifactFocus(null);
         if (!artifactsPinnedRef.current) setArtifactsOpen(false);
+        setSessionPhase(info.agentResumed === false ? "history_only" : "ready");
+        setHistoryOnly(info.agentResumed === false);
         if (info.loadError && !String(info.sessionId || "").startsWith("mail:")) {
           setError(`Opened this chat. Send stays here — attaching agent (${info.loadError})`);
         }
@@ -1338,9 +1114,7 @@ function DeskApp() {
       },
       onSessionStatus: (info) => {
         setSessionPhase(info.state);
-        if (info.state === "creating" || info.state === "loading") {
-          setLoadingSession(true);
-        }
+        if (info.state === "creating" || info.state === "loading") setLoadingSession(true);
         if (info.state === "ready") {
           setLoadingSession(false);
           setHistoryOnly(false);
@@ -1359,480 +1133,123 @@ function DeskApp() {
         setSessionTitles((prev) => ({ ...prev, [info.sessionId]: info.title }));
         setSidebarTick((n) => n + 1);
       },
-      onProjectsTick: () => {
-        setSidebarTick((n) => n + 1);
-      },
+      onProjectsTick: () => setSidebarTick((n) => n + 1),
       onSessionActivity: (info) => {
-        const sid = info.sessionId || turnSessionRef.current || agentRef.current?.sessionId;
+        const sid = info.sessionId;
         if (!sid || !info.status) return;
         const s = info.status as SessionListStatus;
         if (!STATUS_SET.has(s)) return;
-        // Don't override manual unread with transient states from other sessions
         setSessionListStatus(sid, s);
       },
+
+      /**
+       * Desk's own turn started. This opens the low-latency overlay row:
+       * `grok agent stdio` only flushes agent_message_chunk into updates.jsonl
+       * when the turn completes, so the ACP stream is the same content arriving
+       * earlier. It is display-only — the feed replaces it at turn_end.
+       */
       onTurnStart: (info) => {
-        // Server sessionId is required — never invent an owner from the viewed chat
         const sid = info?.sessionId ? String(info.sessionId) : null;
         if (!sid) return;
-        storeRef.current.markLive(sid);
+        deskLiveRef.current.add(sid);
         if (!turnSessionRef.current || turnSessionRef.current === sid) {
           turnSessionRef.current = sid;
         }
         setSessionListStatus(sid, "working");
-        const viewing = shouldPaint(agentRef.current?.sessionId, sid);
-        if (viewing) {
-          setBusy(true);
-          busyRef.current = true;
-          setBgWorkingBanner(false);
+        if (!overlayRef.current.has(sid)) {
+          overlayRef.current.set(sid, {
+            draft: createTurnDraft(info?.draftId || uid()),
+            startSeq: feedRef.current.seqOf(sid),
+          });
+        }
+        if (shouldPaint(agentRef.current?.sessionId, sid)) {
           setHistoryOnly(false);
           setSessionPhase("ready");
-        } else {
-          // Background turn — keep view idle; show bg banner if someone else lives
-          setBgWorkingBanner(
-            Boolean(
-              turnSessionRef.current &&
-                turnSessionRef.current !== agentRef.current?.sessionId,
-            ),
-          );
         }
-        // Clear queued badges for the message that just started (view only)
-        if (viewing) {
-          setMessages((prev) =>
-            prev.map((m) => (m.queued ? { ...m, queued: false } : m)),
-          );
-        }
-        // Prefer server draftId so reconnect / partial_draft / desk shadow share one id
-        const serverDraftId = info?.draftId ? String(info.draftId) : null;
-        // Reconnect may re-emit turn_start — reuse existing streaming draft
-        if (info?.resume && draftRef.current && viewing) {
-          if (serverDraftId && draftRef.current.id !== serverDraftId) {
-            draftRef.current = { ...draftRef.current, id: serverDraftId };
-          }
-          setLiveDraft({ ...draftRef.current });
-          if (sid) liveDraftBySessionRef.current.set(sid, draftRef.current);
-          return;
-        }
-        if (viewing && draftRef.current && draftRef.current.phase !== "idle") {
-          if (serverDraftId && draftRef.current.id !== serverDraftId) {
-            const oldId = draftRef.current.id;
-            draftRef.current = { ...draftRef.current, id: serverDraftId };
-            setMessages((prev) =>
-              prev.map((m) => (m.id === oldId ? { ...m, id: serverDraftId } : m)),
-            );
-          }
-          setLiveDraft({ ...draftRef.current });
-          if (sid) liveDraftBySessionRef.current.set(sid, draftRef.current);
-          return;
-        }
-        // Background resume: refresh map only, leave view draftRef alone
-        if (!viewing && sid) {
-          const existingBg = liveDraftBySessionRef.current.get(sid);
-          if (existingBg) {
-            if (serverDraftId && existingBg.id !== serverDraftId) {
-              existingBg.id = serverDraftId;
-            }
-            liveDraftBySessionRef.current.set(sid, existingBg);
-            return;
-          }
-        }
-        const existing = viewing
-          ? messagesRef.current.find((m) => m.streaming && m.role === "assistant")
-          : undefined;
-        if (existing) {
-          const id = serverDraftId || existing.id;
-          const draft = createTurnDraft(id);
-          draft.content = existing.content || "";
-          draft.thought = existing.thought || "";
-          draft.tools = existing.tools || [];
-          draft.plan = existing.plan || [];
-          if (sid) liveDraftBySessionRef.current.set(sid, draft);
-          if (viewing) {
-            draftRef.current = draft;
-            setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
-            if (id !== existing.id) {
-              setMessages((prev) =>
-                prev.map((m) => (m.id === existing.id ? { ...m, id } : m)),
-              );
-            }
-          }
-          return;
-        }
-        const id = serverDraftId || uid();
-        const draft = createTurnDraft(id);
-        if (sid) liveDraftBySessionRef.current.set(sid, draft);
-        if (viewing) {
-          draftRef.current = draft;
-          setLiveDraft({ ...draft, tools: [], plan: [] });
-          setMessages((prev) => {
-            // Avoid double empty assistant rows on reconnect
-            if (prev.some((m) => m.streaming && m.role === "assistant")) {
-              return prev.map((m) =>
-                m.streaming && m.role === "assistant" ? { ...m, id, streaming: true } : m,
-              );
-            }
-            const next: ChatMessage[] = [
-              ...prev,
-              { id, role: "assistant", content: "", streaming: true },
-            ];
-            if (sid) sessionCacheRef.current.set(sid, next);
-            return next;
-          });
-        }
+        reconcileFeedSubs();
+        repaintViewed();
       },
+
       onUpdate: (update, meta) => {
-        const updateSid = meta?.sessionId ? String(meta.sessionId) : null;
-        if (!updateSid) return;
-        const viewing = shouldPaint(agentRef.current?.sessionId, updateSid);
-        let draft = draftRef.current;
-        // Off-view / foreign updates key strictly off liveDraftBySessionRef. Never fall
-        // back to draftRef (the VIEWED session's draft) — applyTurnUpdate mutates in place,
-        // so that leaked another session's text into the chat on screen. When there is no
-        // draft for updateSid the guard below gets-or-creates one under that id.
-        if (updateSid && turnSessionRef.current && updateSid !== turnSessionRef.current) {
-          draft = liveDraftBySessionRef.current.get(updateSid) || null;
-        } else if (updateSid && !viewing) {
-          draft = liveDraftBySessionRef.current.get(updateSid) || null;
+        const sid = meta?.sessionId ? String(meta.sessionId) : null;
+        if (!sid) return; // untagged stream events are dropped, never guessed
+        let entry = overlayRef.current.get(sid);
+        if (!entry) {
+          if (!deskLiveRef.current.has(sid)) return; // stale update after the turn
+          entry = { draft: createTurnDraft(uid()), startSeq: feedRef.current.seqOf(sid) };
+          overlayRef.current.set(sid, entry);
         }
-        // Reconnect mid-stream: only recreate draft if we already know a live turn owner
-        // (never invent Working… from a lone late update after finalize)
-        if (!draft) {
-          const liveOwner = turnSessionRef.current;
-          const canRevive =
-            Boolean(liveOwner) &&
-            (!updateSid || updateSid === liveOwner) &&
-            (busyRef.current ||
-              liveDraftBySessionRef.current.has(liveOwner!) ||
-              Boolean(updateSid && liveDraftBySessionRef.current.has(updateSid)));
-          if (!canRevive && !updateSid) {
-            // Stale update after turn end — ignore
-            return;
-          }
-          const ownerKey = updateSid || liveOwner;
-          if (!ownerKey) return;
-          const existing = liveDraftBySessionRef.current.get(ownerKey);
-          if (!existing && !canRevive) return;
-          const id = existing?.id || uid();
-          draft = existing || createTurnDraft(id);
-          const sid = updateSid || liveOwner || null;
-          if (sid) {
-            if (!turnSessionRef.current || turnSessionRef.current === sid) {
-              turnSessionRef.current = sid;
-            }
-            liveDraftBySessionRef.current.set(sid, draft);
-            setSessionListStatus(sid, "working");
-          }
-          if (viewing) {
-            draftRef.current = draft;
-            setBusy(true);
-            busyRef.current = true;
-            if (!existing) {
-              setMessages((prev) => {
-                const next: ChatMessage[] = [
-                  ...prev,
-                  { id, role: "assistant", content: "", streaming: true },
-                ];
-                if (sid) sessionCacheRef.current.set(sid, next);
-                return next;
-              });
-            }
-          }
-        }
-        applyTurnUpdate(draft, update);
-        // Clone for React
-        const snap: TurnDraft = {
-          ...draft,
-          tools: draft.tools.map((t) => ({ ...t })),
-          plan: draft.plan.map((p) => ({ ...p })),
+        // applyTurnUpdate mutates; the draft belongs to exactly one session, so
+        // it can never leak into the chat on screen (the P0 bug).
+        applyTurnUpdate(entry.draft, update);
+        entry.draft = {
+          ...entry.draft,
+          tools: entry.draft.tools.map((t) => ({ ...t })),
+          plan: entry.draft.plan.map((p) => ({ ...p })),
         };
-        // Only bind draftRef to view when painting this session
-        if (viewing) draftRef.current = snap;
-        const turnSid = updateSid || turnSessionRef.current || agentRef.current?.sessionId;
-        if (turnSid) {
-          liveDraftBySessionRef.current.set(turnSid, snap);
-          // Live dots from phase (always — sidebar truth)
-          if (snap.phase === "tooling" && snap.plan.length) setSessionListStatus(turnSid, "planning");
-          else if (snap.phase === "tooling") setSessionListStatus(turnSid, "working");
-          else if (snap.phase === "thinking") setSessionListStatus(turnSid, "working");
-          else if (snap.phase === "writing") setSessionListStatus(turnSid, "working");
-        }
-        if (viewing) setLiveDraft(snap);
-        if (viewing) mergeArtifactsRef.current(artifactsFromDraft(snap));
-        // Match by draft id OR any streaming assistant (id can lag after reconnect)
-        const patch = (m: ChatMessage): ChatMessage => {
-          const isTarget =
-            m.id === draft!.id ||
-            (m.role === "assistant" && m.streaming) ||
-            (m.role === "assistant" && !m.content && snap.content);
-          if (!isTarget) return m;
-          return {
-            ...m,
-            id: draft!.id || m.id,
-            content: snap.content,
-            thought: snap.thought || undefined,
-            tools: snap.tools,
-            plan: snap.plan,
-            phase: snap.phase,
-            streaming: true,
-          };
-        };
-        if (viewing) {
-          setMessages((prev) => {
-            let next = prev.map(patch);
-            if (!next.some((m) => m.id === draft!.id || (m.streaming && m.role === "assistant"))) {
-              next = [
-                ...next,
-                {
-                  id: draft!.id,
-                  role: "assistant",
-                  content: snap.content,
-                  thought: snap.thought || undefined,
-                  tools: snap.tools,
-                  plan: snap.plan,
-                  phase: snap.phase,
-                  streaming: true,
-                },
-              ];
-            }
-            if (turnSid) sessionCacheRef.current.set(turnSid, next);
-            return next;
-          });
+        overlayRef.current.set(sid, entry);
+        setSessionListStatus(sid, entry.draft.plan.length ? "planning" : "working");
+        if (shouldPaint(agentRef.current?.sessionId, sid)) {
+          mergeArtifactsRef.current(artifactsFromDraft(entry.draft));
+          repaintViewed();
           scrollToBottom();
-        } else if (turnSid) {
-          const cached = sessionCacheRef.current.get(turnSid) || [];
-          let next = cached.map(patch);
-          if (!next.some((m) => m.id === draft!.id || (m.streaming && m.role === "assistant"))) {
-            next = [
-              ...next,
-              {
-                id: draft!.id,
-                role: "assistant",
-                content: snap.content,
-                thought: snap.thought || undefined,
-                tools: snap.tools,
-                plan: snap.plan,
-                phase: snap.phase,
-                streaming: true,
-              },
-            ];
-          }
-          sessionCacheRef.current.set(turnSid, next);
         }
       },
+
       onPartialDraft: (info) => {
         const partial = info?.draft;
-        if (!partial) return;
         const sid = info.sessionId ? String(info.sessionId) : null;
-        if (!sid) return;
-        // Only apply to live owner / viewed session
-        if (turnSessionRef.current && turnSessionRef.current !== sid) {
-          // still cache for background session
-        }
-        const id = partial.id || draftRef.current?.id || uid();
-        const draft = createTurnDraft(id);
+        if (!partial || !sid) return;
+        const draft = createTurnDraft(partial.id || uid());
         draft.content = partial.content || "";
         draft.thought = partial.thought || "";
         draft.tools = (partial.tools as TurnDraft["tools"]) || [];
         draft.plan = (partial.plan as TurnDraft["plan"]) || [];
         draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
-        liveDraftBySessionRef.current.set(sid, draft);
+        const prev = overlayRef.current.get(sid);
+        overlayRef.current.set(sid, {
+          draft,
+          startSeq: prev?.startSeq ?? feedRef.current.seqOf(sid),
+        });
+        deskLiveRef.current.add(sid);
         setSessionListStatus(sid, "working");
-        const viewing = shouldPaint(agentRef.current?.sessionId, sid);
-        if (viewing) {
-          setBusy(true);
-          busyRef.current = true;
-          draftRef.current = draft;
-          setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
-          setMessages((prev) => {
-            let hit = false;
-            const next = prev.map((m) => {
-              if (m.role === "assistant" && (m.streaming || m.id === id)) {
-                hit = true;
-                return {
-                  ...m,
-                  id,
-                  content: draft.content,
-                  thought: draft.thought || undefined,
-                  tools: draft.tools,
-                  plan: draft.plan,
-                  phase: draft.phase,
-                  streaming: true,
-                };
-              }
-              return m;
-            });
-            if (!hit) {
-              next.push({
-                id,
-                role: "assistant",
-                content: draft.content,
-                thought: draft.thought || undefined,
-                tools: draft.tools,
-                plan: draft.plan,
-                phase: draft.phase,
-                streaming: true,
-              });
-            }
-            sessionCacheRef.current.set(sid, next);
-            return next;
-          });
+        if (shouldPaint(agentRef.current?.sessionId, sid)) {
+          repaintViewed();
           scrollToBottom();
-        } else {
-          const cached = sessionCacheRef.current.get(sid) || [];
-          let hit = false;
-          const next = cached.map((m) => {
-            if (m.role === "assistant" && (m.streaming || m.id === id)) {
-              hit = true;
-              return {
-                ...m,
-                id,
-                content: draft.content,
-                thought: draft.thought || undefined,
-                tools: draft.tools,
-                plan: draft.plan,
-                phase: draft.phase,
-                streaming: true,
-              };
-            }
-            return m;
-          });
-          if (!hit) {
-            next.push({
-              id,
-              role: "assistant",
-              content: draft.content,
-              thought: draft.thought || undefined,
-              tools: draft.tools,
-              plan: draft.plan,
-              phase: draft.phase,
-              streaming: true,
-            });
-          }
-          sessionCacheRef.current.set(sid, next);
         }
       },
+
+      /**
+       * The daemon's ACP turn ended. It unlocks the composer; the OVERLAY is
+       * left standing until the feed's own turn_end lands, so the reply never
+       * flickers out and back while updates.jsonl is being flushed.
+       */
       onTurnEnd: (info) => {
-        const turnSid = info?.sessionId ? String(info.sessionId) : null;
-        if (!turnSid) return;
-        const endedSid = turnSid;
-        storeRef.current.markIdle(endedSid);
-        const liveOwner = turnSessionRef.current;
-        const hadDraft =
-          Boolean(draftRef.current) ||
-          Boolean(endedSid && liveDraftBySessionRef.current.has(endedSid));
-        // Dedup only when fully idle and no draft left for this session.
-        // Never drop a late turn_end after a partial reconnect unlock (phone).
-        if (!busyRef.current && !hadDraft && !info?.abandoned && !info?.error) {
-          if (endedSid) setSessionListStatus(endedSid, null);
-          return;
-        }
-        // Only clear busy if this end matches live owner (or abandon / no owner)
-        const endsLive =
-          info?.abandoned ||
-          !liveOwner ||
-          !endedSid ||
-          endedSid === liveOwner;
-        if (endsLive) {
-          const viewingEnded = shouldPaint(agentRef.current?.sessionId, endedSid);
-          if (viewingEnded || !storeRef.current.viewingBusy()) {
-            busyRef.current = false;
-            setBusy(false);
-          }
-          setBgWorkingBanner(storeRef.current.otherLiveId() !== null);
-          if (turnSessionRef.current === endedSid) turnSessionRef.current = storeRef.current.otherLiveId();
-        }
-        // Prefer map draft for the ended session (view may be on another chat)
-        const draft =
-          (endedSid && liveDraftBySessionRef.current.get(endedSid)) ||
-          draftRef.current;
-        if (endedSid) liveDraftBySessionRef.current.delete(endedSid);
-        // Only clear observe-mode when the *ended* turn is the one we're viewing
-        const viewingId = agentRef.current?.sessionId;
-        const endedIsViewing = Boolean(endedSid && viewingId && endedSid === viewingId);
-        if (endedIsViewing && endsLive) {
+        const sid = info?.sessionId ? String(info.sessionId) : null;
+        if (!sid) return;
+        deskLiveRef.current.delete(sid);
+        if (turnSessionRef.current === sid) turnSessionRef.current = otherWorkingId(sid);
+        const st = feedRef.current.get(sid);
+        // No feed behind this session (dir missing / not readable): nothing will
+        // ever finalize the overlay, so retire it here.
+        if (!st || !st.ok) overlayRef.current.delete(sid);
+        const overlay = overlayRef.current.get(sid);
+        if (overlay) mergeArtifactsRef.current(artifactsFromDraft(overlay.draft));
+        if (info?.abandoned) setSessionListStatus(sid, null);
+        else if (info?.error) setSessionListStatus(sid, "error");
+        else if (shouldPaint(agentRef.current?.sessionId, sid)) setSessionListStatus(sid, null);
+        else setSessionListStatus(sid, "done");
+        if (shouldPaint(agentRef.current?.sessionId, sid)) {
           viewOnlyRef.current = false;
           setViewOnlyBrowse(false);
           setHistoryOnly(false);
           setSessionPhase("ready");
-        } else if (endsLive) {
-          viewOnlyRef.current = false;
-          setViewOnlyBrowse(false);
         }
-        // Abandon → idle (not green done). Natural finish → done if not viewing.
-        if (endedSid) {
-          if (info?.abandoned) setSessionListStatus(endedSid, null);
-          else if (info?.error) setSessionListStatus(endedSid, "error");
-          else if (endedIsViewing) setSessionListStatus(endedSid, null); // read
-          else setSessionListStatus(endedSid, "done"); // green unread
-        }
-        const finalizeRow = (m: ChatMessage): ChatMessage => {
-          const isDraft = draft && m.id === draft.id;
-          if (isDraft && draft) {
-            return {
-              ...m,
-              streaming: false,
-              content:
-                draft.content ||
-                m.content ||
-                (info?.abandoned
-                  ? "(left chat — work stopped; open this session again to continue)"
-                  : draft.tools.length
-                    ? ""
-                    : "✓"),
-              thought: draft.thought || undefined,
-              tools: draft.tools,
-              plan: draft.plan,
-              phase: "idle",
-            };
-          }
-          // Always clear streaming zombies (draft id mismatch after reconnect)
-          if (m.streaming) return { ...m, streaming: false, phase: "idle" };
-          return m;
-        };
-        if (draft) mergeArtifactsRef.current(artifactsFromDraft(draft));
-        const stillViewing = shouldPaint(agentRef.current?.sessionId, turnSid);
-        if (stillViewing) {
-          setMessages((prev) => {
-            let next = prev.map(finalizeRow);
-            if (draft && !next.some((m) => m.id === draft.id)) {
-              next = [
-                ...next,
-                finalizeRow({
-                  id: draft.id,
-                  role: "assistant",
-                  content: "",
-                  streaming: true,
-                }),
-              ];
-            }
-            const cacheSid = turnSid || agentRef.current?.sessionId;
-            if (cacheSid) sessionCacheRef.current.set(cacheSid, next);
-            return next;
-          });
-          setLiveDraft(null);
-          scrollToBottom();
-        } else if (turnSid) {
-          const cached = sessionCacheRef.current.get(turnSid) || [];
-          let next = cached.map(finalizeRow);
-          if (draft && !next.some((m) => m.id === draft.id)) {
-            next.push(
-              finalizeRow({
-                id: draft.id,
-                role: "assistant",
-                content: "",
-                streaming: true,
-              }),
-            );
-          }
-          sessionCacheRef.current.set(turnSid, next);
-        } else {
-          setMessages((prev) => prev.map(finalizeRow));
-        }
-        if (endsLive || stillViewing) draftRef.current = null;
-        if (stillViewing) {
-          setLiveDraft(null);
-        }
+        reconcileFeedSubs();
+        repaintViewed();
         setSidebarTick((n) => n + 1);
       },
+
       onQueued: (info) => {
         setQueueLen(info.remaining);
         if (Array.isArray((info as { items?: QueueItem[] }).items)) {
@@ -1849,34 +1266,14 @@ function DeskApp() {
       },
       onError: (err) => {
         setLoadingSession(false);
-        // Don't surface queue-related noise
         if (/already working/i.test(err)) return;
         setError(err);
-        // Optimistic busy with no turn: re-check server truth
-        if (busyRef.current || draftRef.current) {
-          void fetchTurnTruth().then((snap) => {
-            if (snap && !snap.turnActive) {
-              finalizeIdleTurn({
-                pullTranscript: true,
-                error: true,
-                reason: "error-truth",
-              });
-            }
-          });
-        }
       },
-      onAgentExit: () => {
-        // Server also emits turn_end; belt-and-suspenders unlock
-        if (busyRef.current || draftRef.current) {
-          void fetchTurnTruth().then((snap) => {
-            if (!snap || !snap.turnActive) {
-              finalizeIdleTurn({
-                pullTranscript: true,
-                error: true,
-                reason: "agent_exit",
-              });
-            }
-          });
+      onAgentExit: (info) => {
+        const sid = (info as { sessionId?: string })?.sessionId;
+        if (sid) {
+          deskLiveRef.current.delete(String(sid));
+          repaintViewed();
         }
       },
     });
@@ -1884,173 +1281,36 @@ function DeskApp() {
       client.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- connect once per mount
-  }, [scrollToBottom, pickMessages, focusComposer, setSessionListStatus]);
+  }, [
+    scrollToBottom,
+    focusComposer,
+    setSessionListStatus,
+    repaintViewed,
+    reconcileFeedSubs,
+    resubscribeAll,
+    bindSession,
+    otherWorkingId,
+  ]);
 
-  // While Working…: dual-channel truth (WS status + HTTP /api/turn)
-  useEffect(() => {
-    if (!busy) return;
-    const tick = () => {
-      const client = clientRef.current;
-      if (client?.isConnected()) {
-        client.requestStatus();
-      }
-      // HTTP backup when WS silent or half-open
-      if (!client?.isConnected() || client.lastInboundAge() > 15000) {
-        void fetchTurnTruth().then((snap) => {
-          if (!snap) return;
-          if (!snap.turnActive && (busyRef.current || draftRef.current || turnSessionRef.current)) {
-            // Re-use connect-time finalize via status path simulation
-            clientRef.current?.requestStatus();
-            // Direct HTTP finalize path — only paint if viewing the live session
-            const sid = turnSessionRef.current || agentRef.current?.sessionId;
-            const viewing =
-              Boolean(sid) &&
-              Boolean(agentRef.current?.sessionId) &&
-              agentRef.current!.sessionId === sid;
-            busyRef.current = false;
-            setBusy(false);
-            setBgWorkingBanner(false);
-            if (viewing) {
-              setLiveDraft(null);
-              draftRef.current = null;
-            }
-            if (sid) {
-              liveDraftBySessionRef.current.delete(sid);
-              if (viewing) {
-                setMessages((prev) => {
-                  const next = prev.map((m) =>
-                    m.streaming ? { ...m, streaming: false, phase: "idle" } : m,
-                  );
-                  sessionCacheRef.current.set(sid, next);
-                  return next;
-                });
-              } else {
-                const cached = sessionCacheRef.current.get(sid) || [];
-                sessionCacheRef.current.set(
-                  sid,
-                  cached.map((m) =>
-                    m.streaming ? { ...m, streaming: false, phase: "idle" } : m,
-                  ),
-                );
-              }
-              turnSessionRef.current = null;
-              // Pull final transcript
-              void (async () => {
-                try {
-                  const q = agentRef.current?.cwd
-                    ? `?cwd=${encodeURIComponent(agentRef.current.cwd)}`
-                    : "";
-                  const resp = await fetch(
-                    `/api/sessions/${encodeURIComponent(sid)}/transcript${q}`,
-                  );
-                  if (!resp.ok) return;
-                  const data = await resp.json();
-                  const disk: ChatMessage[] = (data.messages || []).map(
-                    (m: {
-                      id?: string;
-                      role: string;
-                      content: string;
-                      thought?: string;
-                      tools?: ChatMessage["tools"];
-                      plan?: ChatMessage["plan"];
-                    }) => ({
-                      id: m.id || uid(),
-                      role: m.role as ChatMessage["role"],
-                      content: m.content || "",
-                      thought: m.thought,
-                      tools: m.tools,
-                      plan: m.plan,
-                      streaming: false,
-                    }),
-                  );
-                  if (!disk.length) return;
-                  const merged = pickMessages(sid, disk).map((m) => ({
-                    ...m,
-                    streaming: false,
-                  }));
-                  sessionCacheRef.current.set(sid, merged);
-                  if (agentRef.current?.sessionId !== sid) return;
-                  setMessages(merged);
-                } catch {
-                  /* */
-                }
-              })();
-            }
-          }
-        });
-      }
-    };
-    tick();
-    const id = window.setInterval(tick, 6000);
-    return () => window.clearInterval(id);
-  }, [busy, pickMessages]);
 
-  // Phone: page becomes visible — reconnect dead socket + HTTP truth first frame
+  /**
+   * Phone / PWA resume. One operation: reconnect if the socket died, then
+   * resubscribe every tail at its cursor. No force-unlock, no HTTP finalize —
+   * the feed replays whatever happened while we were away.
+   */
   useEffect(() => {
     const onVis = (ev?: Event) => {
       if (document.visibilityState !== "visible" && !(ev as PageTransitionEvent)?.persisted) {
-        // pageshow with persisted still counts
         if (ev?.type !== "pageshow") return;
       }
       const client = clientRef.current;
       if (!client?.isConnected()) {
-        client?.reconnect();
-      } else {
-        client.requestStatus();
-        client.send({ type: "ping" });
+        client?.reconnect(); // onOpen resubscribes
+        return;
       }
-      if (busyRef.current || draftRef.current) {
-        void fetchTurnTruth().then((snap) => {
-          if (snap && !snap.turnActive) {
-            client?.requestStatus();
-            // Force unlock if status path missed
-            setTimeout(() => {
-              if (
-                (busyRef.current || draftRef.current || turnSessionRef.current) &&
-                snap &&
-                !snap.turnActive
-              ) {
-                const sid = turnSessionRef.current || agentRef.current?.sessionId;
-                const viewing =
-                  Boolean(sid) &&
-                  Boolean(agentRef.current?.sessionId) &&
-                  agentRef.current!.sessionId === sid;
-                const d =
-                  (sid && liveDraftBySessionRef.current.get(sid)) || draftRef.current;
-                busyRef.current = false;
-                setBusy(false);
-                setBgWorkingBanner(false);
-                if (viewing) {
-                  setLiveDraft(null);
-                  draftRef.current = null;
-                }
-                if (sid) liveDraftBySessionRef.current.delete(sid);
-                turnSessionRef.current = null;
-                const finalize = (m: ChatMessage): ChatMessage => {
-                  if (!m.streaming && !(d && m.id === d.id)) return m;
-                  return {
-                    ...m,
-                    streaming: false,
-                    content:
-                      (d && m.id === d.id ? d.content || m.content : m.content) ||
-                      (d?.tools?.length ? "" : m.content || "✓"),
-                    thought: (d && m.id === d.id ? d.thought : m.thought) || m.thought,
-                    tools: (d && m.id === d.id ? d.tools : m.tools) || m.tools,
-                    plan: (d && m.id === d.id ? d.plan : m.plan) || m.plan,
-                    phase: "idle",
-                  };
-                };
-                if (viewing) {
-                  setMessages((prev) => prev.map(finalize));
-                } else if (sid) {
-                  const cached = sessionCacheRef.current.get(sid) || [];
-                  sessionCacheRef.current.set(sid, cached.map(finalize));
-                }
-              }
-            }, 400);
-          }
-        });
-      }
+      client.requestStatus();
+      client.send({ type: "ping" });
+      resubscribeAll();
     };
     document.addEventListener("visibilitychange", onVis);
     window.addEventListener("pageshow", onVis);
@@ -2058,7 +1318,7 @@ function DeskApp() {
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("pageshow", onVis);
     };
-  }, []);
+  }, [resubscribeAll]);
 
   useEffect(() => {
     scrollToBottom();
@@ -2112,217 +1372,7 @@ function DeskApp() {
     };
   }, [agent?.sessionId, agent?.cwd]);
 
-  /**
-   * Live transcript sync — when this session is also advanced from CLI (or
-   * another client), pull disk messages so Desk stays current without re-open.
-   * Skip while a Desk turn is streaming so we don't clobber liveDraft.
-   */
-  useEffect(() => {
-    const sid = agent?.sessionId;
-    if (!sid || busy || loadingSession) return;
-    let cancelled = false;
-    const pull = async () => {
-      if (cancelled || busyRef.current || draftRef.current) return;
-      const cur = agentRef.current?.sessionId;
-      if (cur !== sid) return;
-      try {
-        const q = agentRef.current?.cwd
-          ? `?cwd=${encodeURIComponent(agentRef.current.cwd)}`
-          : "";
-        const resp = await fetch(`/api/sessions/${encodeURIComponent(sid)}/transcript${q}`);
-        if (!resp.ok || cancelled) return;
-        const data = await resp.json();
-        const disk: ChatMessage[] = (data.messages || []).map(
-          (m: {
-            id?: string;
-            role: string;
-            content: string;
-            thought?: string;
-            tools?: ChatMessage["tools"];
-            plan?: ChatMessage["plan"];
-          }) => ({
-            id: m.id || uid(),
-            role: m.role as ChatMessage["role"],
-            content: m.content || "",
-            thought: m.thought,
-            tools: m.tools,
-            plan: m.plan,
-            streaming: false,
-          }),
-        );
-        if (!disk.length || cancelled) return;
-        if (agentRef.current?.sessionId !== sid) return;
-        const merged = pickMessages(sid, disk).map((m) =>
-          m.streaming ? { ...m, streaming: false } : m,
-        );
-        setMessages((prev) => {
-          // Never clobber a richer in-memory transcript with a sparser disk view
-          const prevAssist = [...prev].reverse().find((m) => m.role === "assistant");
-          const nextAssist = [...merged].reverse().find((m) => m.role === "assistant");
-          const prevLen = prevAssist?.content?.length || 0;
-          const nextLen = nextAssist?.content?.length || 0;
-          if (prev.length === 0 && merged.length) {
-            sessionCacheRef.current.set(sid, merged);
-            return merged;
-          }
-          if (merged.length > prev.length && nextLen >= prevLen) {
-            sessionCacheRef.current.set(sid, merged);
-            return merged;
-          }
-          if (
-            prev.length === merged.length &&
-            nextLen > prevLen + 40
-          ) {
-            sessionCacheRef.current.set(sid, merged);
-            return merged;
-          }
-          // Prefer prev when it has more assistant body (just finalized in UI)
-          return prev;
-        });
-        // Refresh title from summary if present
-        const t = data.summary?.title;
-        if (t && typeof t === "string") {
-          setSessionTitles((prev) =>
-            prev[sid] === t ? prev : { ...prev, [sid]: t },
-          );
-        }
-      } catch {
-        /* */
-      }
-    };
-    void pull();
-    const id = window.setInterval(() => void pull(), 3000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [agent?.sessionId, busy, loadingSession, pickMessages]);
 
-  /**
-   * Mobile/WS flap safety: while busy, poll /api/turn for partialDraft so
-   * thoughts/tools/text keep painting even when WS updates are dropped.
-   */
-  useEffect(() => {
-    if (!busy) return;
-    let cancelled = false;
-    const tick = async () => {
-      if (cancelled || !busyRef.current) return;
-      try {
-        const resp = await fetch("/api/turn");
-        if (!resp.ok || cancelled) return;
-        const snap = (await resp.json()) as {
-          turnActive?: boolean;
-          activeSessionId?: string | null;
-          partialDraft?: {
-            id?: string;
-            content?: string;
-            thought?: string;
-            tools?: TurnDraft["tools"];
-            plan?: TurnDraft["plan"];
-            phase?: string;
-            sessionId?: string;
-          } | null;
-        };
-        if (!snap.turnActive) return;
-        const partial = snap.partialDraft;
-        if (!partial) return;
-        const sid =
-          snap.activeSessionId ||
-          partial.sessionId ||
-          turnSessionRef.current ||
-          agentRef.current?.sessionId ||
-          null;
-        if (!sid) return;
-        // Reuse partial_draft path via synthetic handler body
-        const id = partial.id || draftRef.current?.id || uid();
-        const draft = createTurnDraft(id);
-        draft.content = partial.content || "";
-        draft.thought = partial.thought || "";
-        draft.tools = partial.tools || [];
-        draft.plan = partial.plan || [];
-        draft.phase = (partial.phase as TurnDraft["phase"]) || "thinking";
-        // Skip if we already have equal/richer content from WS
-        const cur = draftRef.current;
-        if (
-          cur &&
-          (cur.content?.length || 0) >= (draft.content?.length || 0) &&
-          (cur.thought?.length || 0) >= (draft.thought?.length || 0) &&
-          (cur.tools?.length || 0) >= (draft.tools?.length || 0)
-        ) {
-          return;
-        }
-        liveDraftBySessionRef.current.set(sid, draft);
-        const viewing =
-          !suppressPaintRef.current &&
-          Boolean(agentRef.current?.sessionId) &&
-          agentRef.current!.sessionId === sid;
-        if (!viewing) {
-          const cached = sessionCacheRef.current.get(sid) || [];
-          sessionCacheRef.current.set(
-            sid,
-            cached.map((m) =>
-              m.streaming && m.role === "assistant"
-                ? {
-                    ...m,
-                    id,
-                    content: draft.content,
-                    thought: draft.thought || undefined,
-                    tools: draft.tools,
-                    plan: draft.plan,
-                    phase: draft.phase,
-                    streaming: true,
-                  }
-                : m,
-            ),
-          );
-          return;
-        }
-        draftRef.current = draft;
-        setLiveDraft({ ...draft, tools: [...draft.tools], plan: [...draft.plan] });
-        setMessages((prev) => {
-          let hit = false;
-          const next = prev.map((m) => {
-            if (m.role === "assistant" && (m.streaming || m.id === id)) {
-              hit = true;
-              return {
-                ...m,
-                id,
-                content: draft.content,
-                thought: draft.thought || undefined,
-                tools: draft.tools,
-                plan: draft.plan,
-                phase: draft.phase,
-                streaming: true,
-              };
-            }
-            return m;
-          });
-          if (!hit) {
-            next.push({
-              id,
-              role: "assistant",
-              content: draft.content,
-              thought: draft.thought || undefined,
-              tools: draft.tools,
-              plan: draft.plan,
-              phase: draft.phase,
-              streaming: true,
-            });
-          }
-          sessionCacheRef.current.set(sid, next);
-          return next;
-        });
-      } catch {
-        /* */
-      }
-    };
-    void tick();
-    const id = window.setInterval(() => void tick(), 500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [busy]);
 
   const fileToAttachment = useCallback(async (file: File): Promise<AttachmentPreview> => {
     const dataBase64 = await new Promise<string>((resolve, reject) => {
@@ -2388,22 +1438,19 @@ function DeskApp() {
         setError("Email agent threads are read-only here — reply by email to continue.");
         return;
       }
+      if (feedRef.current.get(sid)?.readOnly) {
+        setError("This chat is running in a terminal — read-only until that grok exits.");
+        return;
+      }
       setInput("");
       setError(null);
       const label = text;
       const atts: { name: string; mime: string; dataBase64: string }[] = [];
-      setMessages((prev) => {
-        const next: ChatMessage[] = [
-          ...prev,
-          {
-            id: uid(),
-            role: "user",
-            content: label,
-            queued: busyRef.current && !historyOnlyRef.current,
-          },
-        ];
-        if (sid) sessionCacheRef.current.set(sid, next);
-        return next;
+      pushPendingUser(sid, {
+        id: uid(),
+        role: "user",
+        content: label,
+        queued: busyRef.current && !historyOnlyRef.current,
       });
       if (isPendingId(sid) || (historyOnlyRef.current && !sid)) {
         pendingPromptRef.current = { text, atts, label };
@@ -2424,19 +1471,13 @@ function DeskApp() {
         return;
       }
       const clientMsgId = uid();
-      if (sid) {
-        storeRef.current.markLive(sid);
-        setSessionListStatus(sid, "working");
-      }
-      if (!busyRef.current) {
-        busyRef.current = true;
-        setBusy(true);
-      } else setQueueLen((n) => n + 1);
+      if (busyRef.current) setQueueLen((n) => n + 1);
+      markDeskTurn(sid);
       clientRef.current?.prompt(text, atts, { sessionId: sid, clientMsgId });
       setSidebarTick((n) => n + 1);
       scrollToBottom();
     },
-    [scrollToBottom, setSessionListStatus],
+    [scrollToBottom, markDeskTurn, pushPendingUser],
   );
 
   const send = useCallback(() => {
@@ -2448,6 +1489,10 @@ function DeskApp() {
     // Mail sessions are read-only in Desk
     if (sid?.startsWith("mail:")) {
       setError("Email agent threads are read-only here — reply by email to continue.");
+      return;
+    }
+    if (feedRef.current.get(sid)?.readOnly) {
+      setError("This chat is running in a terminal — read-only until that grok exits.");
       return;
     }
     setInput("");
@@ -2465,43 +1510,34 @@ function DeskApp() {
     // Type-ahead while new session is still creating — send when session arrives
     if (loadingSession && sessionPhase === "creating") {
       pendingPromptRef.current = { text, atts, label };
-      setMessages([
-        {
-          id: uid(),
-          role: "user",
-          content: label,
-          queued: true,
-          attachments: attachments.map((a) => ({
-            id: a.id,
-            name: a.name,
-            mime: a.mime,
-            previewUrl: a.previewUrl,
-          })),
-        },
-      ]);
+      pushPendingUser(sid, {
+        id: uid(),
+        role: "user",
+        content: label,
+        queued: true,
+        attachments: attachments.map((a) => ({
+          id: a.id,
+          name: a.name,
+          mime: a.mime,
+          previewUrl: a.previewUrl,
+        })),
+      });
       setAttachments([]);
       scrollToBottom();
       return;
     }
     const hadUser = messagesRef.current.some((m) => m.role === "user");
-    setMessages((prev) => {
-      const next: ChatMessage[] = [
-        ...prev,
-        {
-          id: uid(),
-          role: "user",
-          content: label,
-          queued: busy && !historyOnlyRef.current,
-          attachments: attachments.map((a) => ({
-            id: a.id,
-            name: a.name,
-            mime: a.mime,
-            previewUrl: a.previewUrl,
-          })),
-        },
-      ];
-      if (sid) sessionCacheRef.current.set(sid, next);
-      return next;
+    pushPendingUser(sid, {
+      id: uid(),
+      role: "user",
+      content: label,
+      queued: busy && !historyOnlyRef.current,
+      attachments: attachments.map((a) => ({
+        id: a.id,
+        name: a.name,
+        mime: a.mime,
+        previewUrl: a.previewUrl,
+      })),
     });
     if (sid && !hadUser && label.trim()) {
       const t = label.trim().replace(/\s+/g, " ");
@@ -2538,70 +1574,49 @@ function DeskApp() {
       setSessionPhase("ready");
     }
     const clientMsgId = uid();
-    if (sid) {
-      storeRef.current.markLive(sid);
-      setSessionListStatus(sid, "working");
-    }
-    if (!busyRef.current) {
-      busyRef.current = true;
-      setBusy(true);
-    } else setQueueLen((n) => n + 1);
+    if (busyRef.current) setQueueLen((n) => n + 1);
+    markDeskTurn(sid);
     clientRef.current?.prompt(text, atts, { sessionId: sid, clientMsgId });
     setAttachments([]);
     setSidebarTick((n) => n + 1);
     if (taRef.current) taRef.current.style.height = "auto";
     scrollToBottom();
-  }, [input, busy, attachments, loadingSession, sessionPhase, scrollToBottom, setSessionListStatus]);
+  }, [
+    input,
+    busy,
+    attachments,
+    loadingSession,
+    sessionPhase,
+    scrollToBottom,
+    markDeskTurn,
+    pushPendingUser,
+  ]);
 
   /** Drop mid-turn UI so New / Open folder / switch session always work. */
   const resetTurnUi = useCallback(() => {
     busyRef.current = false;
     setBusy(false);
     setLiveDraft(null);
-    draftRef.current = null;
     setQueueLen(0);
   }, []);
 
+  /**
+   * Stop ONE session. The daemon answers with `stopped {sessionId}` and the
+   * feed writes the finished rows — nothing is patched into the transcript here.
+   */
   const stopTurn = useCallback(() => {
-    if (!busy && !turnSessionRef.current) return;
-    // Server stop — cancel ACP / restart agent; UI finalizes on turn_end abandoned
-    clientRef.current?.stop();
-    const draft = draftRef.current;
-    const sid = turnSessionRef.current;
-    if (draft) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === draft.id
-            ? {
-                ...m,
-                streaming: false,
-                content: draft.content || m.content || "(stopped)",
-                thought: draft.thought || undefined,
-                tools: draft.tools,
-                plan: draft.plan,
-                phase: "idle",
-              }
-            : m,
-        ),
-      );
-      if (sid) {
-        const cached = sessionCacheRef.current.get(sid) || [];
-        sessionCacheRef.current.set(
-          sid,
-          cached.map((m) =>
-            m.id === draft.id
-              ? { ...m, streaming: false, content: draft.content || m.content || "(stopped)" }
-              : m,
-          ),
-        );
-        liveDraftBySessionRef.current.delete(sid);
-      }
-    }
-    turnSessionRef.current = null;
+    const sid = agentRef.current?.sessionId || turnSessionRef.current;
+    if (!sid) return;
+    if (!busy && !deskLiveRef.current.has(String(sid))) return;
+    clientRef.current?.stop(String(sid));
+    deskLiveRef.current.delete(String(sid));
+    overlayRef.current.delete(String(sid));
+    if (turnSessionRef.current === sid) turnSessionRef.current = otherWorkingId(sid);
     viewOnlyRef.current = false;
     setViewOnlyBrowse(false);
     resetTurnUi();
-  }, [busy, resetTurnUi]);
+    repaintViewed();
+  }, [busy, resetTurnUi, repaintViewed, otherWorkingId]);
 
   const flushForceSend = useCallback(() => {
     const p = pendingForceSendRef.current;
@@ -2635,16 +1650,11 @@ function DeskApp() {
       setSessionPhase("ready");
     }
     const clientMsgId = uid();
-    if (sid) {
-      turnSessionRef.current = sid;
-      setSessionListStatus(sid, "working");
-    }
-    busyRef.current = true;
-    setBusy(true);
+    markDeskTurn(sid);
     clientRef.current?.prompt(p.text, p.atts, { sessionId: sid, clientMsgId });
     setSidebarTick((n) => n + 1);
     scrollToBottom();
-  }, [scrollToBottom, setSessionListStatus]);
+  }, [scrollToBottom, markDeskTurn]);
 
   useEffect(() => {
     if (busy || !pendingForceSendRef.current) return;
@@ -2686,23 +1696,16 @@ function DeskApp() {
     setInput("");
     setError(null);
     setAttachments([]);
-    setMessages((prev) => {
-      const next: ChatMessage[] = [
-        ...prev,
-        {
-          id: uid(),
-          role: "user",
-          content: label,
-          queued: false,
-          attachments: attViews,
-        },
-      ];
-      if (sid) sessionCacheRef.current.set(sid, next);
-      return next;
+    pushPendingUser(sid, {
+      id: uid(),
+      role: "user",
+      content: label,
+      queued: false,
+      attachments: attViews,
     });
     if (taRef.current) taRef.current.style.height = "auto";
     stopTurn();
-  }, [input, attachments, busy, viewOnlyBrowse, send, stopTurn]);
+  }, [input, attachments, busy, isMailSession, send, stopTurn, pushPendingUser]);
 
   const setPermissionModeChip = useCallback((id: "agent" | "auto" | "plan" | "yolo") => {
     setModeChip(id);
@@ -2720,43 +1723,35 @@ function DeskApp() {
 
   const newChat = useCallback(
     (cwd?: string) => {
-      const prevLive = turnSessionRef.current;
-      // Leaving mid-turn A: daemon continues A on a parallel worker. Keep ownership
-      // + live draft for A so the stream never remaps onto blank B.
-      const leavingLive = Boolean(prevLive || busyRef.current || storeRef.current.liveIds.size);
-      if (prevLive) {
-        setSessionListStatus(prevLive, "working");
-        storeRef.current.markLive(prevLive);
-      }
-      stashSession();
+      // Leaving mid-turn A: the daemon continues A on a parallel worker and A
+      // stays subscribed, so its stream never remaps onto blank B.
+      const stillWorking = otherWorkingId(null);
       setError(null);
       setNewMenuOpen(false);
       setOverflowMenuOpen(false);
-      busyRef.current = false;
-      setBusy(false);
-      setLiveDraft(null);
-      draftRef.current = null;
       setQueueLen(0);
-      setMessages([]);
       const target = cwd || preferredCwdRef.current || agent?.cwd;
       if (target) preferredCwdRef.current = target;
-      const pending = storeRef.current.createPending(target || null);
-      // View B immediately under a pending id — A updates won't match, so no paint leak
+      const pendingId = createPendingId();
       suppressPaintRef.current = false;
-      setBgWorkingBanner(leavingLive);
+      setBgWorkingBanner(Boolean(stillWorking));
+      turnSessionRef.current = stillWorking;
       setAgent((a) => {
         const next = a
-          ? { ...a, sessionId: pending.id as any, cwd: target || a.cwd, ready: false }
+          ? { ...a, sessionId: pendingId, cwd: target || a.cwd, ready: false }
           : {
               agentAlive: true,
               ready: false,
-              sessionId: pending.id,
+              sessionId: pendingId,
               cwd: target || "",
               grokBin: "",
             };
-        agentRef.current = next as any;
-        return next as any;
+        agentRef.current = next as AgentStatus;
+        return next as AgentStatus;
       });
+      // Pending ids have no feed — the pane is empty until the real id lands.
+      reconcileFeedSubs();
+      repaintViewed();
       setSessionPhase("creating");
       setLoadingSession(false);
       setHistoryOnly(false);
@@ -2768,7 +1763,14 @@ function DeskApp() {
       setSidebarTick((n) => n + 1);
       focusComposer({ sync: true });
     },
-    [agent?.cwd, stashSession, closeMobileSidebar, focusComposer, setSessionListStatus],
+    [
+      agent?.cwd,
+      closeMobileSidebar,
+      focusComposer,
+      otherWorkingId,
+      reconcileFeedSubs,
+      repaintViewed,
+    ],
   );
 
   const openFolder = useCallback(async () => {
@@ -2782,30 +1784,27 @@ function DeskApp() {
         folder = window.prompt("Folder path to open as project:", agent?.cwd || "") || null;
       }
       if (!folder) return;
-      const prevLive = turnSessionRef.current;
-      const leavingLive = Boolean(prevLive || busyRef.current);
-      if (prevLive) setSessionListStatus(prevLive, "working");
-      stashSession();
+      const stillWorking = otherWorkingId(null);
       setError(null);
-      // View unlock only — keep A live ownership / draft map if daemon continues
+      // View unlock only — a session that is still working keeps its tail.
       busyRef.current = false;
       setBusy(false);
       setLiveDraft(null);
-      draftRef.current = null;
       setQueueLen(0);
       setMessages([]);
+      turnSessionRef.current = stillWorking;
       setSessionPhase("creating");
       setLoadingSession(true);
       setHistoryOnly(false);
       preferredCwdRef.current = folder;
       suppressPaintRef.current = true;
-      // Keep turnSessionRef on prevLive so bg banner / ownership survive
-      setBgWorkingBanner(leavingLive);
+      setBgWorkingBanner(Boolean(stillWorking));
       setAgent((a) => {
-        const next = a ? { ...a, sessionId: null as any, ready: false } : a;
-        agentRef.current = next as any;
-        return next as any;
+        const next = a ? { ...a, sessionId: null as unknown as string, ready: false } : a;
+        agentRef.current = next as AgentStatus;
+        return next as AgentStatus;
       });
+      reconcileFeedSubs();
       closeMobileSidebar();
       focusComposerRef.current = true;
       clientRef.current?.newSession(folder);
@@ -2816,8 +1815,13 @@ function DeskApp() {
       setLoadingSession(false);
       setSessionPhase("error");
     }
-  }, [agent?.cwd, stashSession, closeMobileSidebar, focusComposer, setSessionListStatus]);
+  }, [agent?.cwd, closeMobileSidebar, focusComposer, otherWorkingId, reconcileFeedSubs]);
 
+  /**
+   * Open a chat. One operation: bind the view, subscribe to that session's feed
+   * from its cursor, and let the feed paint. Nothing is copied out of a cache
+   * and the session you left keeps streaming if it is still working.
+   */
   const openSession = useCallback(
     (s: SessionMeta) => {
       // Allow re-click if stuck loading the same session
@@ -2826,67 +1830,24 @@ function DeskApp() {
         closeMobileSidebar();
         return;
       }
-      // Opening marks read unless this session is still working in background
-      const liveSid = turnSessionRef.current;
-      const isLive =
-        Boolean(liveSid) &&
-        (busyRef.current || busy || liveDraftBySessionRef.current.has(liveSid!));
-      const isBackgroundLive = Boolean(liveSid && liveSid === s.id && isLive);
-      if (!isBackgroundLive) setSessionListStatus(s.id, null);
-      stashSession();
+      const stillWorking = deskLiveRef.current.has(s.id) || feedRef.current.isWorking(s.id);
+      if (!stillWorking) setSessionListStatus(s.id, null);
       setError(null);
-      // Keep live draft if reopening the session that owns the in-flight turn
-      const keepLive = liveSid === s.id && isLive;
-      // Another chat is working — view transcript only, do NOT kill that turn
-      // Use turnSessionRef (set optimistically on send) not only React busy
-      const viewOnly = Boolean(isLive && liveSid && liveSid !== s.id);
       suppressPaintRef.current = false;
-      storeRef.current.view(s.id, s.cwd || null);
-      if (!keepLive && !viewOnly) resetTurnUi();
-      if (viewOnly) {
-        setLiveDraft(null);
-        draftRef.current = null;
-        busyRef.current = false;
-        setBusy(false);
-        setBgWorkingBanner(true);
-        setViewOnlyBrowse(false);
-        viewOnlyRef.current = false;
-      }
+      viewOnlyRef.current = false;
+      setViewOnlyBrowse(false);
+      // Another chat working is NOT a reason to lock this composer — but it must
+      // not have its turn stolen either, so the daemon is told viewOnly.
+      const viewOnly = Boolean(otherWorkingId(s.id));
+      setQueueLen(0);
       setSessionPhase("loading");
       setLoadingSession(true);
       setHistoryOnly(false);
-      // Load B from cache only — never wipe A's liveDraftBySessionRef
-      const cached = sessionCacheRef.current.get(s.id);
-      setMessages(cached && cached.length ? cached : []);
-      // Sync agentRef early so viewing checks key off B immediately
-      setAgent((a) => {
-        const next = a
-          ? { ...a, sessionId: s.id, cwd: s.cwd || a.cwd, ready: false }
-          : a;
-        agentRef.current = next as any;
-        return next as any;
-      });
-      if (keepLive) {
-        const draft = liveDraftBySessionRef.current.get(s.id);
-        if (draft) {
-          draftRef.current = draft;
-          setLiveDraft(draft);
-        }
-        busyRef.current = true;
-        setBusy(true);
-        setBgWorkingBanner(false);
-      } else if (!viewOnly) {
-        setLiveDraft(null);
-        draftRef.current = null;
-      }
       if (s.cwd) preferredCwdRef.current = s.cwd;
       saveLastSession(s.id, s.cwd);
+      bindSession(s.id, s.cwd || null);
       closeMobileSidebar();
       clientRef.current?.loadSession(s.id, s.cwd, { viewOnly });
-      // onSessionLoaded will clear suppressPaint via ready path; safety unlock
-      window.setTimeout(() => {
-        suppressPaintRef.current = false;
-      }, 0);
       window.setTimeout(() => {
         setLoadingSession((v) => {
           if (v) setSessionPhase((p) => (p === "loading" ? "history_only" : p));
@@ -2898,11 +1859,10 @@ function DeskApp() {
       agent?.sessionId,
       loadingSession,
       sessionPhase,
-      resetTurnUi,
-      stashSession,
       setSessionListStatus,
       closeMobileSidebar,
-      busy,
+      bindSession,
+      otherWorkingId,
     ],
   );
 
@@ -2938,11 +1898,12 @@ function DeskApp() {
     if (sessionPhase === "creating") return { cls: "warn", label: "Starting chat…" };
     if (sessionPhase === "loading") return { cls: "warn", label: "Opening…" };
     if (isMailSession) return { cls: "warn", label: "Mail · read-only" };
+    if (readOnly) return { cls: "warn", label: "Terminal" };
     if (historyOnly) return { cls: "warn", label: "Same chat" };
     if (agent?.ready) return { cls: "ok", label: "Ready" };
     if (agent?.agentAlive) return { cls: "warn", label: "Agent starting…" };
     return { cls: "warn", label: "Connecting…" };
-  }, [connected, agent, busy, sessionPhase, historyOnly, isMailSession]);
+  }, [connected, agent, busy, sessionPhase, historyOnly, readOnly, isMailSession]);
 
   const projectName = useMemo(() => {
     const cwd = agent?.cwd || "";
@@ -2952,12 +1913,13 @@ function DeskApp() {
   }, [agent?.cwd]);
 
   const composerPlaceholder = useMemo(() => {
+    if (readOnly) return "Running in Terminal — read-only";
     if (isMailSession) return "Reply by email to continue";
     if (busy) return "Queue a follow-up…";
     if (historyOnly) return "Continue this chat…";
     if (projectName && messages.length === 0) return `Ask anything about ${projectName}…`;
     return "Message Grok…";
-  }, [isMailSession, busy, historyOnly, projectName, messages.length]);
+  }, [isMailSession, readOnly, busy, historyOnly, projectName, messages.length]);
 
   const liveArtifacts = useMemo(() => {
     const fromLive = artifactsFromDraft(liveDraft);
@@ -3209,7 +2171,8 @@ function DeskApp() {
         setSidebarTick((n) => n + 1);
       },
       onStopAgent: () => {
-        clientRef.current?.send({ type: "stop" });
+        const sid = agentRef.current?.sessionId || turnSessionRef.current;
+        clientRef.current?.stop(sid || null);
       },
       onRenameSession: (sessionId, title) => {
         void buildApi.sessionRename(sessionId, title).then(() => setSidebarTick((n) => n + 1));
@@ -3859,6 +2822,12 @@ function DeskApp() {
             New chat ready — type below to start.
           </div>
         )}
+        {readOnly && (
+          <div className="banner info" role="status">
+            Running in Terminal — this chat is read-only here. It becomes sendable
+            when that <code>grok</code> exits.
+          </div>
+        )}
         {historyOnly && agent?.sessionId?.startsWith("mail:") && (
           <div className="banner info" role="status">
             Email agent thread (Agent Mail). Read-only here — reply by email to continue the thread.
@@ -4141,11 +3110,13 @@ function DeskApp() {
             ))}
           </div>
           <div
-            className={`composer pill shell${busy ? " is-busy" : ""}${isMailSession ? " mail-locked" : ""}`}
+            className={`composer pill shell${busy ? " is-busy" : ""}${
+              isMailSession || readOnly ? " mail-locked" : ""
+            }`}
           >
           <div className="composer-row">
           <DictateButton
-            disabled={loadingSession || isMailSession}
+            disabled={loadingSession || isMailSession || readOnly}
             onText={(text) => {
               setInput((prev) => {
                 const next = prev.trim() ? `${prev.replace(/\s+$/, "")} ${text}` : text;
@@ -4159,7 +3130,7 @@ function DeskApp() {
             type="button"
             className="icon-btn sm"
             title="Attach files"
-            disabled={isMailSession}
+            disabled={isMailSession || readOnly}
             onClick={() => fileInputRef.current?.click()}
           >
             <Paperclip size={18} strokeWidth={2} />
@@ -4182,7 +3153,7 @@ function DeskApp() {
             inputMode="text"
             enterKeyHint="send"
             // Never disable during creating — iOS needs focus on + gesture for keyboard
-            disabled={isMailSession}
+            disabled={isMailSession || readOnly}
             onChange={(e) => {
               setInput(e.target.value);
               e.target.style.height = "auto";
@@ -4229,7 +3200,8 @@ function DeskApp() {
             aria-label={busy ? "Queue follow-up" : "Send"}
             disabled={
               (!input.trim() && attachments.length === 0) ||
-              isMailSession
+              isMailSession ||
+              readOnly
             }
           >
             {busy ? (
