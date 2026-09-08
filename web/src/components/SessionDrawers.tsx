@@ -1,19 +1,31 @@
 import { useCallback, useEffect, useState } from "react";
 import { History, Info, RotateCcw, X } from "lucide-react";
 import { buildApi } from "../lib/buildClient";
+import type { FeedContext } from "../lib/sessionFeed";
+import { contextLevel, contextPct, formatTokens } from "./ContextMeter";
 
 type Drawer = "info" | "rewind" | "history" | "context" | null;
 
 type Props = {
   sessionId: string | null | undefined;
   cwd?: string | null;
+  /** P6 — live context window usage from the feed (signals.json). */
+  context?: FeedContext | null;
   open: Drawer;
   onClose: () => void;
   onRewind?: (promptIndex: number) => void;
   onReusePrompt?: (text: string) => void;
 };
 
-export function SessionDrawers({ sessionId, cwd, open, onClose, onRewind, onReusePrompt }: Props) {
+export function SessionDrawers({
+  sessionId,
+  cwd,
+  context,
+  open,
+  onClose,
+  onRewind,
+  onReusePrompt,
+}: Props) {
   const [info, setInfo] = useState<Record<string, unknown> | null>(null);
   const [points, setPoints] = useState<
     { promptIndex: number; createdAt: string | null; fileCount: number; files: string[] }[]
@@ -106,6 +118,12 @@ export function SessionDrawers({ sessionId, cwd, open, onClose, onRewind, onReus
                   ) : null,
                 )}
               </dl>
+              {open === "context" && context ? (
+                <div style={{ marginTop: 14 }}>
+                  <h3 className="build-h3">Context window</h3>
+                  <ContextWindowBlock context={context} />
+                </div>
+              ) : null}
               {open === "context" && usage ? (
                 <div style={{ marginTop: 14 }}>
                   <h3 className="build-h3">Token / usage</h3>
@@ -209,6 +227,54 @@ export function SessionDrawers({ sessionId, cwd, open, onClose, onRewind, onReus
         </div>
       </aside>
     </div>
+  );
+}
+
+/**
+ * `/context` parity — the CLI's own counters from `signals.json`, not a Desk
+ * re-count. `usagePct` is the one that predicts auto-compaction.
+ */
+function ContextWindowBlock({ context }: { context: FeedContext }) {
+  const pct = contextPct(context);
+  const level = pct == null ? "ok" : contextLevel(pct);
+  return (
+    <>
+      {pct != null ? (
+        <div className={`ctx-drawer-meter ${level}`}>
+          <div className="ctx-drawer-bar">
+            <div className="ctx-drawer-fill" style={{ width: `${Math.max(2, Math.round(pct))}%` }} />
+          </div>
+          <div className="ctx-drawer-num">{Math.round(pct)}%</div>
+        </div>
+      ) : null}
+      <dl className="session-info-dl">
+        {[
+          ["Used", formatTokens(context.tokensUsed)],
+          ["Window", formatTokens(context.windowTokens)],
+          ["Turns", context.turnCount],
+          ["Tool calls", context.toolCallCount],
+          ["Tool failures", context.toolFailureCount],
+          ["Errors", context.errorCount],
+          ["Model", context.primaryModelId],
+        ].map(([k, v]) =>
+          v != null && v !== "" ? (
+            <div key={String(k)} className="session-info-row">
+              <dt>{k}</dt>
+              <dd>{String(v)}</dd>
+            </div>
+          ) : null,
+        )}
+      </dl>
+      {context.toolsUsed?.length ? (
+        <div className="ctx-tools">
+          {context.toolsUsed.map((t) => (
+            <span key={t} className="src-chip src-cli">
+              {t}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </>
   );
 }
 

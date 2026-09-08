@@ -33,9 +33,11 @@ export type SessionMeta = {
   model: string | null;
   agentName: string | null;
   branch?: string | null;
-  /** desk | cli | agent */
+  /** desk | cli | mail | headless | subagent */
   source?: string;
   sourceLabel?: string;
+  /** Raw `session_kind` from summary.json — "headless" / "subagent" / null. */
+  sessionKind?: string | null;
   projectLabel?: string;
   /** Pinned within its project folder */
   pinned?: boolean;
@@ -62,6 +64,8 @@ export type DeskSettings = {
   maxProjectsShown: number;
   showHomeSessions: boolean;
   showAllCliSessions: boolean;
+  /** Show subagent worker sessions as peer chats in the sidebar. */
+  showSubagentSessions?: boolean;
   collapsedProjects: Record<string, boolean>;
   pinnedCwds: string[];
   /** sessionId → true */
@@ -564,7 +568,11 @@ export function Sidebar({
                         ? "Started from email (Agent Mail)"
                         : src === "desk"
                           ? "Started in Grok Desk"
-                          : "Grok CLI / TUI";
+                          : src === "headless"
+                            ? "Headless run (grok -p), not an interactive chat"
+                            : src === "subagent"
+                              ? "Subagent worker session spawned by another chat"
+                              : "Grok CLI / TUI";
                     const when = status
                       ? STATUS_LABEL[status].toLowerCase()
                       : relTime(s.updatedAt) || (isNew ? "just now" : "");
@@ -580,6 +588,7 @@ export function Sidebar({
                           status === "working" || status === "planning" ? "live" : "",
                           status === "done" || status === "unread" ? "unread" : "",
                           src === "mail" ? "mail" : "",
+                          src === "headless" || src === "subagent" ? "machine" : "",
                           isNew ? "is-new" : "",
                           isPinned ? "pinned" : "",
                         ]
@@ -1006,6 +1015,20 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
             />
             <span>Include home-directory sessions</span>
           </label>
+          <label className="field check">
+            <input
+              type="checkbox"
+              checked={Boolean(settings.showSubagentSessions)}
+              onChange={(e) =>
+                setSettings({ ...settings, showSubagentSessions: e.target.checked })
+              }
+            />
+            <span>List subagent sessions as chats</span>
+          </label>
+          <p className="modal-hint">
+            Subagent children are always reachable from the Agents strip at the top of a chat.
+            This only decides whether they also sit in the sidebar as their own rows.
+          </p>
         </div>
 
         <div className="settings-section">

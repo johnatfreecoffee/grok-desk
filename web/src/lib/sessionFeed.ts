@@ -21,6 +21,7 @@
  */
 import type { ChatMessage } from "./acpClient.ts";
 import type { LivePhase, PlanEntry, ToolCallView, TurnDraft } from "./turnState.ts";
+import { isAgentToolName, normalizeToolName } from "./turnState.ts";
 
 /* ------------------------------------------------------------------ types */
 
@@ -55,13 +56,21 @@ export type FeedSubagent = {
   parentSessionId?: string;
   type?: string | null;
   description?: string | null;
+  role?: string | null;
+  model?: string | null;
   status?: string | null;
   startedAt?: string | number | null;
   completedAt?: string | number | null;
   durationMs?: number | null;
   toolCalls?: number | null;
   turns?: number | null;
+  tokensUsed?: number | null;
+  /** `output.json` — the child's final report. */
   output?: string;
+  outputBytes?: number | null;
+  outputTooLarge?: boolean;
+  childCwd?: string | null;
+  worktreePath?: string | null;
   [k: string]: unknown;
 };
 
@@ -98,6 +107,10 @@ export type FeedEvent = {
   description?: string | null;
   exitCode?: number | null;
   outcome?: string | null;
+  /** tool_status: the real tool name the CLI ran. */
+  tool?: string | null;
+  /** tool_status / subagent_finish: measured duration. */
+  durationMs?: number | null;
   [k: string]: unknown;
 };
 
@@ -114,6 +127,8 @@ export type FeedFrame = {
   working?: boolean;
   context?: FeedContext | null;
   subagents?: FeedSubagent[];
+  /** `session_kind` from summary.json — "headless", "subagent", … */
+  sessionKind?: string | null;
   turn?: FeedTurn | null;
   truncated?: boolean;
   hasMore?: boolean;
@@ -138,6 +153,8 @@ export type SessionFeedState = {
   phase: string | null;
   subagents: FeedSubagent[];
   context: FeedContext | null;
+  /** How the CLI opened this session — "headless" / "subagent" / null. */
+  sessionKind: string | null;
   turn: FeedTurn | null;
   /** Older history exists behind the tail window ("load earlier"). */
   truncated: boolean;
@@ -209,16 +226,6 @@ export function userFacingText(raw: string): string | null {
     .trim();
   if (!text || text === "[" || text === "]") return null;
   return text;
-}
-
-function isAgentTool(title: string, kind?: string): boolean {
-  const t = `${title} ${kind || ""}`.toLowerCase();
-  return (
-    t.includes("agent") ||
-    t.includes("subagent") ||
-    t.includes("spawn") ||
-    t.includes("task(")
-  );
 }
 
 function toolDetail(raw: unknown): string | undefined {
@@ -399,7 +406,13 @@ function reduceEvent(r: Reducer, ev: FeedEvent): boolean {
       // A tool_call_update for a tool from an earlier bubble updates it in place.
       const row = known ? null : assistantRow(r, ev.seq);
       const tool = known || ensureTool(r, row!, id, ev.seq);
-      if (ev.title != null) tool.title = String(ev.title);
+      if (ev.title != null) {
+        // The FIRST title off the wire is the raw tool name (`read_file`,
+        // `spawn_subagent`); the CLI then rewrites it into prose. Keep the
+        // first one as the identity and let `title` be display text.
+        if (!tool.toolName) tool.toolName = normalizeToolName(String(ev.title));
+        tool.title = String(ev.title);
+      }
       if (ev.toolKind != null) tool.kind = String(ev.toolKind);
       if (ev.status != null) tool.status = String(ev.status);
       if (ev.rawInput !== undefined) {
@@ -433,8 +446,40 @@ function reduceEvent(r: Reducer, ev: FeedEvent): boolean {
         const loc = ev.locations[0] as { path?: string } | undefined;
         if (loc && typeof loc.path === "string") tool.path = loc.path;
       }
-      tool.isAgent = isAgentTool(tool.title, tool.kind);
+      tool.isAgent = isAgentToolName(tool.toolName, tool.kind);
       if (r.cur && r.cur.role === "assistant") r.cur.phase = "tooling";
+      return true;
+    }
+    /**
+     * `tool_started` / `tool_completed` from `events.jsonl` — the CLI's own
+     * record of what ran, how long it took and whether it worked. Tool rows
+     * used to guess all three from the rendered title.
+     *
+     * `tool_started` carries no `tool_call_id`, so it can only confirm the tool
+     * name of a row we already opened; `tool_completed` carries the id and is
+     * the authority on duration + outcome.
+     */
+    case "tool_status": {
+      const id = String(ev.toolCallId || "");
+      if (!id) return false;
+      const tool = r.tools.get(id);
+      if (!tool) return false;
+      const name = normalizeToolName(
+        typeof ev.tool === "string" ? ev.tool : undefined,
+      );
+      if (name) {
+        tool.toolName = name;
+        tool.isAgent = isAgentToolName(name, tool.kind);
+      }
+      if (typeof ev.durationMs === "number") tool.durationMs = ev.durationMs;
+      if (ev.outcome != null) {
+        tool.outcome = String(ev.outcome);
+        // A row can be left "in_progress" when the CLI died before writing the
+        // tool_call_update; the event log knows better.
+        if (ev.phase === "completed" && (tool.status === "in_progress" || tool.status === "pending")) {
+          tool.status = tool.outcome === "success" ? "completed" : "failed";
+        }
+      }
       return true;
     }
     case "plan": {
@@ -454,6 +499,7 @@ function reduceEvent(r: Reducer, ev: FeedEvent): boolean {
       const cmd = String(ev.command || "").replace(/\s+/g, " ").trim();
       tool.isBackground = true;
       tool.status = "in_progress";
+      if (!tool.toolName) tool.toolName = "run_terminal_command";
       if (tool.title === "tool") tool.title = "background";
       tool.detail = cmd.length > 80 ? `${cmd.slice(0, 77)}…` : cmd || tool.detail;
       return true;
@@ -467,8 +513,9 @@ function reduceEvent(r: Reducer, ev: FeedEvent): boolean {
       return true;
     }
     default:
-      // phase / tool_status / permission_* / subagent_* / other — derived state
-      // only. They never build a chat row.
+      // phase / permission_* / subagent_* / other — derived state only. They
+      // never build a chat row. (`subagent_*` drives the strip, off `frame
+      // .subagents`, which the daemon merges with the on-disk meta.json.)
       return false;
   }
 }
@@ -536,6 +583,7 @@ function emptyState(id: string): SessionFeedState {
     phase: null,
     subagents: [],
     context: null,
+    sessionKind: null,
     turn: null,
     truncated: false,
     hasMore: false,
@@ -785,6 +833,7 @@ export class SessionFeedStore {
       phase,
       subagents: Array.isArray(frame.subagents) ? frame.subagents : st.subagents,
       context: frame.context ?? st.context,
+      sessionKind: frame.sessionKind ?? st.sessionKind,
       turn: frame.turn ?? st.turn,
       truncated: truncated || st.truncated,
       hasMore: Boolean(frame.hasMore),
@@ -896,6 +945,12 @@ function slimMessage(m: ChatMessage): ChatMessage {
       status: t.status,
       detail: t.detail,
       path: t.path,
+      // Real tool identity + measured outcome. Dropping these on a reload
+      // would put the rows back on title-guessing, which is the exact bug
+      // P6 removed.
+      toolName: t.toolName,
+      durationMs: t.durationMs,
+      outcome: t.outcome,
       isAgent: t.isAgent,
       isBackground: t.isBackground,
       // Bounded slice: enough to show what a tool returned without eating quota.

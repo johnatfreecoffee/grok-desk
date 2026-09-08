@@ -3,7 +3,7 @@
  */
 import { useEffect, useState } from "react";
 import type { PlanEntry, ToolCallView, TurnDraft } from "../lib/turnState";
-import { toolIconLabel } from "../lib/turnState";
+import { formatDuration, toolIconLabel } from "../lib/turnState";
 import { MarkdownBody } from "./MarkdownBody";
 
 function statusDot(status: string): string {
@@ -16,9 +16,17 @@ function statusDot(status: string): string {
 function ToolRow({ t, onClick }: { t: ToolCallView; onClick?: (id: string) => void }) {
   const st = statusDot(t.status);
   const kind = toolIconLabel(t);
+  // P6 — duration and outcome come from the CLI's own tool_completed event,
+  // not from a title guess.
+  const dur = formatDuration(t.durationMs);
   return (
     <div
       className={`tool-row ${t.isAgent ? "is-agent" : ""} ${st}${onClick ? " clickable" : ""}`}
+      title={
+        t.toolName
+          ? `${t.toolName}${t.outcome ? ` · ${t.outcome}` : ""}${dur ? ` · ${dur}` : ""}`
+          : undefined
+      }
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
       onClick={onClick ? () => onClick(t.id) : undefined}
@@ -36,7 +44,11 @@ function ToolRow({ t, onClick }: { t: ToolCallView; onClick?: (id: string) => vo
       {t.description || t.detail ? (
         <span className="tool-detail">{t.description || t.detail}</span>
       ) : null}
-      <span className={`tool-status st-${st}`}>{t.status.replace(/_/g, " ")}</span>
+      {/* Duration rides inside the status cell so the 4-column grid is untouched. */}
+      <span className={`tool-status st-${st}`}>
+        {dur ? <span className="tool-dur">{dur}</span> : null}
+        {(t.outcome && t.outcome !== "success" ? t.outcome : t.status).replace(/_/g, " ")}
+      </span>
     </div>
   );
 }

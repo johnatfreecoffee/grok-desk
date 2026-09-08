@@ -19,6 +19,12 @@ const DEFAULT_SETTINGS = {
   showHomeSessions: false,
   /** false = only sessions opened/created in Grok Desk (not entire CLI history) */
   showAllCliSessions: false,
+  /**
+   * Show subagent worker sessions (`session_kind: subagent*`) as peer chats.
+   * P6: this key was read by `listProjects` but never declared here and had no
+   * UI, so it was permanently off unless someone hand-edited settings.json.
+   */
+  showSubagentSessions: false,
   collapsedProjects: {}, // cwd → true
   pinnedCwds: [],
   /** sessionId → true — pinned chats float to top within their folder */
@@ -291,13 +297,26 @@ export function readSummary(sessionDir) {
 }
 
 /**
- * Where the session came from — Desk UI vs CLI/TUI vs Agent Mail.
- * @returns {{ source: 'desk'|'cli'|'mail', label: string, projectLabel: string }}
+ * Where the session came from — Desk UI vs CLI/TUI vs Agent Mail vs a machine run.
+ *
+ * P6 honesty fix: `session_kind` was never surfaced, so the 80 headless
+ * `grok -p` runs on this machine listed as ordinary "CLI" chats and the
+ * subagent workers (visible only with `showSubagentSessions`) were
+ * indistinguishable from real conversations. Both now say what they are.
+ *
+ * @returns {{ source: 'desk'|'cli'|'mail'|'headless'|'subagent', label: string, projectLabel: string }}
  */
-function classifyOrigin(id, cwd, _agentName, deskSessionIds) {
+function classifyOrigin(id, cwd, _agentName, deskSessionIds, sessionKind) {
   const projectLabel = projectName(cwd);
   if (String(id).startsWith("mail:")) {
     return { source: "mail", label: "Mail", projectLabel };
+  }
+  const kind = String(sessionKind || "").toLowerCase();
+  if (kind.startsWith("subagent")) {
+    return { source: "subagent", label: "Subagent", projectLabel };
+  }
+  if (kind === "headless") {
+    return { source: "headless", label: "Headless", projectLabel };
   }
   if (deskSessionIds?.has(id)) {
     return { source: "desk", label: "Desk", projectLabel };
@@ -621,8 +640,9 @@ function sessionMeta(sessionDir, fallbackCwd, deskSessionIds, deskLastAtMap, des
   const deskRec = deskIdx?.sessionIds?.[id] || null;
   const pinned = Boolean(pinnedSessions?.[id]);
   const isSub = isSubagentKind(s);
+  const sessionKind = s?.session_kind ? String(s.session_kind) : null;
   if (!s) {
-    const origin = classifyOrigin(id, fallbackCwd, null, deskSessionIds);
+    const origin = classifyOrigin(id, fallbackCwd, null, deskSessionIds, null);
     return {
       id,
       cwd: fallbackCwd,
@@ -636,6 +656,7 @@ function sessionMeta(sessionDir, fallbackCwd, deskSessionIds, deskLastAtMap, des
       sourceLabel: origin.label,
       projectLabel: origin.projectLabel,
       isSubagent: false,
+      sessionKind: null,
       pinned,
     };
   }
@@ -661,7 +682,7 @@ function sessionMeta(sessionDir, fallbackCwd, deskSessionIds, deskLastAtMap, des
     title = deskTitle || rawTitle || "New chat";
   }
   const agentName = s.agent_name || null;
-  const origin = classifyOrigin(id, cwd, agentName, deskSessionIds);
+  const origin = classifyOrigin(id, cwd, agentName, deskSessionIds, sessionKind);
   return {
     id,
     cwd,
@@ -683,6 +704,8 @@ function sessionMeta(sessionDir, fallbackCwd, deskSessionIds, deskLastAtMap, des
     sourceLabel: origin.label,
     projectLabel: origin.projectLabel,
     isSubagent: isSub,
+    /** Raw `session_kind` from summary.json — "headless" / "subagent" / null. */
+    sessionKind,
     pinned,
   };
 }

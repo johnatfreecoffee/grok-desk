@@ -616,6 +616,105 @@ function listSubagents(sessionId, cwd) {
   return { ok: true, sessionId, subagents: out };
 }
 
+/* -------------------------------------------------- background shell tasks */
+/*
+ * P6. Background *shell* tasks — `task_backgrounded` / `task_completed` in the
+ * feed — are NOT subagents. The CLI records them in
+ * `<session>/background_tasks_manifest.json` and streams their stdout into
+ * `<session>/terminal/call-*.log`. Neither file was read anywhere in Desk, so
+ * a backgrounded `npm run dev` showed a tool row and nothing else.
+ *
+ * These two readers stay strictly inside the session directory: the log path
+ * from the manifest is only trusted after it resolves under `<session>/terminal`.
+ */
+
+/** Cap on how much of a background log we ship in one response. */
+const BG_LOG_TAIL = 64_000;
+
+function backgroundTaskLogPath(sessionDir, outputFile) {
+  if (!outputFile || typeof outputFile !== "string") return null;
+  const termDir = path.resolve(sessionDir, "terminal");
+  const resolved = path.resolve(outputFile);
+  // Never follow a manifest path out of the session's own terminal dir.
+  if (resolved !== termDir && !resolved.startsWith(termDir + path.sep)) return null;
+  return resolved;
+}
+
+function listBackgroundTasks(sessionId, cwd) {
+  if (!sessionId) return { ok: false, error: "sessionId required", tasks: [] };
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return { ok: true, sessionId, tasks: [] };
+  const manifest = readJsonSafe(path.join(dir, "background_tasks_manifest.json"), []);
+  if (!Array.isArray(manifest)) return { ok: true, sessionId, tasks: [] };
+  const tasks = [];
+  for (const t of manifest) {
+    if (!t || typeof t !== "object") continue;
+    const logPath = backgroundTaskLogPath(dir, t.output_file || t.outputFile);
+    let bytes = null;
+    let modifiedAt = null;
+    if (logPath) {
+      try {
+        const st = fs.statSync(logPath);
+        bytes = st.size;
+        modifiedAt = st.mtimeMs;
+      } catch {
+        /* log not written yet */
+      }
+    }
+    const secs = t.start_time?.secs_since_epoch;
+    tasks.push({
+      taskId: String(t.task_id || t.taskId || ""),
+      command: t.command == null ? null : String(t.command),
+      cwd: t.cwd || null,
+      kind: t.kind || null,
+      startedAt: Number.isFinite(Number(secs)) ? Number(secs) * 1000 : null,
+      hasLog: Boolean(logPath),
+      logBytes: bytes,
+      logModifiedAt: modifiedAt,
+    });
+  }
+  tasks.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  return { ok: true, sessionId, tasks };
+}
+
+function readBackgroundTaskLog(sessionId, cwd, taskId, tail) {
+  if (!sessionId || !taskId) {
+    return { ok: false, error: "sessionId and taskId required", log: "" };
+  }
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return { ok: false, error: "session not found", log: "" };
+  const manifest = readJsonSafe(path.join(dir, "background_tasks_manifest.json"), []);
+  const row = Array.isArray(manifest)
+    ? manifest.find((t) => String(t?.task_id || t?.taskId || "") === String(taskId))
+    : null;
+  if (!row) return { ok: false, error: "task not found", log: "" };
+  const logPath = backgroundTaskLogPath(dir, row.output_file || row.outputFile);
+  if (!logPath) return { ok: true, taskId, log: "", bytes: 0, truncated: false };
+  const cap = Number.isFinite(Number(tail)) && Number(tail) > 0
+    ? Math.min(Number(tail), BG_LOG_TAIL)
+    : BG_LOG_TAIL;
+  try {
+    const size = fs.statSync(logPath).size;
+    const start = size > cap ? size - cap : 0;
+    const fd = fs.openSync(logPath, "r");
+    try {
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      return {
+        ok: true,
+        taskId: String(taskId),
+        log: buf.toString("utf8"),
+        bytes: size,
+        truncated: start > 0,
+      };
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {
+    return { ok: false, error: e.message || String(e), log: "" };
+  }
+}
+
 function doctorStatus() {
   const checks = [];
   const push = (id, ok, detail) => checks.push({ id, ok, detail });
@@ -1062,6 +1161,23 @@ export async function handleBuildApi(req, res, sendJson, readBody) {
     const sessionId = url.searchParams.get("sessionId") || url.searchParams.get("id");
     const cwd = url.searchParams.get("cwd") || null;
     sendJson(res, 200, listSubagents(sessionId, cwd));
+    return true;
+  }
+
+  // P6 — background *shell* tasks (background_tasks_manifest.json + terminal/*.log)
+  if (url.pathname === "/api/build/background-tasks" && req.method === "GET") {
+    const sessionId = url.searchParams.get("sessionId") || url.searchParams.get("id");
+    const cwd = url.searchParams.get("cwd") || null;
+    sendJson(res, 200, listBackgroundTasks(sessionId, cwd));
+    return true;
+  }
+
+  if (url.pathname === "/api/build/background-task-log" && req.method === "GET") {
+    const sessionId = url.searchParams.get("sessionId") || url.searchParams.get("id");
+    const cwd = url.searchParams.get("cwd") || null;
+    const taskId = url.searchParams.get("taskId");
+    const tail = url.searchParams.get("tail");
+    sendJson(res, 200, readBackgroundTaskLog(sessionId, cwd, taskId, tail));
     return true;
   }
 
