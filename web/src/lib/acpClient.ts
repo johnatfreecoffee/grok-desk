@@ -205,6 +205,15 @@ type Handlers = {
     plan: string;
   }) => void;
   onExtRequestCancelled?: (info: { requestId: string; kind?: string }) => void;
+  /** P3 — one session's on-disk truth (daemon/session-feed.js). */
+  onFeed?: (frame: import("./sessionFeed").FeedFrame) => void;
+  onUnsubscribed?: (info: { sessionId: string; ok: boolean }) => void;
+  onStopped?: (info: {
+    sessionId: string;
+    stopped: boolean;
+    scope: string;
+    queued: number;
+  }) => void;
 };
 
 function wsUrl(): string {
@@ -517,6 +526,25 @@ export class DeskClient {
             /* */
           }
           break;
+        case "feed":
+          // Every feed frame is session-scoped; an untagged one is a daemon bug.
+          if (!msg.sessionId) break;
+          this.handlers.onFeed?.(msg as unknown as import("./sessionFeed").FeedFrame);
+          break;
+        case "unsubscribed":
+          this.handlers.onUnsubscribed?.({
+            sessionId: String(msg.sessionId || ""),
+            ok: Boolean(msg.ok),
+          });
+          break;
+        case "stopped":
+          this.handlers.onStopped?.({
+            sessionId: String(msg.sessionId || ""),
+            stopped: Boolean(msg.stopped),
+            scope: String(msg.scope || "none"),
+            queued: Number(msg.queued) || 0,
+          });
+          break;
         case "pong":
           this.lastPongAt = Date.now();
           break;
@@ -635,8 +663,25 @@ export class DeskClient {
     });
   }
 
-  stop() {
-    this.send({ type: "stop" });
+  /** P3 — tail one session from a cursor. fromSeq 0 = newest tail window. */
+  subscribeFeed(sessionId: string, fromSeq = 0, cwd?: string | null) {
+    if (!sessionId) return;
+    this.send({
+      type: "subscribe",
+      sessionId,
+      fromSeq: Number(fromSeq) > 0 ? Math.floor(Number(fromSeq)) : 0,
+      cwd: cwd || undefined,
+    });
+  }
+
+  unsubscribeFeed(sessionId: string) {
+    if (!sessionId) return;
+    this.send({ type: "unsubscribe", sessionId });
+  }
+
+  /** Stop ONE session. Omitting the id is the legacy global stop. */
+  stop(sessionId?: string | null) {
+    this.send(sessionId ? { type: "stop", sessionId } : { type: "stop" });
   }
 
   requestStatus() {

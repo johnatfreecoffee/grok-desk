@@ -39,7 +39,9 @@
     "smoke:feed": "node scripts/smoke-feed-ws.mjs",
     "test:speak": "node scripts/speak-unit.mjs",
     "test:feed": "node scripts/feed-unit.mjs",
-    "test:store": "node --experimental-strip-types scripts/session-store-unit.mjs"
+    "test:store": "node --experimental-strip-types scripts/session-store-unit.mjs",
+    "smoke:switch": "node --experimental-strip-types scripts/smoke-switch.mjs",
+    "smoke:reload": "node --experimental-strip-types scripts/smoke-reload.mjs"
   },
   "dependencies": {
     "web-push": "^3.6.7",
