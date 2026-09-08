@@ -29,7 +29,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Proof: `npm run test:feed`; feed of a real 4 MB `updates.jsonl` equals a full parse and
     resumes from an arbitrary seq
 
-- [ ] **P2 Per-session live tail + protocol**
+- [x] **P2 Per-session live tail + protocol**
   - Per-session watchers + one cheap root watcher; retire the recursive tree watch
   - WS `subscribe` / `unsubscribe` / `feed`
   - Stamp `sessionId` on every daemon→client frame; scope `stop`, `queue_update`, `error`
@@ -56,6 +56,14 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Read `active_sessions.json`; refuse `session/load` while a live pid owns the session
   - "Running in Terminal" state, read-only composer, auto-takeover when the pid exits
   - Ownership guard on `deleteSession`
+  - **Harden `owner` (found in P2 QC).** Three real gaps in the naive pid probe:
+    1. `owner` is populated even when `read()` returns `ok:false` because the session dir
+       does not exist. Gate the read-only composer on `owner && ok`, never `owner` alone.
+    2. The probe only asks "is this pid alive" — a recycled pid after a reboot would make a
+       random process look like the owner. Verify the process is actually `grok`.
+    3. Normalize cwd with `realpath` before `encodeURIComponent`. The registry recorded
+       `/private/tmp/...` while the process argv said `/tmp/...`; on macOS that symlink
+       mismatch makes `findSessionDir` miss.
   - Proof: `npm run smoke:cli`; a terminal turn during a Desk view loses nothing either side
 
 - [ ] **P5 Retire the shadow stores**
@@ -97,6 +105,9 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 ## Clean run
 
+- [ ] Pre-existing smokes (`smoke`, `smoke:turns`, `smoke:isolation`, `smoke:resume`) open the
+      WS with no cookie, so the local lock closes them with `4401 auth required`. They must
+      read the local session cookie the way `smoke:feed` does before they can gate anything.
 - [ ] One full hunt with zero findings
 - [ ] Ship `main`, rebuild UI, kick launchd
 
