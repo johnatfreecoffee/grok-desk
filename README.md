@@ -2,7 +2,7 @@
 
 **I took Grok Build out of the terminal and gave it a real interface.**
 
-Grok Desk is a **local** Mac product for [Grok Build](https://x.ai/build): one install, one Settings pane.
+Grok Desk is a **local** Mac product for [Grok Build](https://x.ai/build): one install, one Settings pane. The only Mac app is **Grok Desk.app** — Speak, the comet menu bar, and the phone connector live inside it.
 
 - **Desk** — visual Grok Build (Electron on Mac, installable phone PWA)
 - **Speak** — subscription TTS, bundled in `tools/speak` (same Grok login, no API key)
@@ -110,8 +110,8 @@ Speak is ready from this tree (`tools/speak`). Per-reply **Concise / Casual / Fu
 ```bash
 npm run make-app
 open -a "Grok Desk"
-# also installs/copies to ~/Applications when the script succeeds
-# installs the Speak binary; rebuilds Folders / Phone MCP only if you already enabled them
+# copies to ~/Applications/Grok Desk.app (the only Mac app)
+# Speak binary is installed; comet helper is inside the Desk bundle
 ```
 
 ### 5. Always-on engine (optional, recommended)
@@ -124,7 +124,7 @@ Keeps the daemon running after reboots / closed windows (user launchd):
 # Stop: launchctl bootout gui/$(id -u)/dev.freecoffee.grok-desk
 ```
 
-Same rule: Speak bin is installed; Folders extra and Phone MCP are **not** auto-enabled.
+Same rule: Speak bin is installed. Comet starts with Grok Desk.app. Phone MCP is not auto-enabled.
 
 ### 6. Phone = same app, same machine (Tailscale)
 
