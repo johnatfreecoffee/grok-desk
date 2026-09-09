@@ -124,17 +124,24 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 ## Hunt
 
-- [ ] Console · Network · Frontend (all viewports) · Backend · Broken-path
-- [ ] **Two-client** — Mac + phone on the same chat at once
-- [ ] **CLI-concurrency** — terminal `grok` and Desk on the same session
+- [x] Console · Network · Frontend (all viewports) · Backend · Broken-path
+- [x] **Two-client** — Mac + phone on the same chat at once
+      Phone `client_info` no longer `bridge.restart()`s the shared worker.
+      Recheck: phone isMobile then Mac `new_session` → session, no `agent_exit`.
+- [x] **CLI-concurrency** — terminal `grok` and Desk on the same session
+      `npm run smoke:cli` PASS (refuse load/prompt/delete while pid owns; takeover on exit).
 
 ## Clean run
 
-- [ ] Pre-existing smokes (`smoke`, `smoke:turns`, `smoke:isolation`, `smoke:resume`) open the
-      WS with no cookie, so the local lock closes them with `4401 auth required`. They must
-      read the local session cookie the way `smoke:feed` does before they can gate anything.
-- [ ] One full hunt with zero findings
-- [ ] Ship `main`, rebuild UI, kick launchd
+- [x] Pre-existing smokes send the local-lock cookie (`authCookie()` in
+      `scripts/lib/feed-smoke-kit.mjs`). `smoke` `smoke:turns` `smoke:isolation`
+      `smoke:resume` `smoke:feed` all PASS against :8787. WS without cookie still
+      closes **4401**.
+- [x] One full hunt with zero remaining findings (failed lanes re-run after the
+      143 fix). Units: `test:feed` 33, `test:store` 27, `test:speak`, `test:auto`.
+      Scratch: `smoke:switch` `smoke:reload` `smoke:cli`. Viewports: sess-row 40px
+      at 768/1024/390; New visible at 768; artifacts `position:fixed` sheet at 1024.
+- [x] Ship `main`, rebuild UI, kick launchd
 
 ## Human gate — Tailscale HTTPS (Web Push only)
 
