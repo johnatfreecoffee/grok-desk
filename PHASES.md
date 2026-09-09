@@ -115,11 +115,12 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 ## UI match
 
-- [ ] **Known, pre-existing: the topbar action row overflows at ~768 with the sidebar open** —
-      872px of content in 293px, `overflow:hidden` clips "New" and the mode chips. Found during
-      P6 and confirmed present without P6's changes.
-- [ ] Existing Desk chrome; no new layout language; no purple
-- [ ] Desktop ~1280 · tablet ~768 portrait + ~1024 landscape · phone ~390. Tap ≥ 40px
+- [x] **Known, pre-existing: the topbar action row overflows at ~768 with the sidebar open** —
+      Chat-column compact/tight tiers (same collapse the phone already did). At ~768 with
+      the sidebar open, session tools fold into ⋯ and **New stays visible**. Proof: 1280 /
+      1024 / 768 / 390 screenshots 2026-09-09.
+- [x] Existing Desk chrome; no new layout language; no purple
+- [x] Desktop ~1280 · tablet ~768 portrait + ~1024 landscape · phone ~390. Tap ≥ 40px
 
 ## Hunt
 

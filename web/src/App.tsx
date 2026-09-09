@@ -2075,6 +2075,21 @@ function DeskApp() {
     return { cls: "warn", label: "Connecting…" };
   }, [connected, agent, busy, sessionPhase, historyOnly, readOnly, isMailSession]);
 
+  /**
+   * Export transcript. Lives here rather than inline on the topbar button so
+   * the ⋯ menu can offer the same action when the row is too narrow for the
+   * session-tools strip.
+   */
+  const exportTranscript = useCallback(() => {
+    const body = messages.map((m) => `## ${m.role}\n\n${m.content}\n`).join("\n");
+    const blob = new Blob([body], { type: "text/markdown" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `grok-desk-${(agentRef.current?.sessionId || "chat").slice(0, 8)}.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, [messages]);
+
   const projectName = useMemo(() => {
     const cwd = agent?.cwd || "";
     if (!cwd) return "";
@@ -2683,23 +2698,17 @@ function DeskApp() {
                   className="icon-btn sm"
                   title="Export transcript"
                   aria-label="Export transcript"
-                  onClick={() => {
-                    const body = messages
-                      .map((m) => `## ${m.role}\n\n${m.content}\n`)
-                      .join("\n");
-                    const blob = new Blob([body], { type: "text/markdown" });
-                    const a = document.createElement("a");
-                    a.href = URL.createObjectURL(blob);
-                    a.download = `grok-desk-${(agent?.sessionId || "chat").slice(0, 8)}.md`;
-                    a.click();
-                    URL.revokeObjectURL(a.href);
-                  }}
+                  onClick={exportTranscript}
                 >
                   <Download size={14} strokeWidth={2.25} />
                 </button>
               </span>
             ) : null}
-            <span className={`pill ${statusPill.cls} status-pill`}>
+            <span
+              className={`pill ${statusPill.cls} status-pill`}
+              title={statusPill.label}
+              aria-label={statusPill.label}
+            >
               <span className="dot" />
               <span className="pill-label">{statusPill.label}</span>
             </span>
@@ -2725,7 +2734,7 @@ function DeskApp() {
                 </button>
               ))}
             </div>
-            <span className="desktop-only-actions">
+            <span className="topbar-tools desktop-only-actions">
               <ModelPicker
                 compact
                 onSelect={(modelId, effort) => {
@@ -2736,14 +2745,14 @@ function DeskApp() {
                 }}
               />
               {speakReady ? (
-                <span className="pill ok" title="Subscription TTS — no API key">
+                <span className="pill ok speak-pill" title="Subscription TTS — no API key">
                   <span className="dot" />
                   speak ready
                 </span>
               ) : (
                 <button
                   type="button"
-                  className="pill"
+                  className="pill speak-pill"
                   title="Grok login + grok-speak for reply voice"
                   onClick={() => setSettingsOpen(true)}
                   style={{ cursor: "pointer", border: "none" }}
@@ -2760,7 +2769,7 @@ function DeskApp() {
                 title="Restart local engine / agent"
               >
                 <RotateCcw size={15} strokeWidth={2} />
-                <span>{restarting ? "…" : "Restart"}</span>
+                <span className="restart-label">{restarting ? "…" : "Restart"}</span>
               </button>
             </span>
             <button
@@ -2828,11 +2837,48 @@ function DeskApp() {
                         type="button"
                         onClick={() => {
                           setOverflowMenuOpen(false);
+                          setSessionDrawer("rewind");
+                        }}
+                      >
+                        <Undo2 size={15} /> Rewind timeline
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
+                          setSessionDrawer("history");
+                        }}
+                      >
+                        <History size={15} /> Prompt history
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
+                          setForkOpen(true);
+                        }}
+                      >
+                        <GitBranch size={15} /> Fork / worktree
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
                           clientRef.current?.send({ type: "queue_list" });
                           setQueueOpen(true);
                         }}
                       >
                         <ListOrdered size={15} /> Queue{queueLen > 0 ? ` (${queueLen})` : ""}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOverflowMenuOpen(false);
+                          exportTranscript();
+                        }}
+                        disabled={messages.length === 0}
+                      >
+                        <Download size={15} /> Export transcript
                       </button>
                     </>
                   ) : null}
@@ -3050,8 +3096,16 @@ function DeskApp() {
             </button>
           </div>
         )}
-        {historyOnly && !viewOnlyBrowse && !readOnly && !agent?.sessionId?.startsWith("mail:") && (
-          <div className="banner" role="status">
+        {/* The generic "same chat" line only when nothing more specific is
+            already saying it — read-only, headless and subagent all carry
+            their own sentence about what sending does. */}
+        {historyOnly &&
+          !viewOnlyBrowse &&
+          !readOnly &&
+          sessionKind !== "headless" &&
+          !(childOrigin && agent?.sessionId === childOrigin.childId) &&
+          !agent?.sessionId?.startsWith("mail:") && (
+          <div className="banner info" role="status">
             This is the same chat. Send continues it — attaching the agent if needed.
           </div>
         )}

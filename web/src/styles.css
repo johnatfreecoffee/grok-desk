@@ -940,7 +940,7 @@ body.desk-app .shell.no-sidebar .topbar {
     text-overflow: ellipsis;
   }
   .topbar .project-chip {
-    display: inline-flex !important;
+    display: inline-block !important;
     max-width: 42vw;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -995,6 +995,9 @@ body.desk-app .shell.no-sidebar .topbar {
   .topbar .overflow-menu {
     min-width: 200px;
     z-index: 40;
+  }
+  .topbar .new-menu button {
+    min-height: 40px;
   }
   /* Collapse/expand alone — not a Projects pill */
   .mobile-menu-btn {
@@ -1063,7 +1066,12 @@ body.desk-app .shell.no-sidebar .topbar {
   }
   .composer.pill textarea {
     min-height: 44px;
-    padding: 12px 6px;
+    padding: 12px 4px;
+  }
+  /* Banner actions ("Jump to live", "Back to parent", Retry) are 19px tall
+     from their inline padding — the same target rule applies to them. */
+  .banner .icon-btn {
+    min-height: 40px;
   }
 }
 
@@ -1082,7 +1090,10 @@ body.desk-app .shell.no-sidebar .topbar {
   z-index: 30;
   min-width: 0;
   flex-wrap: nowrap;
-  overflow: hidden;
+  /* The New / model / ⋯ menus hang out of this row. `overflow: hidden` here
+     sliced them off at the border; `.app` still clips at the column edge, so
+     the row cannot bleed into the page either way. */
+  overflow: visible;
   /* room for macOS traffic lights in Electron hiddenInset titlebar */
   -webkit-app-region: drag;
 }
@@ -1119,6 +1130,13 @@ body.desk-app .topbar {
   flex-shrink: 0;
 }
 
+/* "Grok Desk" / "local" are one line or they are not shown — never two. */
+.brand .brand-text,
+.brand .brand-sub {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .brand span.sub {
   font-weight: 500;
   color: var(--muted);
@@ -1134,8 +1152,20 @@ body.desk-app .topbar {
   flex-shrink: 1;
   min-width: 0;
   flex-wrap: nowrap;
-  overflow: hidden;
+  /* Same reason as `.topbar` — the dropdowns live inside this row. What used
+     to be clipped here is now shed by the two tiers at the end of this file. */
+  overflow: visible;
   -webkit-app-region: no-drag;
+}
+
+/* Model picker + speak + Restart. A bare inline span wrapped its three
+   children onto three lines and made the whole topbar 108px tall. */
+.topbar-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
 }
 
 .pill {
@@ -1155,6 +1185,14 @@ body.desk-app .topbar {
   height: 7px;
   border-radius: 50%;
   background: var(--muted);
+}
+
+/* "Same chat" used to break across two lines and make the whole topbar
+   two rows tall. A status pill is one line or it is truncated. */
+.pill .pill-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .pill.ok .dot {
@@ -2728,6 +2766,14 @@ body.desk-app .topbar {
   min-width: 0;
 }
 
+/* A placeholder is a hint, not content: one line, ellipsised. It used to
+   wrap onto a second line the 40px field then clipped in half. */
+.composer.pill textarea::placeholder {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .composer.pill:focus-within {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px var(--blue-bg);
@@ -3015,6 +3061,14 @@ body.desk-app .topbar {
   text-overflow: ellipsis;
   -webkit-app-region: no-drag;
 }
+/* `text-overflow: ellipsis` does not reach the anonymous text run inside a
+   flex container, so the topbar's chip used to hard-cut mid-letter. It is
+   plain text there, so it can be inline-block and ellipsise properly. */
+.topbar .project-chip {
+  display: inline-block;
+  line-height: 20px;
+}
+
 .project-chip .project-path {
   color: var(--muted);
   font-weight: 500;
@@ -4063,8 +4117,12 @@ body.desk-app .topbar {
   .composer-modes {
     display: flex;
   }
+  /* These are the mode switch on a phone — the topbar row is gone — so they
+     get a real tap target, not a 25px pill. */
   .composer-modes .mode-chip {
     display: inline-flex;
+    min-height: 40px;
+    padding: 0 14px;
   }
   .model-picker-label {
     max-width: 56px;
@@ -5297,17 +5355,27 @@ body.desk-app .topbar {
     gap: 4px;
     /* Same 40px tap target the phone topbar gives every other control. */
     min-height: 40px;
+    min-width: 40px;
+    justify-content: center;
   }
   .ctx-meter-bar {
     width: 22px;
   }
+  /* Dictate / attach get the same 40px target the topbar already gives.
+     The row tightens by the same 12px so the field keeps its width and the
+     placeholder still fits on one line. */
+  .composer.pill .composer-row > .icon-btn.sm {
+    min-width: 40px;
+    min-height: 40px;
+  }
+  .composer.pill .composer-row {
+    gap: 6px;
+  }
 }
 
 /*
- * Tablet band: the topbar's action row is already narrow at ~768 with the
- * sidebar open, so the meter drops its bar and keeps only the number. (The
- * row's overflow at that width predates this — see the topbar's own
- * `overflow: hidden`; this just makes sure the meter is not what tips it.)
+ * Tablet band: the topbar's action row is narrow at ~768 with the sidebar
+ * open, so the meter drops its bar and keeps only the number.
  */
 @media (min-width: 721px) and (max-width: 1000px) {
   .ctx-meter-bar {
@@ -5315,5 +5383,239 @@ body.desk-app .topbar {
   }
   .ctx-meter {
     padding: 5px 8px;
+  }
+}
+
+/* ==================================================================
+ * Topbar crowding — the same collapse the phone block already does,
+ * triggered by how much room the chat column actually has.
+ *
+ * Chat column = viewport − 56px nav rail − 300px sidebar (when open)
+ *               − 34vw artifacts column (when open, and only above
+ *                 1000px — below that it is already a bottom sheet).
+ *
+ * With a session open the full row measures 1163px — session tools 208
+ * + status pill + context meter + mode chips 186 + model picker + speak
+ * + Restart + Copy + Artifacts + New — and the brand another 196, so it
+ * wants ~1400px of chat column. Everything past the container used to be
+ * cut off by `overflow: hidden`: at 768 with the sidebar open that was
+ * 915px of row inside 287px, with "New" 628px beyond the right edge, and
+ * even 1280 with the sidebar open lost Copy, Artifacts and New.
+ *
+ *   compact — chat column < 1420px. The brand wordmark, the topbar mode
+ *             chips (the composer keeps its own row of them), the speak
+ *             pill, the effort chip and the button labels go. Every
+ *             control is still on the row. Needs ~830px.
+ *   tight   — chat column <  880px. The phone's posture exactly: the
+ *             `desktop-only-actions` groups fold into the ⋯ menu the
+ *             topbar already has, and that menu carries all of them.
+ *             Needs ~300px.
+ *
+ * `--tb-*` are only ever set here; unset means "full".
+ * ================================================================== */
+
+/* ---- compact: chat column under 1420px ---- */
+@media (min-width: 721px) and (max-width: 1475px) {
+  .shell.no-sidebar:not(.with-artifacts) {
+    --tb-wordmark: none;
+    --tb-brandfallback: inline;
+    --tb-modes: none;
+    --tb-labels: none;
+    --tb-modelmax: 62px;
+    --tb-noshrink: 0;
+  }
+}
+@media (min-width: 721px) and (max-width: 1775px) {
+  .shell.with-sidebar:not(.with-artifacts) {
+    --tb-wordmark: none;
+    --tb-brandfallback: inline;
+    --tb-modes: none;
+    --tb-labels: none;
+    --tb-modelmax: 62px;
+    --tb-noshrink: 0;
+  }
+}
+@media (min-width: 721px) and (max-width: 2235px) {
+  .shell.no-sidebar.with-artifacts {
+    --tb-wordmark: none;
+    --tb-brandfallback: inline;
+    --tb-modes: none;
+    --tb-labels: none;
+    --tb-modelmax: 62px;
+    --tb-noshrink: 0;
+  }
+}
+@media (min-width: 721px) and (max-width: 2690px) {
+  .shell.with-sidebar.with-artifacts {
+    --tb-wordmark: none;
+    --tb-brandfallback: inline;
+    --tb-modes: none;
+    --tb-labels: none;
+    --tb-modelmax: 62px;
+    --tb-noshrink: 0;
+  }
+}
+
+/* ---- tight: chat column under 880px ---- */
+@media (min-width: 721px) and (max-width: 935px) {
+  .shell.no-sidebar:not(.with-artifacts) {
+    --tb-desktop: none;
+    --tb-overflow: flex;
+    --tb-tap: 40px;
+  }
+}
+@media (min-width: 721px) and (max-width: 1235px) {
+  .shell.with-sidebar:not(.with-artifacts) {
+    --tb-desktop: none;
+    --tb-overflow: flex;
+    --tb-tap: 40px;
+  }
+}
+@media (min-width: 721px) and (max-width: 1417px) {
+  .shell.no-sidebar.with-artifacts {
+    --tb-desktop: none;
+    --tb-overflow: flex;
+    --tb-tap: 40px;
+  }
+}
+@media (min-width: 721px) and (max-width: 1872px) {
+  .shell.with-sidebar.with-artifacts {
+    --tb-desktop: none;
+    --tb-overflow: flex;
+    --tb-tap: 40px;
+  }
+}
+
+/* ---- what those tiers actually shed. One place, both tiers. ---- */
+@media (min-width: 721px) {
+  .topbar .brand-text.desktop-only-brand,
+  .topbar .brand-sub.desktop-only-brand,
+  .topbar .module-info-btn.desktop-only-brand {
+    display: var(--tb-wordmark, inline-flex);
+  }
+  /* No project open → the chip is not there to carry the name, so the
+     short wordmark the phone uses takes over. */
+  .topbar .brand-text.mobile-only-brand {
+    display: var(--tb-brandfallback, none);
+    white-space: nowrap;
+  }
+  .topbar .mode-chip-row.desktop-only-actions {
+    display: var(--tb-modes, inline-flex);
+  }
+  .topbar .speak-pill {
+    display: var(--tb-labels, inline-flex);
+  }
+  .topbar .copy-chat-label,
+  .topbar .restart-label {
+    display: var(--tb-labels, inline);
+  }
+  /* The picker keeps its name; the effort chip is a second line of detail
+     that the menu itself shows, so it is the first thing to go. */
+  .topbar .model-effort-chip {
+    display: var(--tb-labels, inline-flex);
+  }
+  .topbar .model-picker-label {
+    max-width: var(--tb-modelmax, none);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Same trade the 721–1000 band already makes: keep the number, drop the bar. */
+  .topbar .ctx-meter-bar {
+    display: var(--tb-labels, block);
+  }
+
+  .topbar .chat-power-btns.desktop-only-actions,
+  .topbar .topbar-tools.desktop-only-actions {
+    display: var(--tb-desktop, inline-flex);
+  }
+  .topbar .icon-btn.desktop-only-actions,
+  .topbar .desktop-artifacts-btn {
+    display: var(--tb-desktop, inline-flex);
+  }
+  .topbar .mobile-only-actions {
+    display: var(--tb-overflow, none);
+  }
+  .topbar .overflow-menu {
+    min-width: 210px;
+  }
+  .topbar .new-menu button {
+    min-height: var(--tb-tap, auto);
+  }
+  /* At tight the nav rail's own Grok button is right next to the topbar,
+     so the second copy of the mark is what the project name gets back. */
+  .topbar .brand-mark {
+    display: var(--tb-desktop, block);
+  }
+  /* Tight is the touch posture, so it gets the phone's 40px targets too. */
+  .topbar .top-actions .icon-btn,
+  .topbar .top-actions .ctx-meter,
+  .topbar .brand .icon-btn,
+  .composer.pill .composer-row > .icon-btn.sm,
+  .composer-modes .mode-chip {
+    min-height: var(--tb-tap, auto);
+  }
+  .topbar .top-actions .icon-btn,
+  .topbar .top-actions .ctx-meter,
+  .topbar .brand .icon-btn,
+  .composer.pill .composer-row > .icon-btn.sm {
+    min-width: var(--tb-tap, auto);
+  }
+  /* Once the row is down to its five essentials, it stops giving ground —
+     the project chip is what ellipsises instead. */
+  .topbar .top-actions {
+    flex-shrink: var(--tb-noshrink, 1);
+  }
+  .banner .icon-btn {
+    min-height: var(--tb-tap, auto);
+  }
+  /* The project chip is the identity once the wordmark is gone, so it is
+     the one thing in the brand allowed to give ground. */
+  .topbar .project-chip {
+    flex-shrink: 1;
+    min-width: 0;
+  }
+}
+
+/* Phone: the status pill goes dot-only where the project chip would
+   otherwise be clipped down to a sliver — the `title` on the pill keeps
+   the wording. This is what the "dot-only status on narrow phones"
+   comment in the phone block above always meant. */
+@media (max-width: 430px) {
+  .topbar .pill.status-pill .pill-label {
+    display: none;
+  }
+  .topbar .pill.status-pill {
+    padding: 6px 8px;
+  }
+}
+
+/*
+ * Artifacts on a tablet: the three-column grid needs ~1000px before the
+ * chat column is worth reading (at 768 with the sidebar open it left the
+ * transcript 132px wide). Below that it is the bottom sheet the phone
+ * already uses — same sheet, same radius, same shadow.
+ */
+@media (min-width: 721px) and (max-width: 1000px) {
+  .shell.with-artifacts,
+  .shell.no-sidebar.with-artifacts {
+    grid-template-columns: 300px minmax(0, 1fr) !important;
+  }
+  .shell.no-sidebar.with-artifacts {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .artifact-pane {
+    position: fixed !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    top: auto !important;
+    width: 100% !important;
+    max-height: min(72dvh, 640px) !important;
+    z-index: 60 !important;
+    border-radius: 16px 16px 0 0 !important;
+    border-left: none !important;
+    border-top: 1px solid var(--border) !important;
+    box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.45) !important;
   }
 }
