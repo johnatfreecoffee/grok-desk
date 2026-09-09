@@ -202,6 +202,16 @@ function buildSessionScan(root) {
 }
 
 /** Current snapshot, rebuilt only when the generation moved or the TTL expired. */
+/**
+ * Build the scan up front so the first sidebar load does not pay for it.
+ * Called once at boot; everything after rides the cache or a watcher bump.
+ */
+export function warmSessionScan() {
+  const t = Date.now();
+  const scan = sessionScan({ force: true });
+  return { sessions: scan.ids.size, groups: scan.groups.length, ms: Date.now() - t };
+}
+
 function sessionScan({ force = false } = {}) {
   const root = sessionsRoot();
   if (

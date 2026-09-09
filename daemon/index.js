@@ -42,6 +42,7 @@ import {
   loadAgentMailTranscript,
   sessionsRoot,
   pruneSubagentsFromDeskIndex,
+  warmSessionScan,
   bumpSessionScan,
 } from "./session-store.js";
 import {
@@ -3548,6 +3549,12 @@ server.listen(PORT, "127.0.0.1", async () => {
     pruneSubagentsFromDeskIndex();
   } catch {
     /* */
+  }
+  try {
+    const w = warmSessionScan();
+    console.log(`[scan] warmed ${w.sessions} sessions in ${w.groups} groups (${w.ms}ms)`);
+  } catch (e) {
+    console.warn("[scan] warm failed:", e.message);
   }
   startSessionWatcher();
   startOwnershipWatcher();
