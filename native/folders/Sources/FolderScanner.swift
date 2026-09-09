@@ -73,6 +73,27 @@ struct FolderScanner {
         return dirs
     }
 
+    func matches(_ url: URL, query: String, title: String? = nil) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if q.isEmpty { return true }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        if let title, title.range(of: q, options: opts) != nil { return true }
+        if url.lastPathComponent.range(of: q, options: opts) != nil { return true }
+        let homePath = home.path
+        let path = url.path
+        let rel = path.hasPrefix(homePath + "/") ? String(path.dropFirst(homePath.count + 1)) : path
+        return rel.range(of: q, options: opts) != nil
+    }
+
+    func rank(_ url: URL, query: String) -> Int {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let name = url.lastPathComponent.lowercased()
+        if name == q { return 0 }
+        if name.hasPrefix(q) { return 1 }
+        if name.contains(q) { return 2 }
+        return 3
+    }
+
     func shouldInclude(_ url: URL) -> Bool {
         let name = url.lastPathComponent
         if name.hasPrefix(".") { return false }

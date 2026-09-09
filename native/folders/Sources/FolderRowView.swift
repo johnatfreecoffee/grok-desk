@@ -18,6 +18,9 @@ final class FolderRowView: NSView {
     var onGoInto: (() -> Void)?
     var onNameHover: (() -> Void)?
     var onHoverCancel: (() -> Void)?
+    var emphasized = false {
+        didSet { if oldValue != emphasized { needsDisplay = true } }
+    }
 
     init(
         title: String,
@@ -62,7 +65,7 @@ final class FolderRowView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let highlighted = enclosingMenuItem?.isHighlighted == true
+        let highlighted = enclosingMenuItem?.isHighlighted == true || emphasized
         lastHighlighted = highlighted
 
         if highlighted {

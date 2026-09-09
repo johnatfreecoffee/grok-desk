@@ -10,6 +10,11 @@ final class StatusController: NSObject, NSMenuDelegate {
     private var hoverTimer: Timer?
     private var hoverToken = 0
     private var isRebuilding = false
+    private var filterQuery = ""
+    private var menuWidth: CGFloat = 240
+    private var firstMatchPath: String?
+    private var searchView: SearchFieldView?
+    private var keyMonitor: Any?
 
     init(store: StateStore, scanner: FolderScanner) {
         self.store = store
@@ -40,7 +45,14 @@ final class StatusController: NSObject, NSMenuDelegate {
         guard menu == statusItem.menu else { return }
         if isRebuilding { return }
         cancelHover()
+        filterQuery = ""
         rebuildRoot(menu)
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu == statusItem.menu else { return }
+        installKeyMonitor()
+        searchView?.focusSoon()
     }
 
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
@@ -53,9 +65,11 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
-        if menu == statusItem.menu {
-            cancelHover()
-        }
+        guard menu == statusItem.menu else { return }
+        removeKeyMonitor()
+        cancelHover()
+        filterQuery = ""
+        searchView?.setQuery("")
     }
 
     @objc private func popFromSecondLaunch() {
@@ -73,56 +87,140 @@ final class StatusController: NSObject, NSMenuDelegate {
 
         let current = store.lastURL()
         let kids = scanner.children(of: current)
-        var titles = [current.lastPathComponent, "Home", "Documents", "Desktop"]
+        var titles = [current.lastPathComponent, "Home", "Documents", "Desktop", "Search"]
         titles.append(contentsOf: kids.map(\.lastPathComponent))
         if let parent = scanner.parent(of: current) {
             titles.append(parent.lastPathComponent)
         }
         let recents = store.recents.filter { $0 != current.path }
         titles.append(contentsOf: recents.map { URL(fileURLWithPath: $0).lastPathComponent })
-        let width = FolderRowView.width(for: titles)
+        menuWidth = max(FolderRowView.width(for: titles), 240)
 
-        menu.addItem(iconRow(current, kind: .current, width: width))
-        menu.addItem(.separator())
+        let search = SearchFieldView(width: menuWidth)
+        search.onChange = { [weak self] q in self?.applyFilter(q) }
+        search.onSubmit = { [weak self] in self?.submitFirstMatch() }
+        search.onEscape = { [weak self] in self?.handleEscape() }
+        searchView = search
 
-        if let parent = scanner.parent(of: current) {
-            menu.addItem(iconRow(parent, title: "↑  \(parent.lastPathComponent)", kind: .jump, width: width))
-            menu.addItem(.separator())
+        let searchItem = NSMenuItem()
+        searchItem.view = search
+        searchItem.isEnabled = true
+        searchItem.tag = MenuTag.search.rawValue
+        menu.addItem(searchItem)
+
+        rebuildBody(menu)
+    }
+
+    private func rebuildBody(_ menu: NSMenu) {
+        while menu.items.count > 1 {
+            menu.removeItem(at: menu.items.count - 1)
         }
 
-        if kids.isEmpty {
-            let empty = NSMenuItem(title: "No folders", action: nil, keyEquivalent: "")
+        let current = store.lastURL()
+        let query = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let width = menuWidth
+        let recents = store.recents.filter { $0 != current.path }
+
+        menu.addItem(.separator())
+
+        if query.isEmpty {
+            firstMatchPath = nil
+            menu.addItem(iconRow(current, kind: .current, width: width))
+            menu.addItem(.separator())
+
+            if let parent = scanner.parent(of: current) {
+                menu.addItem(iconRow(parent, title: "↑  \(parent.lastPathComponent)", kind: .jump, width: width))
+                menu.addItem(.separator())
+            }
+
+            let kids = scanner.children(of: current)
+            firstMatchPath = kids.first?.path
+            if kids.isEmpty {
+                let empty = NSMenuItem(title: "No folders", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+            } else {
+                for child in kids {
+                    menu.addItem(iconRow(child, kind: .folder, width: width))
+                }
+            }
+
+            menu.addItem(.separator())
+            menu.addItem(iconRow(scanner.home, title: "Home", kind: .jump, width: width))
+            menu.addItem(iconRow(scanner.documents, title: "Documents", kind: .jump, width: width))
+            menu.addItem(iconRow(scanner.desktop, title: "Desktop", kind: .jump, width: width))
+
+            if !recents.isEmpty {
+                let recentsItem = NSMenuItem(title: "Recents", action: nil, keyEquivalent: "")
+                recentsItem.isEnabled = true
+                let recentsMenu = NSMenu()
+                recentsMenu.autoenablesItems = false
+                recentsMenu.delegate = self
+                let recentTitles = recents.map { URL(fileURLWithPath: $0).lastPathComponent }
+                let recentWidth = FolderRowView.width(for: recentTitles)
+                for path in recents {
+                    let url = URL(fileURLWithPath: path, isDirectory: true)
+                    recentsMenu.addItem(iconRow(url, kind: .folder, width: recentWidth))
+                }
+                recentsItem.submenu = recentsMenu
+                menu.addItem(recentsItem)
+            }
+
+            menu.addItem(.separator())
+            addChrome(to: menu)
+            return
+        }
+
+        var seen = Set<String>()
+        var hits: [(url: URL, title: String?)] = []
+
+        func consider(_ url: URL, title: String? = nil) {
+            let path = url.standardizedFileURL.path
+            guard seen.insert(path).inserted else { return }
+            guard scanner.matches(url, query: query, title: title) else { return }
+            hits.append((url, title))
+        }
+
+        for child in scanner.children(of: current) { consider(child) }
+        if let parent = scanner.parent(of: current) {
+            consider(parent, title: "↑  \(parent.lastPathComponent)")
+        }
+        consider(scanner.home, title: "Home")
+        consider(scanner.documents, title: "Documents")
+        consider(scanner.desktop, title: "Desktop")
+        for path in recents {
+            consider(URL(fileURLWithPath: path, isDirectory: true))
+        }
+        for child in scanner.children(of: scanner.documents) { consider(child) }
+        for child in scanner.children(of: scanner.desktop) { consider(child) }
+
+        hits.sort {
+            let ra = scanner.rank($0.url, query: query)
+            let rb = scanner.rank($1.url, query: query)
+            if ra != rb { return ra < rb }
+            return $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending
+        }
+        if hits.count > 40 { hits = Array(hits.prefix(40)) }
+
+        firstMatchPath = hits.first?.url.path
+
+        if hits.isEmpty {
+            let empty = NSMenuItem(title: "No matches", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
-        } else {
-            for child in kids {
-                menu.addItem(iconRow(child, kind: .folder, width: width))
-            }
+            return
         }
 
-        menu.addItem(.separator())
-        menu.addItem(iconRow(scanner.home, title: "Home", kind: .jump, width: width))
-        menu.addItem(iconRow(scanner.documents, title: "Documents", kind: .jump, width: width))
-        menu.addItem(iconRow(scanner.desktop, title: "Desktop", kind: .jump, width: width))
-
-        if !recents.isEmpty {
-            let recentsItem = NSMenuItem(title: "Recents", action: nil, keyEquivalent: "")
-            recentsItem.isEnabled = true
-            let recentsMenu = NSMenu()
-            recentsMenu.autoenablesItems = false
-            recentsMenu.delegate = self
-            let recentTitles = recents.map { URL(fileURLWithPath: $0).lastPathComponent }
-            let recentWidth = FolderRowView.width(for: recentTitles)
-            for path in recents {
-                let url = URL(fileURLWithPath: path, isDirectory: true)
-                recentsMenu.addItem(iconRow(url, kind: .folder, width: recentWidth))
+        for (index, hit) in hits.enumerated() {
+            let item = iconRow(hit.url, title: hit.title, kind: .folder, width: width)
+            if index == 0 {
+                (item.view as? FolderRowView)?.emphasized = true
             }
-            recentsItem.submenu = recentsMenu
-            menu.addItem(recentsItem)
+            menu.addItem(item)
         }
+    }
 
-        menu.addItem(.separator())
-
+    private func addChrome(to menu: NSMenu) {
         let hover = NSMenuItem(
             title: "Open on Hover",
             action: #selector(toggleHover),
@@ -145,6 +243,61 @@ final class StatusController: NSObject, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit Grok Folders", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
+
+    private func applyFilter(_ query: String) {
+        guard query != filterQuery else { return }
+        filterQuery = query
+        guard let menu = statusItem.menu else { return }
+        isRebuilding = true
+        rebuildBody(menu)
+        isRebuilding = false
+        for entry in menu.items {
+            entry.view?.needsDisplay = true
+        }
+        if searchView?.isEditing != true {
+            searchView?.focus()
+        }
+    }
+
+    private func submitFirstMatch() {
+        guard let path = firstMatchPath else { return }
+        launchGrok(path)
+        statusItem.menu?.cancelTracking()
+    }
+
+    private func handleEscape() {
+        if filterQuery.isEmpty {
+            statusItem.menu?.cancelTracking()
+            return
+        }
+        searchView?.setQuery("")
+        applyFilter("")
+    }
+
+    private func installKeyMonitor() {
+        removeKeyMonitor()
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.routeKey(event) ?? event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+    }
+
+    private func routeKey(_ event: NSEvent) -> NSEvent? {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) || flags.contains(.control) {
+            return event
+        }
+        guard let search = searchView else { return event }
+        if search.isEditing { return event }
+        search.interpret(event)
+        return nil
     }
 
     private func iconRow(_ url: URL, title: String? = nil, kind: FolderRowView.Kind, width: CGFloat) -> NSMenuItem {
@@ -256,6 +409,8 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     private func goTo(_ path: String) {
+        filterQuery = ""
+        searchView?.setQuery("")
         store.lastPath = path
         guard let menu = statusItem.menu else { return }
         isRebuilding = true
@@ -264,10 +419,12 @@ final class StatusController: NSObject, NSMenuDelegate {
         for entry in menu.items {
             entry.view?.needsDisplay = true
         }
+        searchView?.focusSoon()
     }
 }
 
 private enum MenuTag: Int {
+    case search = 5
     case folder = 10
     case action = 20
     case nav = 30
