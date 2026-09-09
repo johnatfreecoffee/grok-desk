@@ -35,7 +35,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        LoginItem.ensureInstalled()
         status = StatusController(store: store, scanner: scanner)
     }
 

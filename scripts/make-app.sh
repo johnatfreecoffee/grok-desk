@@ -95,8 +95,16 @@ echo -n "APPL????" > "$CONTENTS/PkgInfo" 2>/dev/null || true
 
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
+# Folders helper lives inside this bundle (not a second app in ~/Applications)
+if [[ -x "$ROOT/native/folders/scripts/build.sh" ]]; then
+  bash "$ROOT/native/folders/scripts/build.sh" >/dev/null
+  mkdir -p "$CONTENTS/Helpers"
+  rm -rf "$CONTENTS/Helpers/Grok Folders.app"
+  cp -R "$ROOT/native/folders/.build/Grok Folders.app" "$CONTENTS/Helpers/"
+fi
+
 echo "Created: $APP_DIR"
-echo "Double-click to open. Closing the window stops the local engine."
+echo "Double-click to open. Close the window to keep the comet in the menu bar. Quit Grok Desk to stop."
 
 USER_APPS="$HOME/Applications"
 mkdir -p "$USER_APPS"
@@ -107,14 +115,9 @@ ln -sfn "$ROOT" "$USER_APPS/$APP_NAME.app/Contents/Resources/app"
 xattr -cr "$USER_APPS/$APP_NAME.app" 2>/dev/null || true
 echo "Also installed: $USER_APPS/$APP_NAME.app"
 
-# Bundled Speak (always). Folders / Phone MCP only if already enabled.
+# Bundled Speak (always). Phone MCP stays on its launchd if already enabled.
 if [[ -x "$ROOT/tools/speak/scripts/install.sh" ]]; then
   /bin/zsh "$ROOT/tools/speak/scripts/install.sh"
-fi
-FOLDERS_LABEL="dev.freecoffee.GrokFolders"
-if [[ -f "$HOME/Library/LaunchAgents/${FOLDERS_LABEL}.plist" ]]; then
-  echo "Folders extra already enabled — rebuilding from native/folders"
-  bash "$ROOT/native/folders/scripts/install.sh"
 fi
 PHONE_LABEL="dev.freecoffee.grok-phone-mcp"
 if [[ -f "$HOME/Library/LaunchAgents/${PHONE_LABEL}.plist" && -f "$ROOT/tools/phone-mcp/server.mjs" ]]; then

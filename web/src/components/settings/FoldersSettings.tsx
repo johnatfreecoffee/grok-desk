@@ -68,7 +68,7 @@ export function FoldersSettings() {
               disabled={busy}
               onChange={(e) => void post({ enabled: e.target.checked })}
             />
-            <span>Enable menu bar (comet)</span>
+            <span>Show comet in the menu bar</span>
           </label>
           <label className="field check">
             <input
@@ -111,7 +111,7 @@ export function FoldersSettings() {
       )}
       {msg && <p className="settings-callout">{msg}</p>}
       <p className="modal-hint">
-        Comet in the menu bar opens a folder in Grok Build or Terminal.
+        Comet is part of Grok Desk — it stays in the menu bar while Desk is running, even if you close the window. Click it and type to search folders. Open Grok Desk from the comet menu or File → Open Grok Desk.
       </p>
     </div>
   );

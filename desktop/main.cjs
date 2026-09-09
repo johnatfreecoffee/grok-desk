@@ -1,10 +1,10 @@
 /**
  * Grok Desk — desktop shell (Electron)
- * Open app → start daemon → show window
- * Close app → stop daemon + agent
+ * Open app → engine + comet helper + phone MCP
+ * Close window → hide; comet stays. Quit → stop helper.
  */
 const { app, BrowserWindow, ipcMain, shell, dialog, Menu, session } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const path = require("path");
 const http = require("http");
 const fs = require("fs");
@@ -34,6 +34,17 @@ const PACKAGED = app.isPackaged;
 let mainWindow = null;
 let daemonProc = null;
 let quitting = false;
+
+function deskBundlePath() {
+  const exe = app.getPath("exe");
+  const m = String(exe).match(/^(.*\/Grok Desk\.app)/);
+  if (m) return m[1];
+  const home = path.join(app.getPath("home"), "Applications", "Grok Desk.app");
+  if (fs.existsSync(home)) return home;
+  const local = path.join(ROOT, "Grok Desk.app");
+  if (fs.existsSync(local)) return local;
+  return home;
+}
 
 function log(...args) {
   console.log("[desk-app]", ...args);
@@ -259,9 +270,138 @@ function createWindow() {
     return { action: "deny" };
   });
 
+  mainWindow.on("close", (e) => {
+    if (!quitting && process.platform === "darwin") {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+}
+
+function showMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    return;
+  }
+  createWindow();
+}
+
+function runFoldersCli(cmd) {
+  const node = resolveNode();
+  const entry = path.join(ROOT, "daemon", "folders.js");
+  const r = spawnSync(node.bin, [entry, cmd], {
+    cwd: ROOT,
+    encoding: "utf8",
+    timeout: 180000,
+    env: {
+      ...process.env,
+      ...node.env,
+      GROK_DESK_APP: deskBundlePath(),
+    },
+  });
+  if (r.status !== 0) {
+    log("folders", cmd, "failed", (r.stderr || r.stdout || "").trim());
+  }
+}
+
+function startFoldersHelper() {
+  runFoldersCli("ensure");
+}
+
+function stopFoldersHelper() {
+  runFoldersCli("stop");
+}
+
+function probeLocal(url) {
+  return new Promise((resolve) => {
+    const req = http.get(url, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on("error", () => resolve(false));
+    req.setTimeout(1200, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function ensurePhoneMcp() {
+  if (await probeLocal("http://127.0.0.1:3311/health")) return;
+  const install = path.join(ROOT, "tools", "phone-mcp", "scripts", "install-launchd.sh");
+  if (!fs.existsSync(install)) return;
+  log("phone MCP down — installing launch agent");
+  spawn("bash", [install], {
+    cwd: path.dirname(install),
+    stdio: "ignore",
+    detached: true,
+    env: process.env,
+  }).unref();
+}
+
+function installLoginItem() {
+  if (process.platform !== "darwin") return;
+  const bundle = deskBundlePath();
+  const bin = path.join(bundle, "Contents", "MacOS", "Grok Desk");
+  if (!fs.existsSync(bin)) return;
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: true,
+      openAsHidden: false,
+      path: bundle,
+    });
+  } catch (e) {
+    log("login item failed", e.message);
+  }
+  const script = `tell application "System Events"
+    if not (exists login item "Grok Desk") then
+      make login item at end with properties {path:${JSON.stringify(bundle)}, hidden:false}
+    end if
+  end tell`;
+  spawnSync("osascript", ["-e", script], { timeout: 8000 });
+}
+
+function buildMenu() {
+  if (process.platform !== "darwin") return;
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      {
+        label: app.name,
+        submenu: [
+          { role: "about" },
+          { type: "separator" },
+          { role: "services" },
+          { type: "separator" },
+          { role: "hide" },
+          { role: "hideOthers" },
+          { role: "unhide" },
+          { type: "separator" },
+          { role: "quit" },
+        ],
+      },
+      {
+        label: "File",
+        submenu: [
+          {
+            label: "Open Grok Desk",
+            accelerator: "CmdOrCtrl+0",
+            click: () => showMainWindow(),
+          },
+          { type: "separator" },
+          { role: "close" },
+        ],
+      },
+      { role: "editMenu" },
+      { role: "viewMenu" },
+      { role: "windowMenu" },
+    ]),
+  );
 }
 
 async function boot() {
@@ -276,6 +416,9 @@ async function boot() {
     return;
   }
   createWindow();
+  installLoginItem();
+  runFoldersCli("on");
+  void ensurePhoneMcp();
 }
 
 ipcMain.handle("desk:restart", async () => {
@@ -332,59 +475,35 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
+    showMainWindow();
   });
 
   app.whenReady().then(() => {
-    // Application menu uses app name ("Grok Desk") not "Electron"
-    if (process.platform === "darwin") {
-      Menu.setApplicationMenu(
-        Menu.buildFromTemplate([
-          {
-            label: app.name,
-            submenu: [
-              { role: "about" },
-              { type: "separator" },
-              { role: "services" },
-              { type: "separator" },
-              { role: "hide" },
-              { role: "hideOthers" },
-              { role: "unhide" },
-              { type: "separator" },
-              { role: "quit" },
-            ],
-          },
-          { role: "editMenu" },
-          { role: "viewMenu" },
-          { role: "windowMenu" },
-        ]),
-      );
-    }
+    buildMenu();
     return boot();
   });
 
   app.on("before-quit", () => {
     quitting = true;
+    stopFoldersHelper();
     stopDaemon();
   });
 
   app.on("window-all-closed", () => {
+    if (process.platform === "darwin") return;
     quitting = true;
+    stopFoldersHelper();
     stopDaemon();
     app.quit();
   });
 
   app.on("activate", async () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      try {
-        await startDaemon();
-        createWindow();
-      } catch (e) {
-        dialog.showErrorBox("Grok Desk", e.message);
-      }
+    try {
+      if (!(await isPortUp())) await startDaemon();
+      startFoldersHelper();
+      showMainWindow();
+    } catch (e) {
+      dialog.showErrorBox("Grok Desk", e.message);
     }
   });
 }

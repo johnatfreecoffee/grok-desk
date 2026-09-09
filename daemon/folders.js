@@ -1,8 +1,8 @@
 /**
- * Grok Folders (native NSMenu extra) — launchd + state.json.
- * Bundle id / label: dev.freecoffee.GrokFolders
+ * Grok Folders — native menu-bar helper owned by Grok Desk.
+ * No standalone .app / launchd. Electron starts and stops the comet.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +17,9 @@ const DESK_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const FOLDERS_ROOT = path.join(DESK_ROOT, "native", "folders");
 const BUILD_APP = path.join(FOLDERS_ROOT, ".build", "Grok Folders.app");
 const BUILD_BIN = path.join(BUILD_APP, "Contents", "MacOS", "GrokFolders");
+const FLAG_DIR = path.join(HOME, "Library", "Application Support", "GrokDesk");
+const FLAG_PATH = path.join(FLAG_DIR, "folders-helper.json");
+const PLIST = path.join(HOME, "Library", "LaunchAgents", `${LABEL}.plist`);
 const OPEN_MODES = new Set(["grok", "terminal"]);
 const DEFAULT_ROOT = path.join(HOME, "Documents");
 
@@ -132,32 +135,61 @@ export function saveState(patch = {}) {
   return state;
 }
 
-function isBootstrapped() {
-  const r = spawnSync("launchctl", ["print", launchdTarget()], {
-    encoding: "utf8",
-    timeout: 8000,
-  });
-  return r.status === 0;
+function loadFlag() {
+  try {
+    if (fs.existsSync(FLAG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(FLAG_PATH, "utf8"));
+      return raw.enabled !== false;
+    }
+  } catch {
+    /* */
+  }
+  return true;
+}
+
+function saveFlag(on) {
+  fs.mkdirSync(FLAG_DIR, { recursive: true });
+  fs.writeFileSync(FLAG_PATH, JSON.stringify({ enabled: Boolean(on) }) + "\n", { mode: 0o600 });
 }
 
 function isRunning() {
-  const r = spawnSync("pgrep", ["-f", "Grok Folders.app/Contents/MacOS/GrokFolders"], {
+  const r = spawnSync("pgrep", ["-x", "GrokFolders"], {
     encoding: "utf8",
     timeout: 5000,
   });
   return r.status === 0 && String(r.stdout || "").trim().length > 0;
 }
 
+function helperBin() {
+  const envBin = process.env.GROK_FOLDERS_BIN;
+  if (envBin && fs.existsSync(envBin)) return envBin;
+  ensureBuilt();
+  if (fs.existsSync(BUILD_BIN)) return BUILD_BIN;
+  const nested = path.join(
+    HOME,
+    "Applications",
+    "Grok Desk.app",
+    "Contents",
+    "Helpers",
+    "Grok Folders.app",
+    "Contents",
+    "MacOS",
+    "GrokFolders",
+  );
+  if (fs.existsSync(nested)) return nested;
+  return path.join(DESK_ROOT, "Grok Desk.app", "Contents", "Helpers", "Grok Folders.app", "Contents", "MacOS", "GrokFolders");
+}
+
 function appPath() {
-  if (fs.existsSync(INSTALLED_APP)) return INSTALLED_APP;
-  if (fs.existsSync(BUILD_APP)) return BUILD_APP;
-  return INSTALLED_APP;
+  const bin = helperBin();
+  // .../Grok Folders.app/Contents/MacOS/GrokFolders
+  return path.resolve(bin, "..", "..", "..");
 }
 
 export function status() {
   const state = loadState();
   return {
-    enabled: isBootstrapped(),
+    enabled: loadFlag(),
     running: isRunning(),
     appPath: appPath(),
     lastPath: state.lastPath,
@@ -188,14 +220,81 @@ function ensureBuilt() {
   runScript("build.sh");
 }
 
+function killHelper() {
+  spawnSync("pkill", ["-x", "GrokFolders"], { timeout: 5000 });
+}
+
+function migrateStandalone() {
+  spawnSync("launchctl", ["bootout", launchdTarget()], { timeout: 8000 });
+  try {
+    if (fs.existsSync(PLIST)) fs.unlinkSync(PLIST);
+  } catch {
+    /* */
+  }
+  spawnSync("/bin/rm", ["-rf", INSTALLED_APP], { timeout: 8000 });
+}
+
+function spawnHelper() {
+  const bin = helperBin();
+  if (!fs.existsSync(bin)) throw new Error(`Folders helper missing: ${bin}`);
+  const deskApp =
+    process.env.GROK_DESK_APP ||
+    (fs.existsSync(path.join(HOME, "Applications", "Grok Desk.app"))
+      ? path.join(HOME, "Applications", "Grok Desk.app")
+      : path.join(DESK_ROOT, "Grok Desk.app"));
+  const child = spawn(bin, [], {
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      GROK_DESK_HELPER: "1",
+      GROK_DESK_APP: deskApp,
+    },
+  });
+  child.unref();
+}
+
+function sleep(ms) {
+  spawnSync("sleep", [String(ms / 1000)], { timeout: ms + 1000 });
+}
+
 export function setEnabled(on) {
+  saveFlag(on);
+  migrateStandalone();
   if (on) {
     ensureBuilt();
-    runScript("install.sh");
+    killHelper();
+    sleep(300);
+    spawnHelper();
   } else {
-    runScript("uninstall.sh");
+    killHelper();
   }
   return status();
+}
+
+export function ensureHelper() {
+  migrateStandalone();
+  if (!loadFlag()) {
+    if (isRunning()) killHelper();
+    return status();
+  }
+  ensureBuilt();
+  if (!isRunning()) spawnHelper();
+  return status();
+}
+
+export function stopHelper() {
+  killHelper();
+  return status();
+}
+
+const isCli = process.argv[1] && path.basename(process.argv[1]) === "folders.js";
+if (isCli) {
+  const cmd = process.argv[2] || "ensure";
+  if (cmd === "stop") stopHelper();
+  else if (cmd === "off") setEnabled(false);
+  else if (cmd === "on") setEnabled(true);
+  else ensureHelper();
 }
 
 export { LABEL, STATE_PATH, FOLDERS_ROOT, INSTALLED_APP };

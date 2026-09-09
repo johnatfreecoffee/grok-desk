@@ -80,14 +80,9 @@ echo "  Open http://127.0.0.1:8787"
 echo "  Logs: ${LOG_DIR}/"
 echo "  Unload: launchctl bootout gui/$(id -u)/${LABEL}"
 
-# Bundled Speak (always). Folders / Phone MCP only if already enabled.
+# Bundled Speak (always). Folders comet is started by Grok Desk.app (not this agent).
 if [[ -x "$ROOT/tools/speak/scripts/install.sh" ]]; then
   /bin/zsh "$ROOT/tools/speak/scripts/install.sh"
-fi
-FOLDERS_LABEL="dev.freecoffee.GrokFolders"
-if [[ -f "$HOME/Library/LaunchAgents/${FOLDERS_LABEL}.plist" ]]; then
-  echo "Folders extra already enabled — rebuilding from native/folders"
-  bash "$ROOT/native/folders/scripts/install.sh"
 fi
 PHONE_LABEL="dev.freecoffee.grok-phone-mcp"
 if [[ -f "$HOME/Library/LaunchAgents/${PHONE_LABEL}.plist" && -f "$ROOT/tools/phone-mcp/server.mjs" ]]; then

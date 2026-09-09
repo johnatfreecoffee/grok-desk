@@ -224,6 +224,14 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     private func addChrome(to menu: NSMenu) {
+        let openDesk = NSMenuItem(
+            title: "Open Grok Desk",
+            action: #selector(openDesk),
+            keyEquivalent: ""
+        )
+        openDesk.target = self
+        menu.addItem(openDesk)
+
         let hover = NSMenuItem(
             title: "Open on Hover",
             action: #selector(toggleHover),
@@ -233,17 +241,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         hover.state = store.openOnHover ? .on : .off
         menu.addItem(hover)
 
-        let login = NSMenuItem(
-            title: loginTitle(),
-            action: #selector(toggleLogin),
-            keyEquivalent: ""
-        )
-        login.target = self
-        login.state = LoginItem.isEnabled ? .on : .off
-        menu.addItem(login)
-
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Grok Folders", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Grok Desk", action: #selector(quitDesk), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -294,10 +293,14 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     private func routeKey(_ event: NSEvent) -> NSEvent? {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if flags.contains(.command) || flags.contains(.control) {
+        guard let search = searchView else { return event }
+        if flags.contains(.command) {
+            if search.handleCommand(event) { return nil }
             return event
         }
-        guard let search = searchView else { return event }
+        if flags.contains(.control) {
+            return event
+        }
         if search.isEditing { return event }
         search.interpret(event)
         return nil
@@ -342,11 +345,10 @@ final class StatusController: NSObject, NSMenuDelegate {
         return icon
     }
 
-    private func loginTitle() -> String {
-        if LoginItem.needsApproval {
-            return "Launch at Login (allow in Settings…)"
-        }
-        return "Launch at Login"
+    @objc private func openDesk() {
+        cancelHover()
+        statusItem.menu?.cancelTracking()
+        Launcher.showDesk()
     }
 
     // MARK: - Hover
@@ -397,18 +399,9 @@ final class StatusController: NSObject, NSMenuDelegate {
         store.openOnHover.toggle()
     }
 
-    @objc private func toggleLogin() {
-        if LoginItem.needsApproval {
-            LoginItem.openSettings()
-            return
-        }
-        if !LoginItem.setEnabled(!LoginItem.isEnabled) && !LoginItem.isEnabled {
-            LoginItem.openSettings()
-        }
-    }
-
-    @objc private func quitApp() {
-        NSApp.terminate(nil)
+    @objc private func quitDesk() {
+        cancelHover()
+        Launcher.quitDesk()
     }
 
     private func goTo(_ path: String) {

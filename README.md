@@ -43,7 +43,7 @@ This project was **built with Grok Build** (dogfooded end-to-end) and is open so
 │  grok agent  (Grok CLI)                                  │  ← your CLI login / subscription
 └──────────────────────────────────────────────────────────┘
 
-Menu bar: Grok Folders extra (native NSMenu) — comet → open a folder in Grok or Terminal
+Menu bar: comet is part of Grok Desk (native NSMenu). Close the window; the comet stays. Quit Grok Desk to stop.
 ```
 
 | Piece | Role |
@@ -69,7 +69,7 @@ Menu bar: Grok Folders extra (native NSMenu) — comet → open a folder in Grok
 - **[Grok CLI](https://x.ai/build)** installed and **logged in** (`grok --version` works in Terminal)
 - Optional: [Tailscale](https://tailscale.com/) on Mac + phone for remote UI
 - Speak TTS is **bundled** (subscription — same Grok login, no API key)
-- Folders extra and Phone connector stay **off** until you enable them in Settings
+- Folders comet starts with Grok Desk (Settings can hide it). Phone connector stays off until you enable it, then Desk keeps it healthy.
 - Dictation in the composer is the same as TUI `/voice` (subscription STT, no API key)
 
 ---

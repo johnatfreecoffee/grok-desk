@@ -40,6 +40,45 @@ enum Launcher {
         NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
     }
 
+    static func deskAppURL() -> URL? {
+        if let env = ProcessInfo.processInfo.environment["GROK_DESK_APP"], !env.isEmpty {
+            let url = URL(fileURLWithPath: env)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        var url = Bundle.main.bundleURL
+        for _ in 0..<8 {
+            if url.lastPathComponent == "Grok Desk.app" { return url }
+            let parent = url.deletingLastPathComponent()
+            if parent.path == url.path { break }
+            url = parent
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent("Applications/Grok Desk.app"),
+            home.appendingPathComponent("Documents/grok-desk/Grok Desk.app"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    static func showDesk() {
+        guard let url = deskAppURL() else { return }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+    }
+
+    static func quitDesk() {
+        let desk = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.freecoffee.grok-desk")
+        if desk.isEmpty {
+            NSApp.terminate(nil)
+            return
+        }
+        desk.forEach { $0.terminate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApp.terminate(nil)
+        }
+    }
+
     private static let openGrokSource = """
     on run argv
       set theDir to item 1 of argv
