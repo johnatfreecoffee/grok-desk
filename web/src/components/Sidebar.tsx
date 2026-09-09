@@ -16,7 +16,7 @@ import {
   enablePush,
   disablePush,
   getPushState,
-  pushSupported,
+  pushAvailability,
   isSecureForPush,
 } from "../lib/push";
 import { ModuleInfo } from "./ModuleInfo";
@@ -257,13 +257,26 @@ export function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload on tick/open only
   }, [open, onRefreshNeeded]);
 
-  // Live refresh while sidebar open (CLI titles/activity without manual refresh)
+  // Live refresh while sidebar open (CLI titles/activity without manual refresh).
+  //
+  // P7: skip the tick while the tab / PWA is hidden. A backgrounded phone was
+  // still asking the Mac to rebuild the entire project list every 2.5 s and then
+  // throwing the answer away. Coming back refreshes immediately, so nothing is
+  // ever stale on screen.
   useEffect(() => {
     if (!open) return;
     const id = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
       void load({ silent: true });
     }, 2500);
-    return () => window.clearInterval(id);
+    const onVis = () => {
+      if (document.visibilityState === "visible") void load({ silent: true });
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -739,6 +752,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
     subscribed: boolean;
   } | null>(null);
   const [pushServerCount, setPushServerCount] = useState(0);
+  /** P7 — the one reason push is (un)available, decided in the browser's own order. */
+  const pushAvail = useMemo(() => pushAvailability(), []);
 
   useEffect(() => {
     if (!open) return;
@@ -914,20 +929,42 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsProps) {
 
         <div className="settings-section">
           <div className="settings-section-title">Phone push</div>
-          {!pushSupported() ? (
+          {pushAvail.state === "desktop-app" ? (
             <p className="modal-hint">
               Push is for the phone/browser PWA (Add to Home Screen). Desktop app uses the Mac
               directly.
             </p>
+          ) : pushAvail.state === "insecure" ? (
+            /* P7 — say what is actually blocking push instead of failing quietly.
+               This is the Tailscale-HTTPS human gate: nothing on this Mac can
+               lift it, and every other phone feature works over plain HTTP. */
+            <>
+              <p className="settings-callout">
+                <strong>Push is off — this page is not a secure context.</strong> Desk is served
+                over plain HTTP at <code>{pushAvail.origin}</code>, so the browser refuses to
+                register a service worker, and Web Push needs one. Nothing is failing silently:
+                there is no subscription to make.
+              </p>
+              <p className="modal-hint">
+                To turn it on, HTTPS certificates have to be enabled for this tailnet — Tailscale
+                admin console → DNS → HTTPS Certificates. <code>tailscale cert</code> currently
+                reports that the account does not support TLS certs, so it cannot be done from
+                this Mac. After it is enabled:{" "}
+                <code>tailscale serve --bg --https=443 http://127.0.0.1:8787</code>, then reinstall
+                the home-screen app from the <strong>https://</strong> URL.
+              </p>
+              <p className="modal-hint">
+                Everything else on the phone works over HTTP and is unaffected: live chat,
+                reconnect after the screen sleeps, cursor resume, and Add to Home Screen.
+              </p>
+            </>
+          ) : pushAvail.state === "unsupported" ? (
+            <p className="settings-callout">
+              This browser has no Web Push support, so notifications cannot be enabled here. Chat,
+              reconnect and cursor resume are unaffected.
+            </p>
           ) : (
             <>
-              {!isSecureForPush() && (
-                <p className="settings-callout">
-                  Need HTTPS for push. On the Mac run{" "}
-                  <code>./scripts/phone-serve.sh</code> and open the{" "}
-                  <strong>https://</strong> URL, then reinstall the home-screen app.
-                </p>
-              )}
               <p className="modal-hint">
                 Status:{" "}
                 {pushState?.subscribed

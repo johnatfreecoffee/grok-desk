@@ -64,6 +64,15 @@ function deskIndexPath() {
 let deskIndexCache = null;
 let deskIndexWriteChain = Promise.resolve();
 
+/**
+ * P7 — sidebar sort-key freeze, in memory only.
+ *
+ * sessionId → `{ lastInteractionAt, chatHash, chatBytes }`. Written by
+ * `resolveInteractionAt` (a READ path — it must never touch disk), cleared by
+ * every path that records a real interaction so the persisted record wins.
+ */
+const interactionFreeze = new Map();
+
 /** Sessions/projects this Desk app has actually used. */
 function loadDeskIndex() {
   if (deskIndexCache) return deskIndexCache;
@@ -109,29 +118,171 @@ export function isSubagentKind(s) {
   return k === "subagent" || k === "subagent_resume" || k.startsWith("subagent");
 }
 
+/* ------------------------------------------------ P7 — one shared dir scan */
+
+/**
+ * P7. `~/.grok/sessions` was walked from scratch by three different hot paths,
+ * per session id, on a 2.5 s poll:
+ *
+ *   - `isSubagentSession()` did a full nested `readdirSync` of EVERY session dir
+ *     to look for a `subagents/<id>` link — O(indexed x on-disk). With 664
+ *     indexed ids and 1025 dirs on disk that is ~390 000 `existsSync` calls per
+ *     `GET /api/projects`, and `pruneSubagentsFromDeskIndex()` ran it for every
+ *     id on every call.
+ *   - `findSessionDir()` / `findSessionCwd()` fell back to a readdir of all 89
+ *     project groups on every prompt, queue drain and load.
+ *
+ * All three now share ONE snapshot: id -> group key, plus the set of ids linked
+ * under some parent's `subagents/`. Building it costs one readdir per group and
+ * one probe per session dir — the same walk `listProjects` already performs.
+ *
+ * Invalidation is generation-based, never a rescan-per-lookup:
+ *   - `bumpSessionScan()` — the root watcher's group-level tick, and every
+ *     Desk-initiated write (session created, session deleted).
+ *   - `SCAN_TTL_MS` — a session dir appearing inside an existing group does not
+ *     move the group set, so the snapshot also ages out on its own.
+ *   - a lookup that misses forces exactly one rebuild, then gives up.
+ */
+const SCAN_TTL_MS = Number(process.env.DESK_SCAN_TTL_MS || 4000);
+/** How stale a snapshot must be before a lookup miss is allowed to force a rebuild. */
+const SCAN_MISS_REFRESH_MS = Number(process.env.DESK_SCAN_MISS_MS || 250);
+
+/** @type {{ root: string, gen: number, at: number, ids: Map<string,string>, subagentIds: Set<string>, groups: string[] } | null} */
+let scanCache = null;
+let scanGen = 1;
+
+/**
+ * Drop the session-directory snapshot. Called by the daemon's root watcher when
+ * project groups appear or disappear, and by this module's own writes.
+ */
+export function bumpSessionScan() {
+  scanGen += 1;
+  return scanGen;
+}
+
+function buildSessionScan(root) {
+  const ids = new Map();
+  const subagentIds = new Set();
+  const groups = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    entries = [];
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory() || ent.name.startsWith(".")) continue;
+    groups.push(ent.name);
+    const groupDir = path.join(root, ent.name);
+    let sEntries = [];
+    try {
+      sEntries = fs.readdirSync(groupDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const sEnt of sEntries) {
+      if (!sEnt.isDirectory()) continue;
+      if (!ids.has(sEnt.name)) ids.set(sEnt.name, ent.name);
+      // One readdir attempt instead of existsSync + readdir; ENOENT is the
+      // common case (most sessions spawn no subagents) and costs one syscall.
+      let kids = null;
+      try {
+        kids = fs.readdirSync(path.join(groupDir, sEnt.name, "subagents"), {
+          withFileTypes: true,
+        });
+      } catch {
+        continue;
+      }
+      for (const kid of kids) {
+        if (kid.name && kid.name[0] !== ".") subagentIds.add(kid.name);
+      }
+    }
+  }
+  return { root, gen: scanGen, at: Date.now(), ids, subagentIds, groups };
+}
+
+/** Current snapshot, rebuilt only when the generation moved or the TTL expired. */
+function sessionScan({ force = false } = {}) {
+  const root = sessionsRoot();
+  if (
+    !force &&
+    scanCache &&
+    scanCache.root === root &&
+    scanCache.gen === scanGen &&
+    Date.now() - scanCache.at < SCAN_TTL_MS
+  ) {
+    return scanCache;
+  }
+  scanCache = buildSessionScan(root);
+  return scanCache;
+}
+
+/**
+ * Project-group directory name that holds `sessionId`, or null.
+ * A miss on a stale snapshot buys exactly one rebuild.
+ */
+function scanGroupFor(sessionId) {
+  const id = String(sessionId);
+  const scan = sessionScan();
+  const group = scan.ids.get(id);
+  if (group) return group;
+  // Miss — the dir may have been created since the snapshot (a brand-new chat,
+  // a group the CLI just made). Fall back to the exact probe this replaced:
+  // one readdir of the root plus one existsSync per group. That is ~90 syscalls
+  // for ONE lookup, where the old code paid it for every id on every poll.
+  const root = scan.root;
+  let groups = scan.groups;
+  try {
+    groups = fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+      .map((e) => e.name);
+  } catch {
+    /* root gone — the snapshot's list is as good as it gets */
+  }
+  for (const g of groups) {
+    if (fs.existsSync(path.join(root, g, id))) return g;
+  }
+  return null;
+}
+
+/**
+ * Subagent-ness is sticky: a session that is a subagent never becomes a user
+ * chat. `true` is therefore memoized for the life of the process; `false` is
+ * only memoized against the current snapshot, because a link can still appear.
+ */
+const subagentMemo = new Map(); // sessionId -> true
+const notSubagentMemo = new Map(); // sessionId -> scan generation the answer came from
+
 /** True when this on-disk session is a Grok Build subagent (not a user chat). */
 export function isSubagentSession(sessionId, cwd) {
   if (!sessionId || String(sessionId).startsWith("mail:")) return false;
-  const dir = findSessionDir(sessionId, cwd);
-  if (!dir) return false;
-  const s = readSummary(dir);
-  if (isSubagentKind(s)) return true;
-  // Linked under a parent session's subagents/ folder
-  try {
-    const root = sessionsRoot();
-    if (!fs.existsSync(root)) return false;
-    for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!ent.isDirectory()) continue;
-      const group = path.join(root, ent.name);
-      for (const sEnt of fs.readdirSync(group, { withFileTypes: true })) {
-        if (!sEnt.isDirectory()) continue;
-        const link = path.join(group, sEnt.name, "subagents", sessionId);
-        if (fs.existsSync(link)) return true;
-      }
-    }
-  } catch {
-    /* */
+  const id = String(sessionId);
+  if (subagentMemo.has(id)) return true;
+  let scan = sessionScan();
+  if (scan.subagentIds.has(id)) {
+    subagentMemo.set(id, true);
+    return true;
   }
+  if (!scan.ids.has(id) && Date.now() - scan.at > SCAN_MISS_REFRESH_MS) {
+    // The id is newer than the snapshot (brand-new session, or a link the CLI
+    // wrote since the last tick). Pay for at most one rebuild — the freshness
+    // guard keeps a loop over many unknown ids (boot-time prune of an index
+    // full of deleted sessions) from rebuilding once per id.
+    scan = sessionScan({ force: true });
+    if (scan.subagentIds.has(id)) {
+      subagentMemo.set(id, true);
+      return true;
+    }
+  }
+  if (notSubagentMemo.get(id) === scan.gen) return false;
+  const dir = findSessionDir(id, cwd);
+  if (!dir) return false;
+  if (isSubagentKind(readSummary(dir))) {
+    subagentMemo.set(id, true);
+    return true;
+  }
+  notSubagentMemo.set(id, scan.gen);
   return false;
 }
 
@@ -179,6 +330,7 @@ export function trackDeskSession(sessionId, cwd, title) {
  */
 export function touchSessionInteraction(sessionId, cwd, extra = {}) {
   if (!sessionId) return;
+  interactionFreeze.delete(sessionId); // a real turn beats the read-path memo
   const idx = loadDeskIndex();
   const prev = idx.sessionIds[sessionId] || {};
   const now = new Date().toISOString();
@@ -215,8 +367,11 @@ export function setDeskTitle(sessionId, title, { force = false } = {}) {
   idx.sessionIds[sessionId] = {
     ...prev,
     title: clean,
-    // First real prompt renames AND counts as interaction
-    lastInteractionAt: prev.lastInteractionAt || now,
+    // First real prompt renames AND counts as interaction.
+    // P7: the sidebar's freeze is no longer persisted by the read path, so fall
+    // back to it here — a rename must not float an old chat to the top.
+    lastInteractionAt:
+      prev.lastInteractionAt || interactionFreeze.get(sessionId)?.lastInteractionAt || now,
     at: now,
   };
   saveDeskIndex(idx);
@@ -616,26 +771,19 @@ function resolveInteractionAt(sessionDir, sessionId, deskLastAt, deskRec, create
   }
 
   if (freeze && sessionId) {
-    // Persist freeze so next poll doesn't re-bootstrap from open mtime
-    try {
-      const idx = loadDeskIndex();
-      const prev = idx.sessionIds[sessionId] || {};
-      // Only write if missing hash or interaction moved forward
-      if (
-        prev.chatHash !== freeze.chatHash ||
-        prev.lastInteractionAt !== freeze.lastInteractionAt
-      ) {
-        idx.sessionIds[sessionId] = {
-          ...prev,
-          lastInteractionAt: freeze.lastInteractionAt,
-          chatHash: freeze.chatHash,
-          chatBytes: freeze.chatBytes,
-        };
-        saveDeskIndex(idx);
-      }
-    } catch {
-      /* */
-    }
+    // P7 — remember the freeze IN MEMORY, never on disk.
+    //
+    // This used to `saveDeskIndex()` from inside a read. On this machine that
+    // was ~187 rewrites of a 148 KB file per `GET /api/projects`, on a 2.5 s
+    // poll, forever: sessions listed with `showAllCliSessions` are not in
+    // desk-index, so `prev` was always `{}` and the "only write if changed"
+    // guard never held. It also silently grew desk-index by 187 ids per poll.
+    //
+    // Nothing is lost. Every input the freeze is derived from is on disk
+    // (`updates.jsonl` timestamps, the chat_history fingerprint), so a restart
+    // recomputes exactly the same value; the freeze only has to survive
+    // *between polls*, which is what this map does.
+    interactionFreeze.set(sessionId, freeze);
   }
 
   if (!candidates.length) return null;
@@ -648,7 +796,12 @@ function sessionMeta(sessionDir, fallbackCwd, deskSessionIds, deskLastAtMap, des
   const s = readSummary(sessionDir);
   const deskTitle = firstDeskUserTitle(id);
   const deskLastAt = deskLastAtMap?.[id] || null;
-  const deskRec = deskIdx?.sessionIds?.[id] || null;
+  // P7: desk-index record, overlaid with this process's in-memory freeze (see
+  // `resolveInteractionAt`). A real interaction drops the freeze, so a
+  // `touchSessionInteraction` write always wins over a stale memo.
+  const persisted = deskIdx?.sessionIds?.[id] || null;
+  const frozen = interactionFreeze.get(id) || null;
+  const deskRec = frozen ? { ...persisted, ...frozen } : persisted;
   const pinned = Boolean(pinnedSessions?.[id]);
   const isSub = isSubagentKind(s);
   const sessionKind = s?.session_kind ? String(s.session_kind) : null;
@@ -731,8 +884,15 @@ export function listProjects(opts = {}) {
     return { projects: [], settings, sessionsRoot: root };
   }
 
-  // One-shot cleanup: subagents must not appear as peer chats
-  pruneSubagentsFromDeskIndex();
+  // P7 — the "one-shot cleanup" that ran here is gone.
+  //
+  // `pruneSubagentsFromDeskIndex()` is O(indexed x on-disk) and it ran on every
+  // 2.5 s sidebar poll, which is most of the 2.9-4.5 s this endpoint took. It
+  // was also redundant: nothing below reads desk-index to decide whether a
+  // subagent is shown — the `scan.subagentIds` / `meta.isSubagent` filters do
+  // that, and they see the same links prune did. It still runs once at daemon
+  // boot (daemon/index.js), which is where a "one-shot cleanup" belongs.
+  const scan = sessionScan();
 
   const maxPer = Number(opts.maxSessionsPerProject ?? settings.maxSessionsPerProject) || 40;
   const maxProjects = Number(opts.maxProjectsShown ?? settings.maxProjectsShown) || 80;
@@ -779,21 +939,12 @@ export function listProjects(opts = {}) {
       continue;
     }
 
-    // Collect sessions for this project
+    // Collect sessions for this project. P7: the subagent links come from the
+    // shared snapshot (built once per tick for the whole tree) instead of a
+    // per-group nested readdir on every poll. It is a superset of the old
+    // per-group set — the same links `pruneSubagentsFromDeskIndex` used.
     let diskCount = 0;
-    const childIds = new Set();
-    try {
-      for (const sEnt of fs.readdirSync(groupDir, { withFileTypes: true })) {
-        if (!sEnt.isDirectory()) continue;
-        const subDir = path.join(groupDir, sEnt.name, "subagents");
-        if (!fs.existsSync(subDir)) continue;
-        for (const kid of fs.readdirSync(subDir, { withFileTypes: true })) {
-          if (kid.name && kid.name[0] !== ".") childIds.add(kid.name);
-        }
-      }
-    } catch {
-      /* */
-    }
+    const childIds = scan.subagentIds;
     const sessions = [];
     for (const sEnt of fs.readdirSync(groupDir, { withFileTypes: true })) {
       if (!sEnt.isDirectory()) continue;
@@ -965,17 +1116,18 @@ export function cwdKeyCandidates(cwd) {
 
 export function findSessionDir(sessionId, cwd) {
   const root = sessionsRoot();
-  if (!sessionId || !fs.existsSync(root)) return null;
+  if (!sessionId) return null;
   for (const key of cwdKeyCandidates(cwd)) {
     const candidate = path.join(root, encodeURIComponent(key), sessionId);
     if (fs.existsSync(candidate)) return candidate;
   }
-  for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
-    if (!ent.isDirectory()) continue;
-    const p = path.join(root, ent.name, sessionId);
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
+  // P7: the group key is unknown, so ask the shared snapshot instead of
+  // re-listing all 89 project groups. `findSessionCwd` and the ACP prompt /
+  // queue-drain paths call this on every turn.
+  const group = scanGroupFor(sessionId);
+  if (!group) return null;
+  const p = path.join(root, group, sessionId);
+  return fs.existsSync(p) ? p : null;
 }
 
 /** List rewind points (metadata only — no file snapshot bodies). */
@@ -1083,6 +1235,11 @@ export function deleteSession(sessionId, cwd) {
     };
   }
   fs.rmSync(dir, { recursive: true, force: true });
+  // P7: the tree changed under us — drop the shared snapshot and this id's memos.
+  bumpSessionScan();
+  interactionFreeze.delete(sessionId);
+  subagentMemo.delete(sessionId);
+  notSubagentMemo.delete(sessionId);
   try {
     clearDeskMessages(sessionId);
   } catch {
@@ -1305,14 +1462,50 @@ function deskMessagesPath() {
   return userDataPath("desk-messages.json");
 }
 
+/**
+ * P7 — cache the legacy shadow log.
+ *
+ * This file is 814 KB on this machine and P5 made it read-only, yet
+ * `firstDeskUserTitle()` re-read AND re-parsed the whole thing once per session
+ * while building the sidebar: ~500 full JSON parses (~400 MB of parsing) per
+ * `GET /api/projects`. It is now parsed once and re-validated with a single
+ * `stat` — size + mtime — so an external edit is still picked up.
+ */
+let deskMessagesCache = null; // { path, size, mtimeMs, store }
+
 function loadDeskMessagesStore() {
+  let p;
   try {
-    const p = deskMessagesPath();
-    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, "utf8"));
+    p = deskMessagesPath();
   } catch {
-    /* */
+    return {};
   }
-  return {};
+  let st = null;
+  try {
+    st = fs.statSync(p);
+  } catch {
+    st = null;
+  }
+  if (!st) {
+    deskMessagesCache = { path: p, size: -1, mtimeMs: -1, store: {} };
+    return deskMessagesCache.store;
+  }
+  if (
+    deskMessagesCache &&
+    deskMessagesCache.path === p &&
+    deskMessagesCache.size === st.size &&
+    deskMessagesCache.mtimeMs === st.mtimeMs
+  ) {
+    return deskMessagesCache.store;
+  }
+  let store = {};
+  try {
+    store = JSON.parse(fs.readFileSync(p, "utf8")) || {};
+  } catch {
+    store = {};
+  }
+  deskMessagesCache = { path: p, size: st.size, mtimeMs: st.mtimeMs, store };
+  return store;
 }
 
 /**
@@ -1326,6 +1519,7 @@ function saveDeskMessagesStore(store) {
   const tmp = `${p}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(store));
   fs.renameSync(tmp, p);
+  deskMessagesCache = null; // re-stat on next read
 }
 
 /**
@@ -1526,12 +1720,11 @@ function mergeTranscripts(primary, secondary) {
 }
 
 export function findSessionCwd(sessionId) {
-  const root = sessionsRoot();
-  if (!fs.existsSync(root)) return null;
-  for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
-    if (!ent.isDirectory()) continue;
-    const p = path.join(root, ent.name, sessionId);
-    if (fs.existsSync(p)) return decodeCwdKey(ent.name);
-  }
-  return null;
+  if (!sessionId) return null;
+  // P7: index lookup instead of a readdir of every project group. This ran on
+  // every prompt, every queue drain and every load.
+  const group = scanGroupFor(sessionId);
+  if (!group) return null;
+  if (!fs.existsSync(path.join(sessionsRoot(), group, sessionId))) return null;
+  return decodeCwdKey(group);
 }
