@@ -62,6 +62,9 @@ final class StatusController: NSObject, NSMenuDelegate {
         if item?.tag != MenuTag.folder.rawValue {
             cancelHover()
         }
+        if item?.tag == MenuTag.search.rawValue {
+            searchView?.focus()
+        }
     }
 
     func menuDidClose(_ menu: NSMenu) {

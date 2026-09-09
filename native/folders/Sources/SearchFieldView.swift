@@ -49,6 +49,11 @@ final class SearchFieldView: NSView, NSTextFieldDelegate {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// NSMenu delivers mouse events to the item view, not hit-tested children.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
+    }
+
     override func layout() {
         super.layout()
         let pad: CGFloat = 10
@@ -74,8 +79,27 @@ final class SearchFieldView: NSView, NSTextFieldDelegate {
         focusSoon()
     }
 
+    override func mouseDown(with event: NSEvent) {
+        focus()
+        if let editor = field.currentEditor() {
+            editor.mouseDown(with: event)
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        field.currentEditor()?.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if let editor = field.currentEditor() {
+            editor.mouseUp(with: event)
+        } else {
+            focus()
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
-        field.interpretKeyEvents([event])
+        interpret(event)
     }
 
     func setQuery(_ value: String) {
@@ -101,9 +125,14 @@ final class SearchFieldView: NSView, NSTextFieldDelegate {
     }
 
     func focus() {
-        guard window != nil else { return }
-        window?.makeFirstResponder(field)
-        field.selectText(nil)
+        guard let window else { return }
+        if !window.isKeyWindow {
+            window.makeKey()
+        }
+        window.makeFirstResponder(field)
+        if field.currentEditor() == nil {
+            field.selectText(nil)
+        }
         if let editor = field.currentEditor() {
             editor.selectedRange = NSRange(location: (field.stringValue as NSString).length, length: 0)
         }
@@ -111,7 +140,11 @@ final class SearchFieldView: NSView, NSTextFieldDelegate {
 
     func interpret(_ event: NSEvent) {
         if !isEditing { focus() }
-        field.interpretKeyEvents([event])
+        if isEditing {
+            field.interpretKeyEvents([event])
+            return
+        }
+        applyKeyWithoutEditor(event)
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -133,9 +166,39 @@ final class SearchFieldView: NSView, NSTextFieldDelegate {
     @objc private func submit() {
         onSubmit?()
     }
+
+    private func applyKeyWithoutEditor(_ event: NSEvent) {
+        switch event.keyCode {
+        case 36, 76:
+            onSubmit?()
+        case 53:
+            onEscape?()
+        case 51:
+            guard !field.stringValue.isEmpty else { return }
+            field.stringValue = String(field.stringValue.dropLast())
+            onChange?(field.stringValue)
+        default:
+            guard let chars = event.characters else { return }
+            let filtered = chars.filter { ch in
+                !ch.isNewline && ch != "\u{7f}" && ch.unicodeScalars.allSatisfy { $0.value >= 32 }
+            }
+            guard !filtered.isEmpty else { return }
+            field.stringValue += filtered
+            onChange?(field.stringValue)
+        }
+    }
 }
 
 final class MenuFilterField: NSTextField {
+    override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
         if ok, let editor = currentEditor() as? NSTextView {
