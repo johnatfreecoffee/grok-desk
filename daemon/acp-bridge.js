@@ -135,6 +135,13 @@ export class AcpBridge extends EventEmitter {
   async ensure() {
     if (this.ready && this.proc && !this.proc.killed) return;
     if (this.starting) return this.starting;
+    // A stale child's exit used to flip `ready` off while a newer `this.proc`
+    // was already live. Killing that process is what produced the 143 loop
+    // (`ensure` → `_start` → `_teardown` SIGTERM → exit → `ready=false` again).
+    if (this.proc && !this.proc.killed) {
+      this.ready = true;
+      return;
+    }
     this.starting = this._start().finally(() => {
       this.starting = null;
     });
@@ -165,16 +172,17 @@ export class AcpBridge extends EventEmitter {
     this.proc.on("exit", (code, signal) => {
       console.log(`[acp] agent exited code=${code} signal=${signal}`);
       if (spawnedPid) this.spawnedPids.delete(spawnedPid);
-      this.ready = false;
-      this.sessionId = null;
+      const current = this.proc && this.proc.pid === spawnedPid;
+      if (current) {
+        this.ready = false;
+        this.sessionId = null;
+        this.proc = null;
+      }
       for (const [, p] of this.pending) {
         p.reject(new Error("agent process exited"));
       }
       this.pending.clear();
       this.emit("agent_exit", { code, signal });
-      // Only clear the handle if it is still THIS process: an overlapping
-      // restart may already have put a newer child here.
-      if (this.proc && this.proc.pid === spawnedPid) this.proc = null;
     });
 
     this.rl = readline.createInterface({ input: this.proc.stdout });

@@ -5,6 +5,10 @@
  */
 import WebSocket from "ws";
 import fs from "node:fs";
+import { authCookie } from "./lib/feed-smoke-kit.mjs";
+
+const COOKIE = authCookie();
+const cookieHeader = COOKIE ? { Cookie: COOKIE } : {};
 
 const PORT = process.env.PORT || 8787;
 // Neutral cwd — avoids heavy project-context injection during short smokes.
@@ -39,7 +43,7 @@ function waitTurnEnd(ws, ms = 120000) {
   return wait(ws, (m) => m.type === "turn_end", ms);
 }
 
-const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, { headers: cookieHeader });
 await new Promise((r, j) => {
   ws.on("open", r);
   ws.on("error", j);
@@ -62,7 +66,9 @@ ws.send(
 );
 await wait(ws, (m) => m.type === "turn_start");
 
-const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then((r) => r.json());
+const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`, {
+  headers: cookieHeader,
+}).then((r) => r.json());
 const other = (projects.projects || [])
   .flatMap((p) => p.sessions || [])
   .find((s) => s.id !== sid);

@@ -5,6 +5,10 @@
  */
 import WebSocket from "ws";
 import fs from "node:fs";
+import { authCookie } from "./lib/feed-smoke-kit.mjs";
+
+const COOKIE = authCookie();
+const cookieHeader = COOKIE ? { Cookie: COOKIE } : {};
 
 const PORT = process.env.PORT || 8787;
 const CWD = process.env.SMOKE_CWD || `${process.env.HOME}/tmp-grok-desk-smoke`;
@@ -35,7 +39,7 @@ function wait(ws, pred, ms = 90000) {
 }
 
 async function fetchTurn() {
-  const r = await fetch(`http://127.0.0.1:${PORT}/api/turn`);
+  const r = await fetch(`http://127.0.0.1:${PORT}/api/turn`, { headers: cookieHeader });
   if (!r.ok) throw new Error("GET /api/turn failed");
   return r.json();
 }
@@ -47,7 +51,7 @@ if (typeof idle.turnEpoch !== "number") throw new Error("turnEpoch missing");
 console.log("✓ GET /api/turn", { turnActive: idle.turnActive, epoch: idle.turnEpoch });
 
 // --- T1: connect + hello parity ---
-const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, { headers: cookieHeader });
 await new Promise((r, j) => {
   ws.on("open", r);
   ws.on("error", j);
@@ -90,7 +94,7 @@ console.log("✓ HTTP /api/turn mid-turn");
 ws.close();
 await new Promise((r) => setTimeout(r, 400));
 
-const ws2 = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+const ws2 = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, { headers: cookieHeader });
 await new Promise((r, j) => {
   ws2.on("open", r);
   ws2.on("error", j);

@@ -2946,10 +2946,10 @@ wss.on("connection", (ws, req) => {
         const st = loadSettings();
         if (isMobile && st.phoneAlwaysApprove !== false) {
           pool.setPermissionMode("always-approve");
-          if (!globalBusy && parallelTurns.size === 0) {
-            await bridge.restart();
-            syncDefaultBridge();
-          }
+          // Do not SIGTERM the shared worker. A phone PWA reconnect used to
+          // restart() here and kill the Mac's agent (exit 143) even with no
+          // live turn. Spawn flags apply to the next child; live workers
+          // already got setPermissionMode.
           send({
             type: "permission_mode",
             sessionId: msg.sessionId || null,

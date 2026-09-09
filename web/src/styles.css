@@ -3931,13 +3931,20 @@ body.desk-app .topbar {
 
 @media (max-width: 720px) {
   .desk-root {
-    grid-template-columns: 48px minmax(0, 1fr);
+    grid-template-columns: 52px minmax(0, 1fr);
+  }
+  .nav-rail {
+    padding-left: 4px;
+    padding-right: 4px;
   }
   .nav-rail-label {
     display: none;
   }
-  .nav-rail-btn {
+  .nav-rail-btn,
+  .nav-rail-palette,
+  .nav-rail-brand {
     min-height: 40px;
+    min-width: 40px;
   }
   .desktop-only-nav {
     display: none;
@@ -5590,13 +5597,36 @@ body.desk-app .topbar {
   }
 }
 
+/* Touch band: session list + sidebar chrome were 21–34px. Desktop stays dense. */
+@media (max-width: 1024px) {
+  .sess-row-main {
+    min-height: 40px;
+    padding: 8px 8px 8px 10px;
+  }
+  .sess-pin-btn,
+  .sess-mark-btn {
+    flex-basis: 40px;
+    min-width: 40px;
+    min-height: 40px;
+  }
+  .sidebar .icon-btn,
+  .sidebar .icon-btn.sm {
+    min-width: 40px;
+    min-height: 40px;
+  }
+  .nav-rail-palette {
+    min-height: 40px;
+    min-width: 40px;
+  }
+}
+
 /*
  * Artifacts on a tablet: the three-column grid needs ~1000px before the
  * chat column is worth reading (at 768 with the sidebar open it left the
  * transcript 132px wide). Below that it is the bottom sheet the phone
  * already uses — same sheet, same radius, same shadow.
  */
-@media (min-width: 721px) and (max-width: 1000px) {
+@media (min-width: 721px) and (max-width: 1100px) {
   .shell.with-artifacts,
   .shell.no-sidebar.with-artifacts {
     grid-template-columns: 300px minmax(0, 1fr) !important;
@@ -5605,6 +5635,25 @@ body.desk-app .topbar {
     grid-template-columns: minmax(0, 1fr) !important;
   }
   .artifact-pane {
+    position: fixed !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    top: auto !important;
+    width: 100% !important;
+    max-height: min(72dvh, 640px) !important;
+    z-index: 60 !important;
+    border-radius: 16px 16px 0 0 !important;
+    border-left: none !important;
+    border-top: 1px solid var(--border) !important;
+    box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.45) !important;
+  }
+}
+@media (min-width: 721px) and (max-width: 1400px) {
+  .shell.with-sidebar.with-artifacts {
+    grid-template-columns: 300px minmax(0, 1fr) !important;
+  }
+  .shell.with-sidebar.with-artifacts .artifact-pane {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;

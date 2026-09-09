@@ -9,6 +9,7 @@
  */
 import WebSocket from "ws";
 import fs from "node:fs";
+import { authCookie } from "./lib/feed-smoke-kit.mjs";
 
 const PORT = process.env.PORT || 8787;
 const CWD = process.env.SMOKE_CWD || `${process.env.HOME}/tmp-grok-desk-smoke`;
@@ -40,7 +41,9 @@ function wait(ws, pred, ms = 90000) {
 
 const cookie = process.env.GD_SESSION
   ? { Cookie: `gd_session=${process.env.GD_SESSION}` }
-  : undefined;
+  : authCookie()
+    ? { Cookie: authCookie() }
+    : undefined;
 const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, { headers: cookie });
 await new Promise((r, j) => {
   ws.on("open", r);
