@@ -32,7 +32,7 @@ export function isSecureForPush(): boolean {
  * - `desktop-app` — Electron shell, which unregisters the service worker on
  *   purpose (it caches stale CSS/JS). Push is not wanted here.
  * - `insecure`    — served over http://. No service worker, so no Web Push.
- *   This is the Tailscale-HTTPS human gate; nothing on this Mac can lift it.
+ *   Phone PWA must be opened at the HTTPS Serve URL.
  * - `unsupported` — a secure context whose browser has no Push/Notification.
  */
 export type PushAvailability =

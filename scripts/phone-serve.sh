@@ -40,9 +40,9 @@ if [[ -z "$DNS_NAME" ]]; then
   DNS_NAME="YOUR-MAC.tailXXXX.ts.net"
 fi
 
-# 2) Prefer HTTPS Serve (needed for real PWA + Web Push)
+# 2) HTTPS Serve (PWA + Web Push). Tailnet certs were enabled 2026-09-09.
 HTTPS_OK=0
-if perl -e 'alarm 12; exec @ARGV' tailscale serve --bg --yes "$PORT" 2>/tmp/grok-desk-serve.err; then
+if perl -e 'alarm 12; exec @ARGV' tailscale serve --https=443 --bg --yes "$PORT" 2>/tmp/grok-desk-serve.err; then
   HTTPS_OK=1
 else
   if grep -q "not enabled" /tmp/grok-desk-serve.err 2>/dev/null; then

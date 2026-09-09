@@ -145,18 +145,13 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
 
 ## Human gate — Tailscale HTTPS (Web Push only)
 
-`tailscale cert` returns *"your Tailscale account does not support getting TLS certs"* and
-`CertDomains` is empty, so the tailnet has HTTPS certificates switched off. Desk is therefore
-served as `http://johns-macbook-pro.tail106bb5.ts.net`, which is **not a secure context** — so
-the service worker never registers and Web Push cannot work on the phone.
+- [x] Tailnet HTTPS certificates enabled 2026-09-09 (DNS → Enable HTTPS).
+      `CertDomains`: `johns-macbook-pro.tail106bb5.ts.net`.
+- [x] `tailscale serve --https=443 --bg --yes http://127.0.0.1:8787`
+      → `https://johns-macbook-pro.tail106bb5.ts.net/` HTTP/2 200, `/api/health` ok.
+- [x] Secure context + service worker: `isSecureContext true`, SW active on that origin.
+- [x] Web Push subscribe 200 (FCM endpoint) + `notifyPush` sent 1/1.
 
-Enabling it is one toggle in the Tailscale admin console (DNS → HTTPS Certificates). It needs
-John's Tailscale login: there is no API key or OAuth client on this machine, and minting one
-also requires that console. Routing Desk through the existing Cloudflare tunnel *would* give a
-real cert, but the spec says local only, no Cloudflare — so that is not an option.
-
-**Nothing else is blocked.** The PWA, the WebSocket, cursor resume and add-to-home-screen all
-work over HTTP. Only Web Push waits on this.
-
-After John enables it: `tailscale serve --bg --https=443 http://127.0.0.1:8787`, then confirm
-the service worker registers and a push arrives.
+Phone Tailscale was offline (last seen 14d) so a banner on the iPhone itself was
+not observed. Plumbing is live; open the HTTPS URL from Safari when the phone is
+on the tailnet.
