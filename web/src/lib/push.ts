@@ -19,6 +19,42 @@ export function isSecureForPush(): boolean {
   return window.isSecureContext === true;
 }
 
+/**
+ * P7 — why push is unavailable, in the order the browser actually decides it.
+ *
+ * On a plain-HTTP origin the browser does not expose `navigator.serviceWorker`
+ * at all, so `pushSupported()` is false for exactly the same reason the context
+ * is insecure. The old Settings copy read that as "you must be on the desktop
+ * app" and told a phone on `http://…ts.net` that push is "for the phone PWA" —
+ * the one case it was actually looking at. Check the secure context FIRST so
+ * the UI can name the real blocker.
+ *
+ * - `desktop-app` — Electron shell, which unregisters the service worker on
+ *   purpose (it caches stale CSS/JS). Push is not wanted here.
+ * - `insecure`    — served over http://. No service worker, so no Web Push.
+ *   This is the Tailscale-HTTPS human gate; nothing on this Mac can lift it.
+ * - `unsupported` — a secure context whose browser has no Push/Notification.
+ */
+export type PushAvailability =
+  | { state: "ok" }
+  | { state: "desktop-app" }
+  | { state: "insecure"; origin: string }
+  | { state: "unsupported" };
+
+export function pushAvailability(): PushAvailability {
+  if (typeof window === "undefined") return { state: "unsupported" };
+  if (window.deskApp?.isApp) return { state: "desktop-app" };
+  if (!isSecureForPush()) return { state: "insecure", origin: window.location.origin };
+  if (
+    !("serviceWorker" in navigator) ||
+    !("PushManager" in window) ||
+    !("Notification" in window)
+  ) {
+    return { state: "unsupported" };
+  }
+  return { state: "ok" };
+}
+
 export async function getPushState(): Promise<{
   supported: boolean;
   secure: boolean;
@@ -51,14 +87,21 @@ export async function getPushState(): Promise<{
 }
 
 export async function enablePush(): Promise<{ ok: boolean; error?: string }> {
-  if (!pushSupported()) {
+  const avail = pushAvailability();
+  if (avail.state === "desktop-app") {
     return { ok: false, error: "Push needs a browser/PWA (not the desktop app shell)." };
   }
-  if (!isSecureForPush()) {
+  if (avail.state === "insecure") {
     return {
       ok: false,
-      error: "Push needs HTTPS. Enable Tailscale Serve HTTPS, then reinstall the home-screen app from the https:// URL.",
+      error:
+        `${avail.origin} is not a secure context, so the browser will not register a ` +
+        "service worker and Web Push cannot start. This needs HTTPS certificates enabled " +
+        "for the tailnet (Tailscale admin console → DNS → HTTPS Certificates).",
     };
+  }
+  if (avail.state === "unsupported") {
+    return { ok: false, error: "This browser has no Web Push support." };
   }
   try {
     const reg = await navigator.serviceWorker.ready;

@@ -42,6 +42,7 @@ import {
   loadAgentMailTranscript,
   sessionsRoot,
   pruneSubagentsFromDeskIndex,
+  bumpSessionScan,
 } from "./session-store.js";
 import {
   read as readSessionFeed,
@@ -1157,6 +1158,9 @@ function startSessionWatcher() {
   const w = startRootWatcher({
     root,
     onChange: () => {
+      // P7: the group-level tick is the invalidation seam for session-store's
+      // shared directory snapshot. Drop it here rather than rescanning per id.
+      bumpSessionScan();
       broadcastProjectsTick("fs");
       // A session dir a client is already subscribed to may have just appeared.
       syncSessionWatchers();

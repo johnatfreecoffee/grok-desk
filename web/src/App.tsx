@@ -1415,31 +1415,55 @@ function DeskApp() {
 
 
   /**
-   * Phone / PWA resume. One operation: reconnect if the socket died, then
-   * resubscribe every tail at its cursor. No force-unlock, no HTTP finalize —
-   * the feed replays whatever happened while we were away.
+   * Phone / PWA resume. One operation: get a socket that is actually alive,
+   * then resubscribe every tail at its cursor. No force-unlock, no HTTP
+   * finalize — the feed replays whatever happened while we were away.
+   *
+   * P7 — two things were wrong for a phone that had been backgrounded a while:
+   *
+   *  1. `isConnected()` only reads `readyState`. iOS suspends the whole page,
+   *     so no ping goes out and no close frame is processed; the socket comes
+   *     back reported OPEN but dead. `resubscribeAll()` then wrote `subscribe`
+   *     frames into a black hole — the chat sat there stale, with no gap
+   *     filled, no error and nothing to retry. A socket that has heard NOTHING
+   *     for longer than the whole ping/pong budget is now replaced instead of
+   *     trusted, which is the same rule the pong watchdog uses when timers are
+   *     actually running.
+   *  2. Nothing repainted on the way back, so a bfcache restore showed whatever
+   *     React had before the freeze until the first frame arrived. The rows are
+   *     already in the store (and in `localStorage` after a real reload) —
+   *     paint them first so the app is never blank while the socket handshakes.
+   *
+   * `pageshow` covers bfcache restore, `online` covers the phone coming back on
+   * the tailnet without a visibility change.
    */
   useEffect(() => {
-    const onVis = (ev?: Event) => {
-      if (document.visibilityState !== "visible" && !(ev as PageTransitionEvent)?.persisted) {
-        if (ev?.type !== "pageshow") return;
-      }
+    /** Silence longer than the ping interval x miss limit means it did not survive. */
+    const STALE_MS = 30_000;
+    const onResume = (ev?: Event) => {
+      const isPageShow = ev?.type === "pageshow";
+      if (!isPageShow && document.visibilityState !== "visible") return;
+      // Never come back blank: the store still holds this session's rows.
+      repaintViewed();
       const client = clientRef.current;
-      if (!client?.isConnected()) {
-        client?.reconnect(); // onOpen resubscribes
+      if (!client) return;
+      if (!client.isConnected() || client.lastInboundAge() > STALE_MS) {
+        client.reconnect(); // onOpen resubscribes at every cursor
         return;
       }
       client.requestStatus();
       client.send({ type: "ping" });
       resubscribeAll();
     };
-    document.addEventListener("visibilitychange", onVis);
-    window.addEventListener("pageshow", onVis);
+    document.addEventListener("visibilitychange", onResume);
+    window.addEventListener("pageshow", onResume);
+    window.addEventListener("online", onResume);
     return () => {
-      document.removeEventListener("visibilitychange", onVis);
-      window.removeEventListener("pageshow", onVis);
+      document.removeEventListener("visibilitychange", onResume);
+      window.removeEventListener("pageshow", onResume);
+      window.removeEventListener("online", onResume);
     };
-  }, [resubscribeAll]);
+  }, [repaintViewed, resubscribeAll]);
 
   /**
    * P5 — keep the daemon's quiet clock fresh while a turn is live.
