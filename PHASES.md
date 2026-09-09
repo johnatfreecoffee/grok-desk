@@ -105,7 +105,7 @@ not exist. Prior factory (one product v0.2.0) is closed — see `docs/SPEC-one-p
   - Surface `session_kind: headless`; real toggle for `showSubagentSessions`
   - Proof: side by side with a live terminal session — same content, order, subagents
 
-- [ ] **P7 Scale + PWA**
+- [x] **P7 Scale + PWA**
   - Kill the O(n²) `pruneSubagentsFromDeskIndex` / `isSubagentSession` per poll
   - Everything on the phone must work over plain HTTP: reconnect, resubscribe, cursor
     resume, add-to-home-screen. That is the phase's real deliverable.
